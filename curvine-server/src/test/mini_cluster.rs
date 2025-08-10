@@ -20,6 +20,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::FsResult;
 use dashmap::DashMap;
+use log::info;
 use orpc::client::RpcClient;
 use orpc::common::LocalTime;
 use orpc::io::net::{InetAddr, NetUtils};
@@ -75,24 +76,112 @@ impl MiniCluster {
 
     pub fn start_cluster(&self) {
         self.start_master();
+
+        // Wait for Master to be fully ready before starting Workers
+        self.client_rt.block_on(self.wait_master_ready()).unwrap();
+
+        // Add a small additional delay to ensure Master is fully stable
+        std::thread::sleep(Duration::from_millis(500));
+
         self.start_worker();
 
         self.client_rt.block_on(self.wait_ready()).unwrap();
     }
 
+    /// Wait for Master service to be fully ready (Raft Leader + RPC service started)
+    async fn wait_master_ready(&self) -> FsResult<()> {
+        let wait_time = LocalTime::mills() + 60 * 1000; // 60 second timeout
+        let mut retry_count = 0;
+        let mut rpc_connection_attempted = false;
+
+        info!("Waiting for Master service to be ready");
+
+        while LocalTime::mills() <= wait_time {
+            retry_count += 1;
+
+            // First check if any master is active by checking the master_fs
+            let mut raft_leader_ready = false;
+            for master_fs in self.master_fs.iter() {
+                if master_fs.master_monitor.is_active() {
+                    raft_leader_ready = true;
+                    break;
+                }
+            }
+
+            if raft_leader_ready && !rpc_connection_attempted {
+                info!("Raft leader elected, now checking RPC service availability...");
+                rpc_connection_attempted = true;
+
+                // Give RPC service a moment to fully initialize after Raft leader election
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+
+            if raft_leader_ready {
+                // Additional check: try to create a simple RPC connection to verify the service is actually listening
+                let conf = self.master_conf().client_rpc_conf();
+                let addr = self.master_conf().master_addr();
+
+                match RpcClient::with_raw(&addr, &conf).await {
+                    Ok(_client) => {
+                        info!("Master service is ready (Raft leader elected and RPC service listening), retry count: {}", retry_count);
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        if retry_count % 5 == 0 && rpc_connection_attempted {
+                            // Log every 5 retries after first RPC attempt
+                            info!("Raft leader ready but RPC service not yet available, continuing to wait... (attempt {})", retry_count);
+                        }
+                    }
+                }
+            } else if retry_count % 20 == 0 {
+                // Log every 20 retries before Raft leader is ready
+                info!(
+                    "Waiting for Raft leader election... (attempt {})",
+                    retry_count
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        err_box!("Master service failed to become ready within 60 seconds")
+    }
+
+    /// Wait for the entire cluster to be ready (all Workers registered)
     async fn wait_ready(&self) -> FsResult<()> {
         let fs = self.new_fs();
-        let wait_time = LocalTime::mills() + 20 * 10000;
+        let wait_time = LocalTime::mills() + 20 * 1000; // 20 second timeout
+        let mut retry_count = 0;
+
+        info!(
+            "Waiting for all Workers to register, expected Worker count: {}",
+            self.worker_conf.len()
+        );
+
         while LocalTime::mills() <= wait_time {
+            retry_count += 1;
             let info = fs.get_master_info().await?;
             if info.live_workers.len() == self.worker_conf.len() {
+                info!(
+                    "Cluster is ready, active Worker count: {}",
+                    info.live_workers.len()
+                );
                 return Ok(());
             } else {
+                if retry_count % 3 == 0 {
+                    // Log every 3 retries
+                    info!(
+                        "Waiting for Worker registration... current: {}/{}, retry count: {}",
+                        info.live_workers.len(),
+                        self.worker_conf.len(),
+                        retry_count
+                    );
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
 
-        err_box!("The cluster is not ready")
+        err_box!("Cluster failed to become ready within 20 seconds")
     }
 
     pub async fn master_client(&self) -> CommonResult<RpcClient> {

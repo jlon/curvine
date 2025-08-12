@@ -141,6 +141,7 @@ message GetMasterInfoResponse {
     required int64 available = 6;
     required int64 fs_used = 7;
     required int64 non_fs_used = 8;
+    required int64 reserved_bytes = 9 [default = 0];
 
     repeated WorkerInfoProto live_workers = 11;
     repeated WorkerInfoProto blacklist_workers = 12;

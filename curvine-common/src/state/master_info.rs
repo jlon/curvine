@@ -27,6 +27,7 @@ pub struct MasterInfo {
     pub available: i64,
     pub fs_used: i64,
     pub non_fs_used: i64,
+    pub reserved_bytes: i64,
 
     pub live_workers: Vec<WorkerInfo>,
     pub blacklist_workers: Vec<WorkerInfo>,

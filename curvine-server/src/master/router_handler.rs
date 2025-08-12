@@ -108,9 +108,30 @@ async fn overview(
     let conf = &instance.conf;
     let start_time = &instance.start_time;
     let master_info = fs.master_info().unwrap();
-    let files = fs.list_status("/").unwrap();
-    let dir_total = files.iter().filter(|f| f.is_dir).count();
-    let files_total = files.len() - dir_total;
+
+    let (files_total, dir_total) = {
+        let (f, d) = fs.get_file_counts();
+        (f as usize, d as usize)
+    };
+
+    let expected_capacity = master_info.available + master_info.fs_used;
+    if master_info.capacity != expected_capacity {
+        log::warn!(
+            "Capacity inconsistency detected: capacity={}, available={}, fs_used={}, expected_capacity={}",
+            master_info.capacity,
+            master_info.available,
+            master_info.fs_used,
+            expected_capacity
+        );
+    } else {
+        log::debug!(
+            "Capacity consistency verified: capacity={}, available={}, fs_used={}",
+            master_info.capacity,
+            master_info.available,
+            master_info.fs_used
+        );
+    }
+
     let master_state = format!("{:?}", fs.master_monitor.journal_state());
 
     let res = Json(json!({
@@ -122,6 +143,7 @@ async fn overview(
         "available": master_info.available,
         "capacity": master_info.capacity,
         "fs_used": master_info.fs_used,
+        "reserved_bytes": master_info.reserved_bytes,
         "files_total": files_total,
         "dir_total": dir_total,
         "master_state": master_state,

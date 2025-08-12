@@ -18,6 +18,9 @@ pub mod inode;
 mod fs_dir;
 pub use self::fs_dir::FsDir;
 
+mod fs_stats;
+pub use self::fs_stats::FileSystemStats;
+
 mod inode_id;
 pub use self::inode_id::InodeId;
 

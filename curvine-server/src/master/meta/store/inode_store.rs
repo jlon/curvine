@@ -17,7 +17,7 @@ use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::ttl_types::TtlInodeMetadata;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
-use crate::master::meta::FsDir;
+use crate::master::meta::{FileSystemStats, FsDir};
 use crate::master::mount::MountPointEntry;
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock};
@@ -30,6 +30,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
+    pub(crate) fs_stats: Arc<FileSystemStats>,
     ttl_bucket_list: Arc<TtlBucketList>,
 }
 
@@ -37,6 +38,7 @@ impl InodeStore {
     pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> Self {
         InodeStore {
             store: Arc::new(store),
+            fs_stats: Arc::new(FileSystemStats::new()),
             ttl_bucket_list,
         }
     }
@@ -65,6 +67,16 @@ impl InodeStore {
             }
         }
 
+        match child {
+            InodeView::File(_) => self.fs_stats.increment_file_count(),
+            InodeView::Dir(dir) => {
+                // Don't count root directory
+                if dir.id != ROOT_INODE_ID {
+                    self.fs_stats.increment_dir_count();
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -75,6 +87,8 @@ impl InodeStore {
         let mut stack = LinkedList::new();
         stack.push_back((parent.id(), del));
         let mut del_res = DeleteResult::new();
+        let mut deleted_files = 0i64;
+        let mut deleted_dirs = 0i64;
 
         while let Some((parent_id, inode)) = stack.pop_front() {
             // Delete inode nodes and edges
@@ -88,6 +102,7 @@ impl InodeStore {
 
             match inode {
                 InodeView::File(file) => {
+                    deleted_files += 1;
                     for meta in &file.blocks {
                         if meta.is_writing() {
                             // Uncommitted block.
@@ -104,6 +119,10 @@ impl InodeStore {
                 }
 
                 InodeView::Dir(dir) => {
+                    // Don't count root directory
+                    if dir.id != ROOT_INODE_ID {
+                        deleted_dirs += 1;
+                    }
                     for item in dir.children_iter() {
                         stack.push_back((inode.id(), item))
                     }
@@ -112,6 +131,14 @@ impl InodeStore {
         }
 
         batch.commit()?;
+
+        if deleted_files > 0 {
+            self.fs_stats.add_file_count(-deleted_files);
+        }
+        if deleted_dirs > 0 {
+            self.fs_stats.add_dir_count(-deleted_dirs);
+        }
+
         Ok(del_res)
     }
 
@@ -223,12 +250,26 @@ impl InodeStore {
         let mut stack = LinkedList::new();
         stack.push_back((root.as_ptr(), ROOT_INODE_ID));
         let mut last_inode_id = ROOT_INODE_ID;
+        let mut file_count = 0i64;
+        let mut dir_count = 0i64;
 
         while let Some((mut parent, child_id)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
                 let inode = try_option!(self.store.get_inode(child_id)?);
+
+                // Count files and directories during tree reconstruction
+                match &inode {
+                    InodeView::File(_) => file_count += 1,
+                    InodeView::Dir(dir) => {
+                        // Don't count root directory
+                        if dir.id != ROOT_INODE_ID {
+                            dir_count += 1;
+                        }
+                    }
+                }
+
                 parent.add_child(inode)?
             } else {
                 parent
@@ -255,6 +296,9 @@ impl InodeStore {
                 }
             }
         }
+
+        // Update statistics with the counts from tree reconstruction
+        self.fs_stats.set_counts(file_count, dir_count);
 
         Ok((last_inode_id, root))
     }
@@ -333,5 +377,9 @@ impl InodeStore {
 
     pub fn get_mount_table(&self) -> CommonResult<Vec<MountPointEntry>> {
         self.store.get_mount_table()
+    }
+
+    pub fn get_file_counts(&self) -> (i64, i64) {
+        self.fs_stats.counts()
     }
 }

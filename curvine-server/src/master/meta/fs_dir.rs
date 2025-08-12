@@ -278,6 +278,7 @@ impl FsDir {
         );
         inp = self.add_last_inode(inp, File(file))?;
         self.journal_writer.log_create_file(op_ms, &inp)?;
+
         Ok(inp)
     }
 
@@ -600,7 +601,8 @@ impl FsDir {
 
         info!(
             "Restore from {}, restore rocksdb used {} ms, \
-        build in-memory directory tree used {} ms",
+        build in-memory directory tree used {} ms, \
+        statistics updated during tree reconstruction",
             path, time1, time2
         );
 
@@ -609,6 +611,10 @@ impl FsDir {
 
     pub fn get_checkpoint_path(&self, id: u64) -> String {
         self.store.get_checkpoint_path(id)
+    }
+
+    pub fn get_file_counts(&self) -> (i64, i64) {
+        self.store.get_file_counts()
     }
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {

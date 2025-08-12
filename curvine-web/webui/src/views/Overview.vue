@@ -160,7 +160,7 @@
                                 </svg>
                                 <div class="capacity-center">
                                     <div class="capacity-percentage">{{ getCapacityPercentage() }}%</div>
-                                    <div class="capacity-label">Used</div>
+                                    <div class="capacity-label">Total Used</div>
                                 </div>
                             </div>
                             <div class="capacity-details">
@@ -169,8 +169,16 @@
                                     <span class="detail-value available">{{ toGB(data.available) }}GB</span>
                                 </div>
                                 <div class="capacity-detail">
-                                    <span class="detail-label">Used</span>
-                                    <span class="detail-value used">{{ toGB(data.fs_used) }}GB</span>
+                                    <span class="detail-label">FS Used</span>
+                                    <span class="detail-value fs-used">{{ toGBPrecise(data.fs_used) }}GB</span>
+                                </div>
+                                <div class="capacity-detail">
+                                    <span class="detail-label">System Used</span>
+                                    <span class="detail-value system-used">{{ toGB(getNonFsUsed()) }}GB</span>
+                                </div>
+                                <div class="capacity-detail">
+                                    <span class="detail-label">Reserved</span>
+                                    <span class="detail-value reserved">{{ toGBPrecise(data.reserved_bytes || 0) }}GB</span>
                                 </div>
                                 <div class="capacity-detail">
                                     <span class="detail-label">Total</span>
@@ -204,7 +212,8 @@ export default {
         available: 0,
         fs_used: 0,
         files_total: 0,
-        dir_total: 0
+        dir_total: 0,
+        reserved_bytes: 0
       },
       loading: false
     }
@@ -244,6 +253,10 @@ export default {
       if (!bytes) return 0
       return (bytes / 1024 / 1024 / 1024).toFixed(2)
     },
+    toGBPrecise(bytes) {
+      if (!bytes) return 0
+      return (bytes / 1024 / 1024 / 1024).toFixed(4)
+    },
     formatNumber(num) {
       if (!num) return '0'
       return num.toLocaleString()
@@ -281,7 +294,9 @@ export default {
     },
     getCapacityPercentage() {
       if (!this.data.capacity || this.data.capacity === 0) return 0
-      return Math.round((this.data.fs_used / this.data.capacity) * 100)
+      // Calculate total used (fs_used + non_fs_used) percentage
+      const totalUsed = this.data.capacity - this.data.available
+      return Math.round((totalUsed / this.data.capacity) * 100)
     },
     getCapacityDashArray() {
       const circumference = 2 * Math.PI * 45
@@ -291,6 +306,11 @@ export default {
       const circumference = 2 * Math.PI * 45
       const percentage = this.getCapacityPercentage()
       return circumference - (percentage / 100) * circumference
+    },
+    getNonFsUsed() {
+      if (!this.data.capacity || this.data.capacity === 0) return 0
+      // non_fs_used = capacity - available - fs_used
+      return Math.max(0, this.data.capacity - this.data.available - this.data.fs_used)
     }
   }
 }
@@ -687,8 +707,16 @@ export default {
                                 color: var(--accent-green);
                             }
                             
-                            &.used {
+                            &.fs-used {
                                 color: #ff6b6b;
+                            }
+                            
+                            &.system-used {
+                                color: var(--accent-blue);
+                            }
+                            
+                            &.reserved {
+                                color: var(--accent-purple);
                             }
                             
                             &.total {

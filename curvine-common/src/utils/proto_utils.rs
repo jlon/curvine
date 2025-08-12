@@ -31,6 +31,7 @@ impl ProtoUtils {
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
             available: item.available,
+            reserved_bytes: item.reserved_bytes,
             storage_type: item.storage_type.into(),
             block_num: item.block_num,
         }
@@ -45,6 +46,7 @@ impl ProtoUtils {
             fs_used: item.fs_used,
             non_fs_used: item.non_fs_used,
             available: item.available,
+            reserved_bytes: item.reserved_bytes,
             storage_type: StorageType::from(item.storage_type),
             block_num: item.block_num,
         }
@@ -280,6 +282,7 @@ impl ProtoUtils {
             available: src.available,
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
+            reserved_bytes: src.reserved_bytes,
             ..Default::default()
         };
 
@@ -310,6 +313,7 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             last_update: src.last_update,
+            reserved_bytes: src.reserved_bytes,
             storage_map: Default::default(),
         };
 
@@ -331,6 +335,7 @@ impl ProtoUtils {
             available: src.available,
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
+            reserved_bytes: src.reserved_bytes,
             live_workers: Self::worker_info_from_pb(src.live_workers),
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
@@ -347,6 +352,7 @@ impl ProtoUtils {
                 available: info.available,
                 fs_used: info.fs_used,
                 non_fs_used: info.non_fs_used,
+                reserved_bytes: info.reserved_bytes,
                 ..Default::default()
             };
             for (k, v) in info.storage_map {

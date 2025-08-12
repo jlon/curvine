@@ -516,6 +516,7 @@ impl MasterFilesystem {
             info.available += worker.available;
             info.fs_used += worker.fs_used;
             info.non_fs_used += worker.non_fs_used;
+            info.reserved_bytes += worker.reserved_bytes;
             info.block_num += worker.block_num;
 
             match worker.status {
@@ -551,6 +552,11 @@ impl MasterFilesystem {
     pub fn last_inode_id(&self) -> i64 {
         let fs_dir = self.fs_dir.read();
         fs_dir.last_inode_id()
+    }
+
+    pub fn get_file_counts(&self) -> (i64, i64) {
+        let fs_dir = self.fs_dir.read();
+        fs_dir.get_file_counts()
     }
 
     // Create a directory number based on rocksdb data for testing.

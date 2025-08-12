@@ -115,8 +115,9 @@ message StorageInfoProto {
     required int64 available = 5;
     required int64 fs_used = 6;
     required int64 non_fs_used = 7;
-    required StorageTypeProto storage_type = 8 [default = STORAGE_TYPE_PROTO_DISK];
-    required int64 block_num = 9;
+    required int64 reserved_bytes = 8 [default = 0];
+    required StorageTypeProto storage_type = 9 [default = STORAGE_TYPE_PROTO_DISK];
+    required int64 block_num = 10;
 }
 
 // Represents a customer service address.
@@ -146,4 +147,5 @@ message WorkerInfoProto {
     required int64 non_fs_used = 5;
     required uint64 last_update = 6;
     map<string, StorageInfoProto> storage_map = 7;
+    required int64 reserved_bytes = 8 [default = 0];
 }

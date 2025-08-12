@@ -138,6 +138,7 @@ impl BlockStore {
                 fs_used: item.fs_used(),
                 non_fs_used: item.non_fs_used(),
                 available: item.available(),
+                reserved_bytes: item.reserved_bytes(),
                 storage_type: item.storage_type(),
                 block_num: state.num_blocks() as i64,
             };

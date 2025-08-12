@@ -113,24 +113,26 @@ impl VfsDir {
     pub fn capacity(&self) -> i64 {
         let disk_space = self.stats.total_space() as i64;
 
-        let capacity = if self.conf_capacity <= 0 {
+        if self.conf_capacity <= 0 {
             disk_space
         } else {
             self.conf_capacity.min(disk_space)
-        };
-
-        capacity - self.reserved_bytes
+        }
     }
 
     pub fn available(&self) -> i64 {
-        let mut reaming = self.capacity() - self.final_bytes.get() - self.tmp_bytes.get();
-        let available =
-            self.stats.available_space() as i64 - self.tmp_bytes.get() - self.reserved_bytes;
-        if reaming > available {
-            reaming = available
-        }
+        let _disk_total = self.stats.total_space() as i64;
+        let disk_used = self.stats.used_space() as i64;
+        let disk_available = self.stats.available_space() as i64;
 
-        0.max(reaming)
+        let capacity = self.capacity();
+        let fs_used = self.fs_used();
+        let reserved_bytes = self.reserved_bytes;
+        let non_fs_used = disk_used - fs_used;
+
+        let calculated_available = capacity - fs_used - non_fs_used - reserved_bytes;
+
+        0.max(calculated_available.min(disk_available))
     }
 
     pub fn non_fs_used(&self) -> i64 {
@@ -144,6 +146,10 @@ impl VfsDir {
 
     pub fn fs_used(&self) -> i64 {
         self.final_bytes.get() + self.tmp_bytes.get()
+    }
+
+    pub fn reserved_bytes(&self) -> i64 {
+        self.reserved_bytes
     }
 
     pub fn base_path(&self) -> &Path {

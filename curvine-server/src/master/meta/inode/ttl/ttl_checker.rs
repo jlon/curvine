@@ -139,6 +139,21 @@ impl InodeTtlChecker {
             }
         }
 
+        // After processing all inodes, check if bucket is now empty and remove it
+        let remaining_inodes = bucket.get_all_inodes();
+        if remaining_inodes.is_empty() {
+            debug!(
+                "Bucket processing completed, removing empty bucket with interval_start_ms={}",
+                bucket.interval_start_ms
+            );
+            let _ = self.bucket_list.remove_empty_bucket(bucket);
+        } else {
+            debug!(
+                "Bucket processing completed, {} inodes remaining for retry",
+                remaining_inodes.len()
+            );
+        }
+
         Ok(result)
     }
 

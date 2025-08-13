@@ -234,4 +234,37 @@ impl TtlBucketList {
 
         expired_buckets
     }
+
+    /// Remove an empty bucket from the bucket list
+    pub fn remove_empty_bucket(&self, bucket: &TtlBucket) -> TtlResult<bool> {
+        // Double-check that the bucket is actually empty before attempting removal
+        if !bucket.inode_retries.is_empty() {
+            warn!(
+                "Attempted to remove non-empty bucket with interval_start_ms={}, {} inodes remaining",
+                bucket.interval_start_ms,
+                bucket.inode_retries.len()
+            );
+            return Ok(false);
+        }
+
+        let mut buckets = self
+            .buckets
+            .write()
+            .map_err(|_| TtlError::ServiceError("Failed to acquire write lock".to_string()))?;
+
+        // Remove the bucket directly using its interval_start_ms
+        if buckets.remove(&bucket.interval_start_ms).is_some() {
+            debug!(
+                "Removed empty TTL bucket with interval_start_ms={}",
+                bucket.interval_start_ms
+            );
+            Ok(true)
+        } else {
+            debug!(
+                "Bucket with interval_start_ms={} not found for removal",
+                bucket.interval_start_ms
+            );
+            Ok(false)
+        }
+    }
 }

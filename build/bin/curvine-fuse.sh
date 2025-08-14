@@ -1,6 +1,5 @@
 #!/bin/bash
 
-#
 # Copyright 2025 OPPO.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,32 +13,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
-# Execute fuse mount.
+# Execute fuse mount with parameter passthrough
 
-# Mount Point
+# Default mount point
 MNT_PATH=/curvine-fuse
 
-# Number of mount points.
-MNT_NUMBER=1
-
-# fuse2 default options: -o allow_other -o async
-# fuse3 default options: -o allow_other -o async -o direct_io -o big_write -o max_write=131072
-FUSE_OPTS=""
+# Process arguments in a single loop
+for arg in "$@"; do
+    if [[ "$arg" == "--help" ]] || [[ "$arg" == "-h" ]]; then
+        . "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+        ${CURVINE_HOME}/lib/curvine-fuse --help
+        exit 0
+    fi
+    
+    # Extract mount path from arguments if specified
+    if [[ "$arg" == --mnt-path=* ]]; then
+        MNT_PATH="${arg#*=}"
+    elif [[ "$arg" == "--mnt-path" ]]; then
+        next_is_path=true
+        continue
+    elif [[ "$next_is_path" == true ]]; then
+        MNT_PATH="$arg"
+        next_is_path=false
+    fi
+done
 
 # Cancel the last mount.
-umount -f $MNT_PATH;
-if [ -d "$fuse_mnt" ]; then
-  for file in `ls $MNT_PATH`; do
-      umount -f "$MNT_PATH/$file"
+umount -f "$MNT_PATH" 2>/dev/null || true
+if [ -d "$MNT_PATH" ]; then
+  for file in $(ls "$MNT_PATH" 2>/dev/null || true); do
+      umount -f "$MNT_PATH/$file" 2>/dev/null || true
   done
 fi
 
-mkdir -p $MNT_PATH
+mkdir -p "$MNT_PATH"
 
+echo "Starting curvine-fuse with arguments: $*"
 
-"$(cd "`dirname "$0"`"; pwd)"/launch-process.sh fuse $1 \
---mnt-path $MNT_PATH \
---mnt-number ${MNT_NUMBER} \
-${FUSE_OPTS}
+# Pass all arguments to launch-process.sh
+"$(cd "$(dirname "$0")"; pwd)"/launch-process.sh fuse "$@"

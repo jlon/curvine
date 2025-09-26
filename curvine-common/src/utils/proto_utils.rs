@@ -603,4 +603,37 @@ impl ProtoUtils {
             })
             .collect()
     }
+
+    // Quota conversion methods
+    pub fn quota_info_to_pb(item: QuotaInfo) -> QuotaInfoPb {
+        QuotaInfoPb {
+            path: item.path,
+            quota_size: item.quota_size,
+            used_size: item.used_size,
+            state: match item.state {
+                QuotaState::Available => QuotaStatePb::Available as i32,
+                QuotaState::Calculating => QuotaStatePb::Calculating as i32,
+                QuotaState::Exceeded => QuotaStatePb::Exceeded as i32,
+            },
+            created_time: item.created_time,
+            updated_time: item.updated_time,
+        }
+    }
+
+    pub fn quota_info_from_pb(pb: QuotaInfoPb) -> QuotaInfo {
+        QuotaInfo {
+            inode_id: 0, // Will be set by server when converting from proto
+            path: pb.path,
+            quota_size: pb.quota_size,
+            used_size: pb.used_size,
+            state: match QuotaStatePb::from_i32(pb.state).unwrap_or(QuotaStatePb::Available) {
+                QuotaStatePb::Available => QuotaState::Available,
+                QuotaStatePb::Calculating => QuotaState::Calculating,
+                QuotaStatePb::Exceeded => QuotaState::Exceeded,
+            },
+            created_time: pb.created_time,
+            updated_time: pb.updated_time,
+            properties: std::collections::HashMap::new(), // Empty properties map
+        }
+    }
 }

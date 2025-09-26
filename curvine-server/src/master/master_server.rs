@@ -29,7 +29,7 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
-use crate::master::{JobHandler, MountManager};
+use crate::master::{JobHandler, MountManager, QuotaManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 
@@ -41,6 +41,7 @@ pub struct MasterService {
     fs: MasterFilesystem,
     retry_cache: Option<FsRetryCache>,
     mount_manager: Arc<MountManager>,
+    quota_manager: Arc<QuotaManager>,
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<MasterReplicationManager>,
@@ -52,6 +53,7 @@ impl MasterService {
         fs: MasterFilesystem,
         retry_cache: Option<FsRetryCache>,
         mount_manager: Arc<MountManager>,
+        quota_manager: Arc<QuotaManager>,
         job_manager: Arc<JobManager>,
         rt: Arc<Runtime>,
         replication_manager: Arc<MasterReplicationManager>,
@@ -61,6 +63,7 @@ impl MasterService {
             fs,
             retry_cache,
             mount_manager,
+            quota_manager,
             job_manager,
             rt,
             replication_manager,
@@ -98,6 +101,7 @@ impl HandlerService for MasterService {
             self.retry_cache.clone(),
             client_state,
             self.mount_manager.clone(),
+            self.quota_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
             self.replication_manager.clone(),
         )
@@ -165,6 +169,7 @@ impl Master {
             fs,
             retry_cache,
             mount_manager.clone(),
+            journal_system.quota_manager(),
             job_manager.clone(),
             rt.clone(),
             replication_manager.clone(),

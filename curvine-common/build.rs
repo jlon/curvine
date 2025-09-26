@@ -22,6 +22,7 @@ fn main() {
         "worker.proto",
         "job.proto",
         "mount.proto",
+        "quota.proto",
         "replication.proto",
     ];
 

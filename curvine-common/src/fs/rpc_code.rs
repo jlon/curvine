@@ -47,6 +47,13 @@ pub enum RpcCode {
     GetMountTable = 33,
     GetMountInfo = 34,
 
+    // quota management
+    AddQuota = 50,
+    UpdateQuota = 51,
+    RemoveQuota = 52,
+    GetQuotaInfo = 53,
+    GetQuotaTable = 54,
+
     SubmitJob = 35,
     GetJobStatus = 36,
     CancelJob = 37,

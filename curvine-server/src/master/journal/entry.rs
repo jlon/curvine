@@ -14,7 +14,7 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
+use curvine_common::state::{CommitBlock, MountInfo, QuotaInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -93,6 +93,18 @@ pub struct UnMountEntry {
     pub(crate) id: u32,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct QuotaAddEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) info: QuotaInfo,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct QuotaRemoveEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) id: i64,
+}
+
 // set attr
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SetAttrEntry {
@@ -129,6 +141,8 @@ pub enum JournalEntry {
     Delete(DeleteEntry),
     Mount(MountEntry),
     UnMount(UnMountEntry),
+    QuotaAdd(QuotaAddEntry),
+    QuotaRemove(QuotaRemoveEntry),
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
     Link(LinkEntry),

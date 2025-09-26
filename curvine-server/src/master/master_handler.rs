@@ -16,8 +16,8 @@ use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
-use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
+use crate::master::{MountManager, QuotaManager};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -40,6 +40,7 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) quota_manager: Arc<QuotaManager>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
 }
 
@@ -51,6 +52,7 @@ impl MasterHandler {
         retry_cache: Option<FsRetryCache>,
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
+        quota_manager: Arc<QuotaManager>,
         job_handler: JobHandler,
         replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
@@ -61,6 +63,7 @@ impl MasterHandler {
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
             mount_manager,
+            quota_manager,
             job_handler,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
         }
@@ -353,6 +356,97 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    // Quota management methods
+    fn add_quota(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: AddQuotaRequest = ctx.parse_header()?;
+
+        ctx.set_audit(Some(request.path.clone()), None);
+
+        let file_status = self.fs.file_status(&request.path).map_err(|_| {
+            FsError::common(format!(
+                "Directory '{}' not found. Please create the directory first using 'cv fs mkdir'.",
+                &request.path
+            ))
+        })?;
+        let inode_id = file_status.id;
+
+        self.quota_manager
+            .add_quota(inode_id, &request.path, request.quota_size)?;
+
+        let rep_header = AddQuotaResponse {};
+        ctx.response(rep_header)
+    }
+
+    fn update_quota(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: UpdateQuotaRequest = ctx.parse_header()?;
+
+        ctx.set_audit(Some(request.path.clone()), None);
+
+        let file_status = self
+            .fs
+            .file_status(&request.path)
+            .map_err(|_| FsError::common(format!("Directory '{}' not found.", &request.path)))?;
+        let inode_id = file_status.id;
+
+        self.quota_manager
+            .update_quota(inode_id, &request.path, request.quota_size)?;
+
+        let rep_header = UpdateQuotaResponse {};
+        ctx.response(rep_header)
+    }
+
+    fn remove_quota(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: RemoveQuotaRequest = ctx.parse_header()?;
+
+        ctx.set_audit(Some(request.path.clone()), None);
+
+        let file_status = self
+            .fs
+            .file_status(&request.path)
+            .map_err(|_| FsError::common(format!("Directory '{}' not found.", &request.path)))?;
+        let inode_id = file_status.id;
+
+        self.quota_manager.remove_quota(inode_id, &request.path)?;
+
+        let rep_header = RemoveQuotaResponse {};
+        ctx.response(rep_header)
+    }
+
+    fn get_quota_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: GetQuotaInfoRequest = ctx.parse_header()?;
+
+        // Get inode ID from FileStatus using MasterFilesystem
+        let file_status = self
+            .fs
+            .file_status(&request.path)
+            .map_err(|_| FsError::common(format!("Directory '{}' not found.", &request.path)))?;
+        let inode_id = file_status.id;
+
+        let quota_info = self.quota_manager.get_quota_info(inode_id)?;
+        let quota_info_pb = quota_info.map(ProtoUtils::quota_info_to_pb);
+
+        let rep_header = GetQuotaInfoResponse {
+            quota_info: quota_info_pb,
+        };
+        ctx.response(rep_header)
+    }
+
+    fn get_quota_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetQuotaTableRequest = ctx.parse_header()?;
+
+        let table = self
+            .quota_manager
+            .get_quota_usage(&self.fs.fs_dir)?;
+        
+        let quota_table: Vec<QuotaInfoPb> = table
+            .into_iter()
+            .map(ProtoUtils::quota_info_to_pb)
+            .collect();
+
+        let rep_header = GetQuotaTableResponse { quota_table };
+        ctx.response(rep_header)
+    }
+
     fn set_attr_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         if self.check_is_retry(ctx.msg.req_id())? {
             return ctx.response(SetAttrResponse::default());
@@ -443,6 +537,13 @@ impl MessageHandler for MasterHandler {
             RpcCode::UnMount => self.umount(ctx),
             RpcCode::GetMountTable => self.get_mount_table(ctx),
             RpcCode::GetMountInfo => self.get_mount_info(ctx),
+
+            // Quota management
+            RpcCode::AddQuota => self.add_quota(ctx),
+            RpcCode::UpdateQuota => self.update_quota(ctx),
+            RpcCode::RemoveQuota => self.remove_quota(ctx),
+            RpcCode::GetQuotaInfo => self.get_quota_info(ctx),
+            RpcCode::GetQuotaTable => self.get_quota_table(ctx),
 
             RpcCode::MetricsReport => self.metrics_report(ctx),
 

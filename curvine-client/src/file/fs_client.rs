@@ -322,6 +322,57 @@ impl FsClient {
         Ok(rep)
     }
 
+    pub async fn add_quota(&self, path: &str, quota_size: i64) -> FsResult<()> {
+        let req = AddQuotaRequest {
+            path: path.to_string(),
+            quota_size,
+        };
+
+        let _rep: AddQuotaResponse = self.rpc(RpcCode::AddQuota, req).await?;
+        Ok(())
+    }
+
+    pub async fn update_quota(&self, path: &str, quota_size: i64) -> FsResult<()> {
+        let req = UpdateQuotaRequest {
+            path: path.to_string(),
+            quota_size,
+        };
+
+        let _rep: UpdateQuotaResponse = self.rpc(RpcCode::UpdateQuota, req).await?;
+        Ok(())
+    }
+
+    pub async fn remove_quota(&self, path: &str) -> FsResult<()> {
+        let req = RemoveQuotaRequest {
+            path: path.to_string(),
+        };
+
+        let _rep: RemoveQuotaResponse = self.rpc(RpcCode::RemoveQuota, req).await?;
+        Ok(())
+    }
+
+    pub async fn get_quota_info(&self, path: &str) -> FsResult<Option<QuotaInfo>> {
+        let req = GetQuotaInfoRequest {
+            path: path.to_string(),
+        };
+
+        let rep: GetQuotaInfoResponse = self.rpc(RpcCode::GetQuotaInfo, req).await?;
+        Ok(rep.quota_info.map(ProtoUtils::quota_info_from_pb))
+    }
+
+    pub async fn get_quota_table(&self) -> FsResult<Vec<QuotaInfo>> {
+        let req = GetQuotaTableRequest {};
+        let rep: GetQuotaTableResponse = self.rpc(RpcCode::GetQuotaTable, req).await?;
+
+        let table = rep
+            .quota_table
+            .into_iter()
+            .map(ProtoUtils::quota_info_from_pb)
+            .collect();
+
+        Ok(table)
+    }
+
     pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
         let req = SetAttrRequest {
             path: path.encode(),

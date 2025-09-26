@@ -20,6 +20,8 @@ use curvine_common::state::{
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
+use curvine_server::master::quota::QuotaTable;
+use curvine_server::master::QuotaManager;
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
@@ -55,7 +57,8 @@ fn check_journal_state() -> CommonResult<()> {
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
     let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
-    let journal_loader = JournalLoader::new(fs_follower.fs_dir(), mnt_mgr2.clone(), &conf.journal);
+    let quota_mgr = Arc::new(QuotaManager::new(QuotaTable::new(fs_follower.fs_dir())));
+    let journal_loader = JournalLoader::new(fs_follower.fs_dir(), mnt_mgr2.clone(), quota_mgr, &conf.journal);
 
     let entries = journal_system.fs().fs_dir.read().take_entries();
     info!("entries size {}", entries.len());

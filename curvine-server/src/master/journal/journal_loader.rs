@@ -18,6 +18,7 @@ use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::{MountManager, QuotaManager, SyncFsDir};
+use crate::master::meta::FsDir;
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -130,9 +131,22 @@ impl JournalLoader {
         // For journal replay, we directly update the file with the entry's file data
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
+        let old_len = file.len;
+        let new_len = entry.file.len;
         let _ = mem::replace(file, entry.file);
 
         fs_dir.store.apply_overwrite_file(inode.as_ref())?;
+
+        // Quota incremental tracking: coalesce into a batch
+        let delta = new_len - old_len;
+        if delta != 0 {
+            let last_parent_index = inp.existing_len() as isize - 2;
+            let fs_dir_mut = self.fs_dir.write();
+            let inode_store = fs_dir_mut.inode_store();
+            let mut batch = inode_store.new_batch();
+            FsDir::propagate_size_delta_into_batch(&fs_dir_mut, &mut batch, &inp, last_parent_index, delta)?;
+            batch.commit()?;
+        }
 
         Ok(())
     }
@@ -157,12 +171,25 @@ impl JournalLoader {
 
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
+        let old_len = file.len;
 
         let _ = mem::replace(file, entry.file);
+        let new_len = file.len;
         // Update block location
         fs_dir
             .store
             .apply_complete_file(inode.as_ref(), entry.commit_block.as_ref())?;
+
+        // Quota incremental tracking: coalesce into a batch
+        let delta = new_len - old_len;
+        if delta != 0 {
+            let last_parent_index = inp.existing_len() as isize - 2;
+            let fs_dir_mut = self.fs_dir.write();
+            let inode_store = fs_dir_mut.inode_store();
+            let mut batch = inode_store.new_batch();
+            FsDir::propagate_size_delta_into_batch(&fs_dir_mut, &mut batch, &inp, last_parent_index, delta)?;
+            batch.commit()?;
+        }
 
         Ok(())
     }
@@ -232,7 +259,7 @@ impl JournalLoader {
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.dst_path, &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), &entry.dst_path, &fs_dir.store)?;
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
@@ -240,7 +267,34 @@ impl JournalLoader {
             None => return err_box!("Original file not found during link recovery"),
         };
 
-        fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms)?;
+        // Read file length for propagation before applying link
+        let file_len = {
+            let inode = try_option!(old_path.get_last_inode());
+            match inode.as_ref() {
+                File(_, f) => f.len,
+                _ => 0,
+            }
+        };
+
+        fs_dir.unprotected_link(new_path.clone(), original_inode_id, entry.op_ms)?;
+
+        // Quota incremental tracking: +len on destination parents
+        if file_len != 0 {
+            let root_ptr = fs_dir.root_ptr();
+            let store = fs_dir.store.clone();
+            drop(fs_dir);
+            if let Ok(dst_inp2) = InodePath::resolve(root_ptr, &entry.dst_path, &store) {
+                let dst_parent_index: isize = match dst_inp2.get_last_inode() {
+                    Some(ref v) if v.is_dir() => dst_inp2.existing_len() as isize - 1,
+                    _ => dst_inp2.existing_len() as isize - 2,
+                };
+                let fs_dir2 = self.fs_dir.write();
+                let inode_store2 = fs_dir2.inode_store();
+                let mut batch = inode_store2.new_batch();
+                FsDir::propagate_size_delta_into_batch(&fs_dir2, &mut batch, &dst_inp2, dst_parent_index, file_len)?;
+                batch.commit()?;
+            }
+        }
         Ok(())
     }
 
@@ -338,12 +392,12 @@ impl AppStorage for JournalLoader {
             let data = try_option_ref!(snapshot.files_data);
             self.seq_id.set(snapshot.snapshot_id + 1);
             fs_dir.restore(&data.dir)?;
-        }
+        } // fs_dir write lock is released here
         {
             self.mnt_mgr.restore();
         }
         {
-            self.quota_mgr.restore();
+            self.quota_mgr.restore(); // Now safe to call - no fs_dir write lock held
         }
         Ok(())
     }

@@ -25,6 +25,8 @@ use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::quota::QuotaTable;
+use curvine_server::master::QuotaManager;
 use orpc::common::LocalTime;
 use orpc::common::Utils;
 use orpc::message::Builder;
@@ -83,10 +85,11 @@ fn new_handler() -> MasterHandler {
     ));
     MasterHandler::new(
         &conf,
-        fs,
+        fs.clone(),
         retry_cache,
         None,
         mount_manager,
+        Arc::new(QuotaManager::new(QuotaTable::new(fs.fs_dir()))),
         JobHandler::new(job_manager),
         replication_manager,
     )

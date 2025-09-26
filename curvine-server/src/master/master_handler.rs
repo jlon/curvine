@@ -422,7 +422,20 @@ impl MasterHandler {
             .map_err(|_| FsError::common(format!("Directory '{}' not found.", &request.path)))?;
         let inode_id = file_status.id;
 
-        let quota_info = self.quota_manager.get_quota_info(inode_id)?;
+        // Get quota info and update with real-time usage
+        let mut quota_info = self.quota_manager.get_quota_info(inode_id)?;
+        if let Some(ref mut info) = quota_info {
+            // Use file_status.len directly instead of re-querying subtree_bytes
+            // For directories, file_status.len equals subtree_bytes
+            info.used_size = file_status.len;
+            info.state = if info.is_exceeded() {
+                curvine_common::state::QuotaState::Exceeded
+            } else {
+                curvine_common::state::QuotaState::Available
+            };
+            info.updated_time = orpc::common::LocalTime::mills() as i64;
+        }
+        
         let quota_info_pb = quota_info.map(ProtoUtils::quota_info_to_pb);
 
         let rep_header = GetQuotaInfoResponse {
@@ -434,9 +447,29 @@ impl MasterHandler {
     fn get_quota_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetQuotaTableRequest = ctx.parse_header()?;
 
-        let table = self
-            .quota_manager
-            .get_quota_usage(&self.fs.fs_dir)?;
+        // Get all quota definitions without expensive subtree_bytes lookup
+        let mut table = self.quota_manager.get_quota_table()?;
+        
+        // Update used_size for each quota by reading subtree_bytes efficiently
+        for quota_info in &mut table {
+            let file_status = match self.fs.file_status(&quota_info.path) {
+                Ok(status) => status,
+                Err(_) => {
+                    log::warn!("Failed to get file status for quota path: {}", quota_info.path);
+                    quota_info.used_size = 0;
+                    continue;
+                }
+            };
+            
+            // Use file_status.len directly (equals subtree_bytes for directories)
+            quota_info.used_size = file_status.len;
+            quota_info.state = if quota_info.is_exceeded() {
+                curvine_common::state::QuotaState::Exceeded
+            } else {
+                curvine_common::state::QuotaState::Available
+            };
+            quota_info.updated_time = orpc::common::LocalTime::mills() as i64;
+        }
         
         let quota_table: Vec<QuotaInfoPb> = table
             .into_iter()

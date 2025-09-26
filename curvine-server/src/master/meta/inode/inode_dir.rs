@@ -29,9 +29,8 @@ pub struct InodeDir {
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
     pub(crate) storage_policy: StoragePolicy,
-
     pub(crate) features: DirFeature,
-
+    pub(crate) subtree_bytes: i64,
     #[serde(skip)]
     children: InodeChildren,
 }
@@ -45,6 +44,7 @@ impl InodeDir {
             atime: time,
             storage_policy: Default::default(),
             features: Default::default(),
+            subtree_bytes: 0,
             children: InodeChildren::new_map(),
         }
     }
@@ -60,6 +60,7 @@ impl InodeDir {
                 acl: AclFeature::with_mode(opts.mode),
                 x_attr: opts.x_attr,
             },
+            subtree_bytes: 0,
             children: InodeChildren::new_map(),
         }
     }

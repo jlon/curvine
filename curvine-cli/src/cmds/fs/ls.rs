@@ -330,9 +330,7 @@ async fn print_file_entry(
     let group = file.group.to_string(); // Default group
 
     // Format file size
-    let size = if file.is_dir {
-        "-".to_string()
-    } else if config.human_readable {
+    let size = if config.human_readable {
         crate::cmds::fs::common::format_size(file.len as u64)
     } else {
         file.len.to_string()

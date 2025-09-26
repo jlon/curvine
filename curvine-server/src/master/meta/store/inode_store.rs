@@ -349,7 +349,7 @@ impl InodeStore {
     }
 
     // Helper method to decrement nlink count of an inode
-    fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
+    pub fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
         // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {

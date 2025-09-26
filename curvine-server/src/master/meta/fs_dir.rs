@@ -17,7 +17,7 @@ use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
-use crate::master::meta::store::{InodeStore, RocksInodeStore};
+use crate::master::meta::store::{InodeStore, InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -67,6 +67,7 @@ impl FsDir {
     pub fn inode_store(&self) -> InodeStore {
         self.store.clone()
     }
+    
     // Create root directory
     pub fn create_root() -> InodeView {
         Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
@@ -87,6 +88,64 @@ impl FsDir {
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
         self.store.get_ttl_bucket_list()
+    }
+
+    /// Update subtree_bytes on ancestor chain of the given path up to last_parent_index (inclusive).
+    /// last_parent_index is an index into `path.inodes` (0-based), typically `existing_len - 2` for a file path.
+    fn propagate_size_delta_on_parents(
+        &mut self,
+        path: &InodePath,
+        last_parent_index: isize,
+        delta: i64,
+    ) -> FsResult<()> {
+        if delta == 0 || path.existing_len() == 0 || last_parent_index < 0 {
+            return Ok(());
+        }
+        let mut batch = self.store.new_batch();
+        Self::propagate_size_delta_into_batch(&self, &mut batch, path, last_parent_index, delta)?;
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// Same as propagate_size_delta_on_parents, but writes into the provided batch without committing.
+    pub(crate) fn propagate_size_delta_into_batch(
+        &self,
+        batch: &mut InodeWriteBatch<'_>,
+        path: &InodePath,
+        last_parent_index: isize,
+        delta: i64,
+    ) -> FsResult<()> {
+        // Early exit for invalid inputs
+        if delta == 0 || path.existing_len() == 0 || last_parent_index < 0 {
+            return Ok(());
+        }
+
+        // Determine the actual range to update
+        let max_idx = last_parent_index.min(path.existing_len() as isize - 1);
+        if max_idx < 0 {
+            return Ok(());
+        }
+
+        // Update in-memory parents and collect clones for persistence
+        let mut updated_dirs: Vec<InodeView> = Vec::with_capacity((max_idx + 1) as usize);
+        {
+            for idx in 0..=max_idx {
+                if let Some(parent) = path.get_inode(idx as i32) {
+                    if let Ok(dir_mut) = parent.as_mut().as_dir_mut() {
+                        dir_mut.subtree_bytes = dir_mut.subtree_bytes.saturating_add(delta);
+                    }
+                    updated_dirs.push(parent.as_ref().clone());
+                } else {
+                    log::warn!("No inode found at idx {}", idx);
+                }
+            }
+        }
+        
+        // Persist all updates in batch
+        for dir_view in updated_dirs.iter() {
+            batch.write_inode(dir_view)?;
+        }
+        Ok(())
     }
 
     pub fn mkdir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
@@ -174,25 +233,67 @@ impl FsDir {
         parent.update_mtime(mtime);
         let del_res = match child {
             File(_, file) => {
+                // Coalesced batch: unlink/delete and parent propagation in single commit
                 if file.nlink() > 1 {
                     let target_inode = target.clone();
                     if let File(_, ref mut target_file) = target_inode.as_mut() {
                         target_file.decrement_nlink();
                     }
-                    self.store.apply_unlink(parent.as_ref(), child)?
+                    let mut batch = self.store.new_batch();
+                    // write parent for unlink edge
+                    batch.write_inode(parent.as_ref())?;
+                    batch.delete_child(parent.id(), child.name())?;
+                    // decrement nlink in store
+                    self.store.decrement_inode_nlink(file.id)?;
+                    if file.len != 0 {
+                        let last_parent_index = inp.existing_len() as isize - 2;
+                        self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file.len)?;
+                    }
+                    batch.commit()?;
+                    DeleteResult::new()
                 } else {
                     // This is the last link, delete the inode
+                    let mut batch = self.store.new_batch();
+                    // recursive delete in store.apply_delete already deletes subtree; we still propagate bytes for file case
+                    batch.write_inode(parent.as_ref())?;
+                    batch.delete_child(parent.id(), child.name())?;
+                    if file.len != 0 {
+                        let last_parent_index = inp.existing_len() as isize - 2;
+                        self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file.len)?;
+                    }
+                    // rely on existing helper to collect blocks; fall back to original path
+                    batch.commit()?;
                     self.store.apply_delete(parent.as_ref(), child)?
                 }
             }
             FileEntry(_, inode_id) => {
                 // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
-                self.store
-                    .apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
+                let file_len = match self.store.get_inode(*inode_id, None)? {
+                    Some(InodeView::File(_, f)) => f.len,
+                    _ => 0,
+                };
+                let mut batch = self.store.new_batch();
+                batch.write_inode(parent.as_ref())?;
+                batch.delete_child(parent.id(), child.name())?;
+                self.store.decrement_inode_nlink(*inode_id)?;
+                if file_len != 0 {
+                    let last_parent_index = inp.existing_len() as isize - 2;
+                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file_len)?;
+                }
+                batch.commit()?;
+                DeleteResult::new()
             }
-            Dir(_, _) => {
+            Dir(_, dir) => {
                 // Directories are always deleted
+                let mut batch = self.store.new_batch();
+                batch.write_inode(parent.as_ref())?;
+                batch.delete_child(parent.id(), child.name())?;
+                if dir.subtree_bytes != 0 {
+                    let last_parent_index = inp.existing_len() as isize - 2;
+                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -dir.subtree_bytes)?;
+                }
+                batch.commit()?;
                 self.store.apply_delete(parent.as_ref(), child)?
             }
         };
@@ -261,19 +362,60 @@ impl FsDir {
         src_parent.update_mtime(mtime);
         dst_parent.update_mtime(mtime);
 
-        // Update state.
-        self.store.apply_rename(
-            src_parent.as_ref(),
-            src_inode.as_ref(),
-            dst_parent.as_ref(),
-            &new_inode,
-        )?;
+        // Quota incremental tracking for rename/move - calculate deltas first
+        let (delta_src, delta_dst) = match src_inode.as_ref() {
+            InodeView::File(_, f) => (-(f.len), f.len),
+            InodeView::Dir(_, d) => (-(d.subtree_bytes), d.subtree_bytes),
+            InodeView::FileEntry(_, _) => (0, 0),
+        };
 
-        // Update memory status.
+        // Update memory status first.
         // step 1: Delete the original node.
         // step 2: Add a new node.
         let _ = src_parent.delete_child(src_inode.id(), src_inode.name())?;
-        let _ = dst_parent.add_child(new_inode)?;
+        let _ = dst_parent.add_child(new_inode.clone())?;
+
+        // Coalesced batch: apply rename and propagate parent deltas atomically
+        {
+            let mut batch = self.store.new_batch();
+            
+            // Apply the rename operation to the batch (inline implementation)
+            // Delete the old node using the original name
+            batch.delete_child(src_parent.id(), src_inode.name())?;
+            
+            // Add new node
+            batch.write_inode(&new_inode)?;
+            batch.add_child(dst_parent.id(), new_inode.name(), new_inode.id())?;
+            
+            // Update the modification time of the parent nodes
+            batch.write_inode(src_parent.as_ref())?;
+            batch.write_inode(dst_parent.as_ref())?;
+            
+            // Propagate subtree_bytes changes if needed
+            if delta_src != 0 {
+                // Source parent chain excludes the moved node itself
+                let src_parent_index = src_inp.existing_len() as isize - 2;
+                self.propagate_size_delta_into_batch(&mut batch, src_inp, src_parent_index, delta_src)?;
+
+                // Destination parent chain: we need to update all parent directories of the new location
+                // For /quota_test/rename_dst/subdir, we want to update /quota_test/rename_dst (and its parents)
+                let dst_parent_index: isize = match dst_inp.get_last_inode() {
+                    Some(ref v) if v.is_dir() => {
+                        // If destination exists as directory, the moved item goes inside it
+                        // Update up to and including that directory
+                        dst_inp.existing_len() as isize - 1
+                    },
+                    _ => {
+                        // If destination doesn't exist, the moved item replaces the last path component
+                        // Update up to and including the parent of the last component
+                        dst_inp.existing_len() as isize - 1
+                    },
+                };
+                self.propagate_size_delta_into_batch(&mut batch, dst_inp, dst_parent_index, delta_dst)?;
+            }
+            
+            batch.commit()?;
+        }
 
         Ok(())
     }
@@ -364,7 +506,7 @@ impl FsDir {
                     match item {
                         File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
                         FileEntry(name, id) => {
-                            let inode_opt = self.store.get_inode(*id, Some(name))?;
+                            let inode_opt = self.store.get_inode(*id, Some(&name))?;
                             if let Some(inode_view) = inode_opt {
                                 res.push(inode_view.to_file_status(&child_path));
                             }
@@ -500,6 +642,7 @@ impl FsDir {
         let mut inode = try_option!(inp.get_last_inode());
         let name = inp.name();
         let file = inode.as_file_mut()?;
+        let old_len = file.len;
         if file.is_complete() {
             // The file has been completed, it is a duplicate request from the client service.
             return Ok(false);
@@ -513,8 +656,23 @@ impl FsDir {
         file.features.complete_write();
         file.len = len;
 
-        self.store
-            .apply_complete_file(inode.as_ref(), commit_block.as_ref())?;
+        // Coalesced batch: persist file changes, commit locations, and propagate parent deltas atomically
+        let delta = len - old_len;
+        {
+            let mut batch = self.store.new_batch();
+            batch.write_inode(inode.as_ref())?;
+            if let Some(commit) = commit_block.as_ref() {
+                for item in &commit.locations {
+                    batch.add_location(commit.block_id, item)?;
+                }
+            }
+            if delta != 0 {
+                let last_parent_index = inp.existing_len() as isize - 2;
+                self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, delta)?;
+            }
+            batch.commit()?;
+        }
+
         self.journal_writer.log_complete_file(
             op_ms,
             inp.path(),
@@ -575,7 +733,9 @@ impl FsDir {
         }
         let status = inode.to_file_status(inp.path());
 
+        // Persist metadata update
         self.store.apply_append_file(&inode)?;
+        // Quota incremental tracking: if block append changed committed length later, the delta will be applied at complete/commit
         self.journal_writer
             .log_append_file(op_ms, inp.path(), inode.as_file_ref()?)?;
 
@@ -621,6 +781,7 @@ impl FsDir {
                 }
 
                 let file = inode.as_mut().as_file_mut()?;
+                let old_len = file.len;
                 for block_meta in &file.blocks {
                     if let Ok(locations) = self.get_block_locations(block_meta.id) {
                         delete_result.blocks.insert(block_meta.id, locations);
@@ -628,7 +789,14 @@ impl FsDir {
                 }
                 file.overwrite(opts, op_ms as i64);
 
-                self.store.apply_overwrite_file(inode.as_ref())?;
+                // Coalesced batch: persist overwrite and propagate -old_len in one commit
+                let mut batch = self.store.new_batch();
+                batch.write_inode(inode.as_ref())?;
+                if old_len != 0 {
+                    let last_parent_index = inp.existing_len() as isize - 2;
+                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -old_len)?;
+                }
+                batch.commit()?;
             }
             None => {
                 return err_ext!(FsError::file_not_found(inp.path()));
@@ -911,11 +1079,29 @@ impl FsDir {
 
         // Create the link
         let dst_path_str = dst_path.path().to_string();
-        self.unprotected_link(dst_path, original_inode_id, op_ms)?;
+        let updated_dst_path = self.unprotected_link(dst_path, original_inode_id, op_ms)?;
 
         // Log the operation
         self.journal_writer
             .log_link(op_ms, src_path.path(), &dst_path_str)?;
+
+        // Quota incremental tracking: +len on destination parents
+        let file_len = if let Some(ip) = original_inode_ptr {
+            if let File(_, f) = ip.as_ref() { f.len } else { 0 }
+        } else {
+            match self.store.get_inode(original_inode_id, None)? {
+                Some(InodeView::File(_, f)) => f.len,
+                _ => 0,
+            }
+        };
+        if file_len != 0 {
+            // Use the updated path returned from unprotected_link
+            let dst_parent_index: isize = match updated_dst_path.get_last_inode() {
+                Some(ref v) if v.is_dir() => updated_dst_path.existing_len() as isize - 1,
+                _ => updated_dst_path.existing_len() as isize - 2,
+            };
+            self.propagate_size_delta_on_parents(&updated_dst_path, dst_parent_index, file_len)?;
+        }
 
         Ok(())
     }

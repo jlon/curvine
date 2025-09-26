@@ -17,7 +17,7 @@ use orpc::sys::RawPtr;
 mod inode_file;
 pub use self::inode_file::*;
 
-mod inode_dir;
+pub mod inode_dir;
 pub use self::inode_dir::*;
 
 mod inode_view;

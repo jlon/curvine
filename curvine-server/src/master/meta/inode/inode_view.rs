@@ -394,7 +394,7 @@ impl InodeView {
 
             Dir(_, d) => {
                 status.file_type = FileType::Dir;
-                status.len = d.children_len() as i64;
+                status.len = d.subtree_bytes;
                 status.x_attr = d.features.x_attr.clone();
                 status.storage_policy = d.storage_policy.clone();
             }

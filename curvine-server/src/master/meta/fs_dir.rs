@@ -521,6 +521,7 @@ impl FsDir {
             inode.as_file_ref()?,
             commit_block,
         )?;
+
         Ok(true)
     }
 
@@ -953,5 +954,23 @@ impl FsDir {
             .apply_link(parent.as_ref(), added.as_ref(), original_inode_id)?;
 
         Ok(new_path)
+    }
+
+    pub fn store_quota(&mut self, info: curvine_common::state::QuotaInfo) -> CommonResult<()> {
+        self.store.store.add_quota(info.inode_id, &info)?;
+        self.journal_writer
+            .log_quota_add(orpc::common::LocalTime::mills(), info)?;
+        Ok(())
+    }
+
+    pub fn remove_quota(&mut self, inode_id: i64) -> CommonResult<()> {
+        self.store.store.remove_quota(inode_id)?;
+        self.journal_writer
+            .log_quota_remove(orpc::common::LocalTime::mills(), inode_id)?;
+        Ok(())
+    }
+
+    pub fn get_quota_table(&self) -> CommonResult<Vec<curvine_common::state::QuotaInfo>> {
+        self.store.store.get_quota_table()
     }
 }

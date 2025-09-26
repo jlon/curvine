@@ -17,7 +17,7 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::{MountManager, SyncFsDir};
+use crate::master::{MountManager, QuotaManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -36,16 +36,23 @@ use std::{fs, mem};
 pub struct JournalLoader {
     fs_dir: SyncFsDir,
     mnt_mgr: Arc<MountManager>,
+    quota_mgr: Arc<QuotaManager>,
     seq_id: Arc<AtomicCounter>,
     retain_checkpoint_num: usize,
     ignore_replay_error: bool,
 }
 
 impl JournalLoader {
-    pub fn new(fs_dir: SyncFsDir, mnt_mgr: Arc<MountManager>, conf: &JournalConf) -> Self {
+    pub fn new(
+        fs_dir: SyncFsDir,
+        mnt_mgr: Arc<MountManager>,
+        quota_mgr: Arc<QuotaManager>,
+        conf: &JournalConf,
+    ) -> Self {
         Self {
             fs_dir,
             mnt_mgr,
+            quota_mgr,
             seq_id: Arc::new(AtomicCounter::new(0)),
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_replay_error: conf.ignore_replay_error,
@@ -73,6 +80,10 @@ impl JournalLoader {
             JournalEntry::Mount(e) => self.mount(e),
 
             JournalEntry::UnMount(e) => self.unmount(e),
+
+            JournalEntry::QuotaAdd(e) => self.quota_add(e),
+
+            JournalEntry::QuotaRemove(e) => self.quota_remove(e),
 
             JournalEntry::SetAttr(e) => self.set_attr(e),
 
@@ -185,6 +196,21 @@ impl JournalLoader {
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unmount(entry.id)?;
+        Ok(())
+    }
+
+    pub fn quota_add(&self, entry: QuotaAddEntry) -> CommonResult<()> {
+        self.quota_mgr.unprotected_add_quota(entry.info.clone())?;
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.store_quota(entry.info)?;
+        Ok(())
+    }
+
+    pub fn quota_remove(&self, entry: QuotaRemoveEntry) -> CommonResult<()> {
+        // Remove quota by inode_id from storage
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.remove_quota(entry.id)?;
         Ok(())
     }
 
@@ -315,6 +341,9 @@ impl AppStorage for JournalLoader {
         }
         {
             self.mnt_mgr.restore();
+        }
+        {
+            self.quota_mgr.restore();
         }
         Ok(())
     }

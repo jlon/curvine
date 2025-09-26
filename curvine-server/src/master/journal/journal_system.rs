@@ -16,7 +16,9 @@ use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::FsDir;
-use crate::master::{MasterMonitor, MetaRaftJournal, MountManager, SyncFsDir, SyncWorkerManager};
+use crate::master::{
+    MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir, SyncWorkerManager,
+};
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
@@ -39,6 +41,7 @@ pub struct JournalSystem {
     raft_journal: MetaRaftJournal,
     master_monitor: MasterMonitor,
     mount_manager: Arc<MountManager>,
+    quota_manager: Arc<QuotaManager>,
 }
 
 impl JournalSystem {
@@ -49,6 +52,7 @@ impl JournalSystem {
         raft_journal: MetaRaftJournal,
         master_monitor: MasterMonitor,
         mount_manager: Arc<MountManager>,
+        quota_manager: Arc<QuotaManager>,
     ) -> Self {
         Self {
             rt,
@@ -57,6 +61,7 @@ impl JournalSystem {
             raft_journal,
             master_monitor,
             mount_manager,
+            quota_manager,
         }
     }
 
@@ -98,10 +103,18 @@ impl JournalSystem {
 
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
 
+        let quota_table = crate::master::quota::QuotaTable::new(fs_dir.clone());
+        let quota_manager = Arc::new(QuotaManager::new(quota_table));
+
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
             log_store,
-            JournalLoader::new(fs_dir.clone(), mount_manager.clone(), &conf.journal),
+            JournalLoader::new(
+                fs_dir.clone(),
+                mount_manager.clone(),
+                quota_manager.clone(),
+                &conf.journal,
+            ),
             conf.journal.clone(),
             role_monitor,
         );
@@ -113,6 +126,7 @@ impl JournalSystem {
             raft_journal,
             master_monitor,
             mount_manager,
+            quota_manager,
         );
 
         Ok(js)
@@ -147,6 +161,10 @@ impl JournalSystem {
 
     pub fn mount_manager(&self) -> Arc<MountManager> {
         self.mount_manager.clone()
+    }
+
+    pub fn quota_manager(&self) -> Arc<QuotaManager> {
+        self.quota_manager.clone()
     }
 
     // Create a snapshot manually, dedicated for testing.

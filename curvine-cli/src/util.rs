@@ -14,7 +14,7 @@
 
 use bigdecimal::BigDecimal;
 use curvine_ufs::S3Conf;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, ToBigInt};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -269,4 +269,57 @@ pub fn bytes_to_string(size: &BigInt) -> String {
 
         format!("{:.1}{}", value, unit)
     }
+}
+
+/// Parse size string like "10GB", "1.5TB" etc. to bytes
+pub fn parse_size_string(size_str: &str) -> Result<BigInt, String> {
+    let size_str = size_str.trim().to_uppercase();
+
+    if size_str.is_empty() {
+        return Err("Size string cannot be empty".to_string());
+    }
+
+    // Define size units
+    let kib = BigInt::from(1i64 << 10); // 1024
+    let mib = BigInt::from(1i64 << 20); // 1024^2
+    let gib = BigInt::from(1i64 << 30); // 1024^3
+    let tib = BigInt::from(1i64 << 40); // 1024^4
+    let pib = BigInt::from(1i64 << 50); // 1024^5
+    let eib = BigInt::from(1i64 << 60); // 1024^6
+
+    // Find the unit suffix
+    let (num_part, multiplier) = if size_str.ends_with("EB") {
+        (&size_str[..size_str.len() - 2], eib)
+    } else if size_str.ends_with("PB") {
+        (&size_str[..size_str.len() - 2], pib)
+    } else if size_str.ends_with("TB") {
+        (&size_str[..size_str.len() - 2], tib)
+    } else if size_str.ends_with("GB") {
+        (&size_str[..size_str.len() - 2], gib)
+    } else if size_str.ends_with("MB") {
+        (&size_str[..size_str.len() - 2], mib)
+    } else if size_str.ends_with("KB") {
+        (&size_str[..size_str.len() - 2], kib)
+    } else if size_str.ends_with("B") {
+        (&size_str[..size_str.len() - 1], BigInt::from(1))
+    } else {
+        // No unit, assume bytes
+        (size_str.as_str(), BigInt::from(1))
+    };
+
+    // Parse the numeric part
+    let decimal = BigDecimal::from_str(num_part)
+        .map_err(|_| format!("Invalid number format: {}", num_part))?;
+
+    // Convert to BigInt (multiply by the unit)
+    let multiplier_decimal = BigDecimal::from_str(&multiplier.to_string()).unwrap();
+    let result_decimal = decimal * multiplier_decimal;
+
+    // Convert to BigInt (round down for fractional parts)
+    let result_str = result_decimal
+        .to_bigint()
+        .ok_or_else(|| "Failed to convert to integer".to_string())?
+        .to_string();
+
+    BigInt::from_str(&result_str).map_err(|_| "Failed to parse result as BigInt".to_string())
 }

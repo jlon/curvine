@@ -14,7 +14,7 @@
 
 use crate::master::meta::inode::InodeView;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use curvine_common::state::{BlockLocation, MountInfo};
+use curvine_common::state::{BlockLocation, MountInfo, QuotaInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
@@ -29,6 +29,7 @@ impl RocksInodeStore {
     pub const CF_BLOCK: &'static str = "block";
     pub const CF_LOCATION: &'static str = "location";
     pub const CF_MOUNTPOINT: &'static str = "mountpoints";
+    pub const CF_QUOTA: &'static str = "quotas";
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -36,7 +37,8 @@ impl RocksInodeStore {
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
-            .add_cf(Self::CF_MOUNTPOINT);
+            .add_cf(Self::CF_MOUNTPOINT)
+            .add_cf(Self::CF_QUOTA);
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
     }
@@ -172,6 +174,58 @@ impl RocksInodeStore {
         }
 
         Ok(vec)
+    }
+
+    pub fn get_quota_info(&self, id: i64) -> CommonResult<Option<QuotaInfo>> {
+        let bytes = self
+            .db
+            .get_cf(Self::CF_QUOTA, RocksUtils::i64_to_bytes(id))?;
+
+        match bytes {
+            None => Ok(None),
+            Some(v) => {
+                let info: QuotaInfo = Serde::deserialize(&v)?;
+                Ok(Some(info))
+            }
+        }
+    }
+
+    pub fn get_quota_table(&self) -> CommonResult<Vec<QuotaInfo>> {
+        let iter = self.db.scan(Self::CF_QUOTA)?;
+        let mut vec = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            let quota = Serde::deserialize::<QuotaInfo>(&bytes.1)?;
+            vec.push(quota);
+        }
+
+        Ok(vec)
+    }
+
+    pub fn add_quota(&self, inode_id: i64, entry: &QuotaInfo) -> CommonResult<()> {
+        let key = RocksUtils::i64_to_bytes(inode_id);
+        let value = Serde::serialize(entry).unwrap();
+        self.db.put_cf(RocksInodeStore::CF_QUOTA, key, value)
+    }
+
+    /// Remove quota by inode ID
+    pub fn remove_quota(&self, inode_id: i64) -> CommonResult<()> {
+        let key = RocksUtils::i64_to_bytes(inode_id);
+        self.db.delete_cf(RocksInodeStore::CF_QUOTA, key)
+    }
+
+    /// Get quota info by inode ID
+    pub fn get_quota_info_by_inode_id(&self, inode_id: i64) -> CommonResult<Option<QuotaInfo>> {
+        let bytes = self
+            .db
+            .get_cf(Self::CF_QUOTA, RocksUtils::i64_to_bytes(inode_id))?;
+        match bytes {
+            None => Ok(None),
+            Some(v) => {
+                let quota_info: QuotaInfo = Serde::deserialize(&v)?;
+                Ok(Some(quota_info))
+            }
+        }
     }
 }
 

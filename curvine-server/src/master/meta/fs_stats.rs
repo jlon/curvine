@@ -53,7 +53,23 @@ impl FileSystemStats {
 
     pub fn set_counts(&self, file_count: i64, dir_count: i64) {
         self.metrics.inode_file_num.set(file_count);
-        self.metrics.inode_file_num.set(dir_count);
+        self.metrics.inode_dir_num.set(dir_count);
+    }
+
+    /// Add a quota path for tracking (placeholder - not implemented)
+    pub fn add_quota_path(&self, _path: &str, _initial_size: i64) {
+        // Placeholder - quota tracking will be handled by periodic sync
+    }
+
+    /// Remove a quota path from tracking (placeholder - not implemented)
+    pub fn remove_quota_path(&self, _path: &str) {
+        // Placeholder - quota tracking will be handled by periodic sync
+    }
+
+    /// Get current size for a quota path (placeholder - returns None)
+    pub fn get_quota_size(&self, _path: &str) -> Option<i64> {
+        // Placeholder - will be calculated on demand
+        None
     }
 }
 

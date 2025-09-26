@@ -61,6 +61,10 @@ fn main() -> CommonResult<()> {
             Commands::Mount(cmd) => cmd.execute(fs_client).await,
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
+            Commands::Quota(cmd) => {
+                cmd.execute(fs_client).await;
+                Ok(())
+            }
             Commands::Version => {
                 println!("Curvine version: {}", version::GIT_VERSION);
                 Ok(())

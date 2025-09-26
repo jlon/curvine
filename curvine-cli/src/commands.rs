@@ -47,6 +47,10 @@ pub enum Commands {
     #[command(name = "node")]
     Node(NodeCommand),
 
+    /// Quota management
+    #[command(name = "quota")]
+    Quota(QuotaCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

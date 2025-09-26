@@ -19,7 +19,7 @@ use crate::master::meta::inode::{InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
+use curvine_common::state::{CommitBlock, MountInfo, QuotaInfo, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -199,6 +199,18 @@ impl JournalWriter {
         let entry = UnMountEntry { op_ms, id };
 
         self.send(JournalEntry::UnMount(entry))
+    }
+
+    pub fn log_quota_add(&self, op_ms: u64, info: QuotaInfo) -> FsResult<()> {
+        let entry = QuotaAddEntry { op_ms, info };
+
+        self.send(JournalEntry::QuotaAdd(entry))
+    }
+
+    pub fn log_quota_remove(&self, op_ms: u64, id: i64) -> FsResult<()> {
+        let entry = QuotaRemoveEntry { op_ms, id };
+
+        self.send(JournalEntry::QuotaRemove(entry))
     }
 
     pub fn log_set_attr(&self, op_ms: u64, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {

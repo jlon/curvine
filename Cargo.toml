@@ -92,6 +92,7 @@ bindgen = "0.69.1"
 zerocopy = { version = "0.7.35", features = ["derive"] }
 memchr = "2.6.4"
 smallvec = "1.11.2"
+lru = "0.12.5"
 
 axum = "0.7.4"
 # Note: curvine-s3-gateway uses axum 0.8.4 independently for S3 compatibility

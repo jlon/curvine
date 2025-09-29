@@ -17,3 +17,12 @@ pub use quota_table::QuotaTable;
 
 mod quota_manager;
 pub use quota_manager::QuotaManager;
+
+pub mod eviction;
+// Inline observer trait here to avoid separate control_plane module
+use curvine_common::state::FileStatus;
+pub trait QuotaObserver: Send + Sync {
+    fn on_size_change(&self, status: &FileStatus);
+    fn on_access(&self, status: &FileStatus);
+    fn on_open(&self, status: &FileStatus);
+}

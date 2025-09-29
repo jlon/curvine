@@ -19,6 +19,7 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::quota::QuotaObserver;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
@@ -39,6 +40,8 @@ pub struct FsDir {
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: JournalWriter,
+    #[allow(dead_code)]
+    pub(crate) quota_observer: Option<Arc<dyn QuotaObserver>>,
 }
 
 impl FsDir {
@@ -58,6 +61,7 @@ impl FsDir {
             inode_id: InodeId::new(),
             store: state,
             journal_writer,
+            quota_observer: None,
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -67,7 +71,7 @@ impl FsDir {
     pub fn inode_store(&self) -> InodeStore {
         self.store.clone()
     }
-    
+
     // Create root directory
     pub fn create_root() -> InodeView {
         Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
@@ -140,7 +144,7 @@ impl FsDir {
                 }
             }
         }
-        
+
         // Persist all updates in batch
         for dir_view in updated_dirs.iter() {
             batch.write_inode(dir_view)?;
@@ -205,9 +209,25 @@ impl FsDir {
         if !inp.is_empty_dir() && !recursive {
             return err_box!("{} is non empty", inp.path());
         }
+        // Capture status before deletion for eviction signaling
+        let pre_status = self.file_status(inp).ok();
+
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64)?;
+
+        // Non-blocking pre-quota eviction hooks (size-change only)
+        if let Some(mgr) = &self.quota_observer {
+            if let Some(status) = pre_status {
+                mgr.on_size_change(&status);
+            } else {
+                let fallback = FileStatus {
+                    path: inp.path().to_string(),
+                    ..Default::default()
+                };
+                mgr.on_size_change(&fallback);
+            }
+        }
 
         Ok(del_res)
     }
@@ -247,7 +267,12 @@ impl FsDir {
                     self.store.decrement_inode_nlink(file.id)?;
                     if file.len != 0 {
                         let last_parent_index = inp.existing_len() as isize - 2;
-                        self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file.len)?;
+                        self.propagate_size_delta_into_batch(
+                            &mut batch,
+                            inp,
+                            last_parent_index,
+                            -file.len,
+                        )?;
                     }
                     batch.commit()?;
                     DeleteResult::new()
@@ -259,7 +284,12 @@ impl FsDir {
                     batch.delete_child(parent.id(), child.name())?;
                     if file.len != 0 {
                         let last_parent_index = inp.existing_len() as isize - 2;
-                        self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file.len)?;
+                        self.propagate_size_delta_into_batch(
+                            &mut batch,
+                            inp,
+                            last_parent_index,
+                            -file.len,
+                        )?;
                     }
                     // rely on existing helper to collect blocks; fall back to original path
                     batch.commit()?;
@@ -279,7 +309,12 @@ impl FsDir {
                 self.store.decrement_inode_nlink(*inode_id)?;
                 if file_len != 0 {
                     let last_parent_index = inp.existing_len() as isize - 2;
-                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -file_len)?;
+                    self.propagate_size_delta_into_batch(
+                        &mut batch,
+                        inp,
+                        last_parent_index,
+                        -file_len,
+                    )?;
                 }
                 batch.commit()?;
                 DeleteResult::new()
@@ -291,7 +326,12 @@ impl FsDir {
                 batch.delete_child(parent.id(), child.name())?;
                 if dir.subtree_bytes != 0 {
                     let last_parent_index = inp.existing_len() as isize - 2;
-                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -dir.subtree_bytes)?;
+                    self.propagate_size_delta_into_batch(
+                        &mut batch,
+                        inp,
+                        last_parent_index,
+                        -dir.subtree_bytes,
+                    )?;
                 }
                 batch.commit()?;
                 self.store.apply_delete(parent.as_ref(), child)?
@@ -308,6 +348,14 @@ impl FsDir {
         self.unprotected_rename(src_inp, dst_inp, op_ms as i64)?;
         self.journal_writer
             .log_rename(op_ms, src_inp.path(), dst_inp.path(), op_ms as i64)?;
+        // Non-blocking pre-quota eviction hook: use destination status as hint (size-change only)
+        if let Some(mgr) = &self.quota_observer {
+            let status = self.file_status(dst_inp).unwrap_or_else(|_| FileStatus {
+                path: dst_inp.path().to_string(),
+                ..Default::default()
+            });
+            mgr.on_size_change(&status);
+        }
         Ok(true)
     }
 
@@ -378,24 +426,29 @@ impl FsDir {
         // Coalesced batch: apply rename and propagate parent deltas atomically
         {
             let mut batch = self.store.new_batch();
-            
+
             // Apply the rename operation to the batch (inline implementation)
             // Delete the old node using the original name
             batch.delete_child(src_parent.id(), src_inode.name())?;
-            
+
             // Add new node
             batch.write_inode(&new_inode)?;
             batch.add_child(dst_parent.id(), new_inode.name(), new_inode.id())?;
-            
+
             // Update the modification time of the parent nodes
             batch.write_inode(src_parent.as_ref())?;
             batch.write_inode(dst_parent.as_ref())?;
-            
+
             // Propagate subtree_bytes changes if needed
             if delta_src != 0 {
                 // Source parent chain excludes the moved node itself
                 let src_parent_index = src_inp.existing_len() as isize - 2;
-                self.propagate_size_delta_into_batch(&mut batch, src_inp, src_parent_index, delta_src)?;
+                self.propagate_size_delta_into_batch(
+                    &mut batch,
+                    src_inp,
+                    src_parent_index,
+                    delta_src,
+                )?;
 
                 // Destination parent chain: we need to update all parent directories of the new location
                 // For /quota_test/rename_dst/subdir, we want to update /quota_test/rename_dst (and its parents)
@@ -404,16 +457,21 @@ impl FsDir {
                         // If destination exists as directory, the moved item goes inside it
                         // Update up to and including that directory
                         dst_inp.existing_len() as isize - 1
-                    },
+                    }
                     _ => {
                         // If destination doesn't exist, the moved item replaces the last path component
                         // Update up to and including the parent of the last component
                         dst_inp.existing_len() as isize - 1
-                    },
+                    }
                 };
-                self.propagate_size_delta_into_batch(&mut batch, dst_inp, dst_parent_index, delta_dst)?;
+                self.propagate_size_delta_into_batch(
+                    &mut batch,
+                    dst_inp,
+                    dst_parent_index,
+                    delta_dst,
+                )?;
             }
-            
+
             batch.commit()?;
         }
 
@@ -680,6 +738,12 @@ impl FsDir {
             commit_block,
         )?;
 
+        // Non-blocking pre-quota eviction hook (size-change only)
+        if let Some(mgr) = &self.quota_observer {
+            let status = inode.to_file_status(inp.path());
+            mgr.on_size_change(&status);
+        }
+
         Ok(true)
     }
 
@@ -794,7 +858,12 @@ impl FsDir {
                 batch.write_inode(inode.as_ref())?;
                 if old_len != 0 {
                     let last_parent_index = inp.existing_len() as isize - 2;
-                    self.propagate_size_delta_into_batch(&mut batch, inp, last_parent_index, -old_len)?;
+                    self.propagate_size_delta_into_batch(
+                        &mut batch,
+                        inp,
+                        last_parent_index,
+                        -old_len,
+                    )?;
                 }
                 batch.commit()?;
             }
@@ -805,6 +874,15 @@ impl FsDir {
 
         // Log the operation
         self.journal_writer.log_overwrite_file(op_ms, inp)?;
+
+        // Non-blocking pre-quota eviction hook (size-change only)
+        if let Some(mgr) = &self.quota_observer {
+            let status = self.file_status(inp).unwrap_or_else(|_| FileStatus {
+                path: inp.path().to_string(),
+                ..Default::default()
+            });
+            mgr.on_size_change(&status);
+        }
 
         Ok(delete_result)
     }
@@ -1087,7 +1165,11 @@ impl FsDir {
 
         // Quota incremental tracking: +len on destination parents
         let file_len = if let Some(ip) = original_inode_ptr {
-            if let File(_, f) = ip.as_ref() { f.len } else { 0 }
+            if let File(_, f) = ip.as_ref() {
+                f.len
+            } else {
+                0
+            }
         } else {
             match self.store.get_inode(original_inode_id, None)? {
                 Some(InodeView::File(_, f)) => f.len,
@@ -1101,6 +1183,17 @@ impl FsDir {
                 _ => updated_dst_path.existing_len() as isize - 2,
             };
             self.propagate_size_delta_on_parents(&updated_dst_path, dst_parent_index, file_len)?;
+        }
+
+        // Non-blocking pre-quota eviction hook: notify destination status (size-change only)
+        if let Some(mgr) = &self.quota_observer {
+            let status = self
+                .file_status(&updated_dst_path)
+                .unwrap_or_else(|_| FileStatus {
+                    path: updated_dst_path.path().to_string(),
+                    ..Default::default()
+                });
+            mgr.on_size_change(&status);
         }
 
         Ok(())

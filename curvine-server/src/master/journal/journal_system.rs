@@ -19,6 +19,7 @@ use crate::master::meta::FsDir;
 use crate::master::{
     MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir, SyncWorkerManager,
 };
+// control_plane and QuotaEvictionManager have been inlined into QuotaManager
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
@@ -103,8 +104,11 @@ impl JournalSystem {
 
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
 
-        let quota_table = crate::master::quota::QuotaTable::new(fs_dir.clone());
-        let quota_manager = Arc::new(QuotaManager::new(quota_table));
+        let quota_manager = QuotaManager::new(conf, fs.clone(), rt.clone());
+        {
+            let mut fsd = fs_dir.write();
+            fsd.quota_observer = Some(quota_manager.clone());
+        }
 
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),

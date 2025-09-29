@@ -100,6 +100,18 @@ pub struct MasterConf {
     #[serde(skip)]
     pub ttl_bucket_interval_unit: DurationUnit,
 
+    // Pre-quota eviction configuration
+    pub enable_prequota_eviction: bool,
+    pub eviction_mode: String,
+    pub eviction_policy: String,
+    pub eviction_high_watermark: f64,
+    pub eviction_low_watermark: f64,
+    pub eviction_target_margin_ratio: f64,
+    pub eviction_candidate_scan_page: usize,
+    pub eviction_max_concurrent_tasks_per_quota: usize,
+    pub eviction_max_rate_bytes_per_s: i64,
+    pub eviction_dry_run: bool,
+    // deprecated: confirm delete no longer used
     pub ttl_max_retry_duration: String,
     #[serde(skip)]
     pub ttl_max_retry_duration_unit: DurationUnit,
@@ -246,6 +258,18 @@ impl Default for MasterConf {
 
             ttl_bucket_interval: "1h".to_string(),
             ttl_bucket_interval_unit: Default::default(),
+
+            // Pre-quota eviction defaults (disabled by default for safety)
+            enable_prequota_eviction: false,
+            eviction_mode: "FreeFile".to_string(),
+            eviction_policy: "Lru".to_string(),
+            eviction_high_watermark: 0.85,
+            eviction_low_watermark: 0.75,
+            eviction_target_margin_ratio: 0.05,
+            eviction_candidate_scan_page: 5,
+            eviction_max_concurrent_tasks_per_quota: 2,
+            eviction_max_rate_bytes_per_s: -1, // unlimited
+            eviction_dry_run: false,
 
             ttl_max_retry_duration: "10m".to_string(),
             ttl_max_retry_duration_unit: Default::default(),

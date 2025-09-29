@@ -255,7 +255,13 @@ impl MasterHandler {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
 
-        let blocks = self.fs.get_block_locations(req.path)?;
+        let blocks = self.fs.get_block_locations(req.path.clone())?;
+        {
+            let fs_dir = self.fs.fs_dir.read();
+            if let Some(mgr) = &fs_dir.quota_observer {
+                mgr.on_open(&blocks.status);
+            }
+        }
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
@@ -435,7 +441,7 @@ impl MasterHandler {
             };
             info.updated_time = orpc::common::LocalTime::mills() as i64;
         }
-        
+
         let quota_info_pb = quota_info.map(ProtoUtils::quota_info_to_pb);
 
         let rep_header = GetQuotaInfoResponse {
@@ -449,18 +455,21 @@ impl MasterHandler {
 
         // Get all quota definitions without expensive subtree_bytes lookup
         let mut table = self.quota_manager.get_quota_table()?;
-        
+
         // Update used_size for each quota by reading subtree_bytes efficiently
         for quota_info in &mut table {
             let file_status = match self.fs.file_status(&quota_info.path) {
                 Ok(status) => status,
                 Err(_) => {
-                    log::warn!("Failed to get file status for quota path: {}", quota_info.path);
+                    log::warn!(
+                        "Failed to get file status for quota path: {}",
+                        quota_info.path
+                    );
                     quota_info.used_size = 0;
                     continue;
                 }
             };
-            
+
             // Use file_status.len directly (equals subtree_bytes for directories)
             quota_info.used_size = file_status.len;
             quota_info.state = if quota_info.is_exceeded() {
@@ -470,7 +479,7 @@ impl MasterHandler {
             };
             quota_info.updated_time = orpc::common::LocalTime::mills() as i64;
         }
-        
+
         let quota_table: Vec<QuotaInfoPb> = table
             .into_iter()
             .map(ProtoUtils::quota_info_to_pb)

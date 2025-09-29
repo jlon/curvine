@@ -17,8 +17,8 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::{MountManager, QuotaManager, SyncFsDir};
 use crate::master::meta::FsDir;
+use crate::master::{MountManager, QuotaManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -144,7 +144,13 @@ impl JournalLoader {
             let fs_dir_mut = self.fs_dir.write();
             let inode_store = fs_dir_mut.inode_store();
             let mut batch = inode_store.new_batch();
-            FsDir::propagate_size_delta_into_batch(&fs_dir_mut, &mut batch, &inp, last_parent_index, delta)?;
+            FsDir::propagate_size_delta_into_batch(
+                &fs_dir_mut,
+                &mut batch,
+                &inp,
+                last_parent_index,
+                delta,
+            )?;
             batch.commit()?;
         }
 
@@ -187,7 +193,13 @@ impl JournalLoader {
             let fs_dir_mut = self.fs_dir.write();
             let inode_store = fs_dir_mut.inode_store();
             let mut batch = inode_store.new_batch();
-            FsDir::propagate_size_delta_into_batch(&fs_dir_mut, &mut batch, &inp, last_parent_index, delta)?;
+            FsDir::propagate_size_delta_into_batch(
+                &fs_dir_mut,
+                &mut batch,
+                &inp,
+                last_parent_index,
+                delta,
+            )?;
             batch.commit()?;
         }
 
@@ -291,7 +303,13 @@ impl JournalLoader {
                 let fs_dir2 = self.fs_dir.write();
                 let inode_store2 = fs_dir2.inode_store();
                 let mut batch = inode_store2.new_batch();
-                FsDir::propagate_size_delta_into_batch(&fs_dir2, &mut batch, &dst_inp2, dst_parent_index, file_len)?;
+                FsDir::propagate_size_delta_into_batch(
+                    &fs_dir2,
+                    &mut batch,
+                    &dst_inp2,
+                    dst_parent_index,
+                    file_len,
+                )?;
                 batch.commit()?;
             }
         }

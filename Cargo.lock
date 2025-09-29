@@ -1450,6 +1450,7 @@ dependencies = [
  "indexmap 2.11.0",
  "linked-hash-map",
  "log",
+ "lru",
  "mini-moka",
  "num_enum",
  "once_cell",

@@ -52,6 +52,12 @@ pub mod mount;
 
 pub mod quota;
 
+pub mod quota_eviction {
+    pub mod eviction {
+        pub use crate::master::quota::eviction::*;
+    }
+}
+
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
 pub type SyncFsDir = ArcRwLock<FsDir>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;

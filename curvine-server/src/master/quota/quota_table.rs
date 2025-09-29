@@ -14,7 +14,7 @@
 
 use crate::master::SyncFsDir;
 use curvine_common::state::QuotaInfo;
-use log::info;
+// use log::info; // lowered to debug in this module
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -41,61 +41,68 @@ impl QuotaTable {
     }
 
     pub fn has_quota(&self, inode_id: i64) -> bool {
-        let quotas = self.quotas.read().unwrap();
-        quotas.contains_key(&inode_id)
+        self.quotas
+            .read()
+            .map_or(false, |quotas| quotas.contains_key(&inode_id))
     }
 
     pub fn add_quota(&self, inode_id: i64, path: &str, quota_size: i64) -> CommonResult<()> {
-        let mut quotas = self.quotas.write().unwrap();
+        let quota_info = QuotaInfo::new(inode_id, path, quota_size);
 
-        if quotas.contains_key(&inode_id) {
-            return err_box!("Directory '{}' already has a quota defined. Please remove the existing quota first or use the update command to modify it.", path);
+        {
+            let mut quotas = self.quotas.write().unwrap();
+            if quotas.contains_key(&inode_id) {
+                return err_box!("Directory '{}' already has a quota defined. Please remove the existing quota first or use the update command to modify it.", path);
+            }
+            quotas.insert(inode_id, quota_info.clone());
         }
 
-        let quota_info = QuotaInfo::new(inode_id, path, quota_size);
-        info!("add quota: {:?}", quota_info);
+        log::debug!("add quota: {:?}", quota_info);
 
-        quotas.insert(inode_id, quota_info.clone());
-
-        let mut _guard = self.fs_dir.write();
-        _guard.store_quota(quota_info.clone())?;
+        let mut fs_guard = self.fs_dir.write();
+        fs_guard.store_quota(quota_info)?;
 
         Ok(())
     }
 
     pub fn remove_quota(&self, inode_id: i64, path: &str) -> CommonResult<()> {
-        let mut quotas = self.quotas.write().unwrap();
-
-        if !quotas.contains_key(&inode_id) {
-            return err_box!(
-                "No quota found for directory '{}'. Use 'cv quota add' to create a quota first.",
-                path
-            );
+        {
+            let mut quotas = self.quotas.write().unwrap();
+            if !quotas.contains_key(&inode_id) {
+                return err_box!(
+                    "No quota found for directory '{}'. Use 'cv quota add' to create a quota first.",
+                    path
+                );
+            }
+            quotas.remove(&inode_id);
         }
 
-        quotas.remove(&inode_id);
-
-        let mut _guard = self.fs_dir.write();
-        _guard.remove_quota(inode_id)?;
+        let mut fs_guard = self.fs_dir.write();
+        fs_guard.remove_quota(inode_id)?;
 
         Ok(())
     }
 
     pub fn update_quota(&self, inode_id: i64, path: &str, new_quota_size: i64) -> CommonResult<()> {
-        let mut quotas = self.quotas.write().unwrap();
+        let updated_quota = {
+            let mut quotas = self.quotas.write().unwrap();
+            match quotas.get_mut(&inode_id) {
+                Some(quota_info) => {
+                    quota_info.quota_size = new_quota_size;
+                    quota_info.updated_time = orpc::common::LocalTime::mills() as i64;
+                    quota_info.clone()
+                }
+                None => {
+                    return err_box!(
+                        "No quota found for directory '{}'. Use 'cv quota add' to create a quota first.",
+                        path
+                    );
+                }
+            }
+        };
 
-        if let Some(quota_info) = quotas.get_mut(&inode_id) {
-            quota_info.quota_size = new_quota_size;
-            quota_info.updated_time = orpc::common::LocalTime::mills() as i64;
-
-            let mut _guard = self.fs_dir.write();
-            _guard.store_quota(quota_info.clone())?;
-        } else {
-            return err_box!(
-                "No quota found for directory '{}'. Use 'cv quota add' to create a quota first.",
-                path
-            );
-        }
+        let mut fs_guard = self.fs_dir.write();
+        fs_guard.store_quota(updated_quota)?;
 
         Ok(())
     }

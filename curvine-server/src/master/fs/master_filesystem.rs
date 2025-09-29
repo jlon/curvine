@@ -274,8 +274,14 @@ impl MasterFilesystem {
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let p = path.as_ref();
+        let inp = Self::resolve_path(&fs_dir, p)?;
         let status = fs_dir.file_status(&inp)?;
+
+        if let Some(mgr) = &fs_dir.quota_observer {
+            mgr.on_access(&status);
+        }
+
         Ok(status)
     }
 
@@ -501,6 +507,11 @@ impl MasterFilesystem {
             status: inode.to_file_status(path),
             block_locs,
         };
+
+        // Pre-quota eviction: record access heat on read path
+        if let Some(mgr) = &fs_dir.quota_observer {
+            mgr.on_access(&locate_blocks.status);
+        }
 
         Ok(locate_blocks)
     }

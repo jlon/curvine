@@ -19,6 +19,7 @@ use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, OpenFlags};
 use log::warn;
@@ -246,8 +247,17 @@ impl NodeState {
 
             mode if mode == OpenFlags::RDWR => {
                 let writer = self.new_writer(ino, path, flags).await?;
-                let reader = self.new_reader(path).await?;
-                (Some(RawPtr::from_owned(reader)), Some(writer))
+                let reader = match self.fs.open(path).await {
+                    Ok(unified_reader) => {
+                        let fuse_reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), unified_reader);
+                        Some(RawPtr::from_owned(fuse_reader))
+                    }
+                    Err(err) => match err {
+                        FsError::FileNotFound(_) if flags.create() || flags.overwrite() => None,
+                        other => return Err(other.into()),
+                    },
+                };
+                (reader, Some(writer))
             }
             _ => {
                 return err_fuse!(
@@ -271,7 +281,13 @@ impl NodeState {
             None
         };
 
-        let handle = Arc::new(FileHandle::new(ino, self.next_fh(), reader, check_writer));
+        let handle = Arc::new(FileHandle::new(
+            ino,
+            self.next_fh(),
+            path.clone(),
+            reader,
+            check_writer,
+        ));
         lock.entry(handle.ino)
             .or_default()
             .insert(handle.fh, handle.clone());

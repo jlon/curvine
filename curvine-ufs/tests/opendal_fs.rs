@@ -14,7 +14,6 @@
 
 #[cfg(feature = "opendal-s3")]
 mod s3_test {
-    use curvine_common::conf::UfsConf;
     use curvine_common::fs::{FileSystem, Path};
     use curvine_ufs::opendal::OpendalFileSystem;
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -30,7 +29,7 @@ mod s3_test {
     #[test]
     fn s3_test() -> CommonResult<()> {
         let path = Path::from_str("s3://spark")?;
-        let fs = OpendalFileSystem::new(&path, UfsConf::with_map(minio_conf()))?;
+        let fs = OpendalFileSystem::new(&path, minio_conf())?;
         let rt = AsyncRuntime::single();
 
         rt.block_on(async move {

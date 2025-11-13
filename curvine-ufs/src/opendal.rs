@@ -14,7 +14,7 @@
 
 use crate::err_ufs;
 use crate::OpendalConf;
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
@@ -159,6 +159,9 @@ pub struct OpendalWriter {
     chunk: BytesMut,
     chunk_size: usize,
     writer: Option<opendal::Writer>,
+    is_append: bool, 
+    seek_pos: i64, 
+    random_write_buffer: Option<BytesMut>, 
 }
 
 impl Writer for OpendalWriter {
@@ -187,6 +190,91 @@ impl Writer for OpendalWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        if self.is_append {
+            let data = match chunk {
+                DataSlice::Empty => return Ok(0),
+                DataSlice::Bytes(bytes) => bytes,
+                DataSlice::Buffer(buf) => buf.freeze(),
+                DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
+                    let slice = chunk.as_slice();
+                    bytes::Bytes::copy_from_slice(slice)
+                }
+            };
+            
+            let len = data.len() as i64;
+            self.chunk.put_slice(&data);
+            return Ok(len);
+        }
+
+        if let Some(ref mut buffer) = self.random_write_buffer {
+            let len: i64;
+            let pos = self.seek_pos as usize;
+            
+            match chunk {
+                DataSlice::Empty => return Ok(0),
+                DataSlice::Bytes(ref bytes) => {
+                    len = bytes.len() as i64;
+                    let end_pos = pos + bytes.len();
+                    
+                    if buffer.len() < end_pos {
+                        buffer.reserve(end_pos - buffer.len());
+                        buffer.resize(end_pos, 0);
+                    }
+                    
+                    buffer[pos..end_pos].copy_from_slice(bytes);
+                    
+                    self.pos = end_pos as i64;
+                    self.seek_pos = end_pos as i64;
+                }
+                DataSlice::Buffer(ref buf) => {
+                    len = buf.len() as i64;
+                    let end_pos = pos + buf.len();
+                    
+                    if buffer.len() < end_pos {
+                        buffer.reserve(end_pos - buffer.len());
+                        buffer.resize(end_pos, 0);
+                    }
+                    
+                    buffer[pos..end_pos].copy_from_slice(buf);
+                    
+                    self.pos = end_pos as i64;
+                    self.seek_pos = end_pos as i64;
+                }
+                DataSlice::IOSlice(ref io_slice) => {
+                    let data = io_slice.as_slice();
+                    len = data.len() as i64;
+                    let end_pos = pos + data.len();
+                    
+                    if buffer.len() < end_pos {
+                        buffer.reserve(end_pos - buffer.len());
+                        buffer.resize(end_pos, 0);
+                    }
+                    
+                    buffer[pos..end_pos].copy_from_slice(data);
+                    
+                    self.pos = end_pos as i64;
+                    self.seek_pos = end_pos as i64;
+                }
+                DataSlice::MemSlice(ref mem_slice) => {
+                    let data = mem_slice.as_slice();
+                    len = data.len() as i64;
+                    let end_pos = pos + data.len();
+                    
+                    if buffer.len() < end_pos {
+                        buffer.reserve(end_pos - buffer.len());
+                        buffer.resize(end_pos, 0);
+                    }
+                    
+                    buffer[pos..end_pos].copy_from_slice(data);
+                    
+                    self.pos = end_pos as i64;
+                    self.seek_pos = end_pos as i64;
+                }
+            }
+            
+            return Ok(len);
+        }
+
         if self.writer.is_none() {
             self.writer = Some(
                 self.operator
@@ -201,8 +289,6 @@ impl Writer for OpendalWriter {
             DataSlice::Bytes(bytes) => bytes,
             DataSlice::Buffer(buf) => buf.freeze(),
             DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
-                // For IOSlice and MemSlice, we need to copy the data
-                // This is acceptable since OpenDAL will handle the actual I/O efficiently
                 let slice = chunk.as_slice();
                 bytes::Bytes::copy_from_slice(slice)
             }
@@ -216,15 +302,84 @@ impl Writer for OpendalWriter {
             .await
             .map_err(|e| FsError::common(format!("Failed to write: {}", e)))?;
 
+        self.pos += len;
         Ok(len)
     }
 
     async fn flush(&mut self) -> FsResult<()> {
+        if self.is_append {
+            return Ok(());
+        }
         self.flush_chunk().await?;
         Ok(())
     }
 
     async fn complete(&mut self) -> FsResult<()> {
+        if self.random_write_buffer.is_some() && !self.chunk.is_empty() {
+            self.flush_chunk().await?;
+        }
+        
+        if self.is_append {
+            if !self.chunk.is_empty() {
+                let mut writer = self.operator
+                    .writer(&self.object_path)
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to create writer for append: {}", e)))?;
+                
+                let data = self.chunk.split().freeze();
+                writer
+                    .write(data)
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to write appended data: {}", e)))?;
+                
+                writer
+                    .close()
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to close writer: {}", e)))?;
+            }
+            if self.chunk.is_empty() && self.pos == 0 {
+                let mut writer = self.operator
+                    .writer(&self.object_path)
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to create writer for empty file: {}", e)))?;
+                writer
+                    .close()
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to close empty file writer: {}", e)))?;
+            }
+            self.chunk.clear();
+            self.is_append = false; 
+            return Ok(());
+        }
+
+        if let Some(mut buffer) = self.random_write_buffer.take() {
+            let final_len = buffer.len().max(self.pos as usize);
+            
+            if buffer.len() < final_len {
+                buffer.resize(final_len, 0);
+            }
+            
+            let mut writer = self.operator
+                .writer(&self.object_path)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to create writer for random write: {}", e)))?;
+            
+            let data = buffer.freeze();
+            
+            if !data.is_empty() {
+                writer
+                    .write(data)
+                    .await
+                    .map_err(|e| FsError::common(format!("Failed to write random write data: {}", e)))?;
+            }
+            
+            writer
+                .close()
+                .await
+                .map_err(|e| FsError::common(format!("Failed to close random write writer: {}", e)))?;
+            return Ok(());
+        }
+
         self.flush().await?;
 
         if let Some(writer) = self.writer.as_mut() {
@@ -240,6 +395,46 @@ impl Writer for OpendalWriter {
 
     async fn cancel(&mut self) -> FsResult<()> {
         self.writer = None;
+        Ok(())
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(FsError::common(format!("Cannot seek to negative position: {}", pos)));
+        }
+
+        if pos == self.seek_pos {
+            return Ok(());
+        }
+
+        self.flush_chunk().await?;
+
+        if self.random_write_buffer.is_none() {
+            let existing_content = match self.operator.read(&self.object_path).await {
+                Ok(data) => data.to_vec(),
+                Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                    vec![]
+                }
+                Err(e) => {
+                    return Err(FsError::common(format!(
+                        "Failed to read existing file for seek: {}",
+                        e
+                    )));
+                }
+            };
+            
+            let capacity = existing_content.len().max(8 * 1024 * 1024);
+            let mut buffer = BytesMut::with_capacity(capacity);
+            
+            if !existing_content.is_empty() {
+                buffer.put_slice(&existing_content);
+            }
+            
+            self.random_write_buffer = Some(buffer);
+        }
+
+        self.seek_pos = pos;
+        self.pos = pos;
         Ok(())
     }
 }
@@ -535,7 +730,6 @@ impl OpendalFileSystem {
 
         let metadata = entry.metadata();
 
-        // Critical: Skip self-references to prevent infinite recursion
         if metadata.is_dir() && entry_path == parent_normalized {
             log::warn!(
                 "Filtered self-reference: '{}' points to parent '{}'",
@@ -545,7 +739,6 @@ impl OpendalFileSystem {
             return None;
         }
 
-        // Get metadata with HDFS stat optimization
         let (mtime, content_length) =
             if self.scheme == "hdfs" && metadata.is_dir() && metadata.last_modified().is_none() {
                 self.get_hdfs_metadata(&entry)
@@ -561,7 +754,6 @@ impl OpendalFileSystem {
                 )
             };
 
-        // Clean directory names (remove trailing slash)
         let name = entry.name();
         let cleaned_name = if metadata.is_dir() && name.ends_with('/') {
             &name[..name.len() - 1]
@@ -602,11 +794,9 @@ impl OpendalFileSystem {
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
         let mut object_path = self.get_object_path(path)?;
-        // Ensure directory paths end with '/' for WebHDFS
         if !object_path.ends_with('/') && !object_path.is_empty() {
             object_path.push('/');
         }
-        // Debug: Creating directory
 
         self.operator
             .create_dir(&object_path)
@@ -616,21 +806,56 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         Ok(true)
     }
 
-    async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
-        // Debug: Creating file
+        
+        let file_exists = self.operator.stat(&object_path).await.is_ok();
+        
+        if overwrite && file_exists {
+            let _ = self.operator.delete(&object_path).await;
+        }
 
-        let status = FileStatus {
-            path: path.full_path().to_owned(),
-            name: path.name().to_owned(),
-            is_dir: false,
-            mtime: 0,
-            is_complete: false,
-            len: 0,
-            replicas: 1,
-            block_size: 4 * 1024 * 1024,
-            file_type: FileType::File,
-            ..Default::default()
+        if !file_exists || overwrite {
+            let mut writer = self.operator
+                .writer(&object_path)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to create writer for new file: {}", e)))?;
+            writer
+                .close()
+                .await
+                .map_err(|e| FsError::common(format!("Failed to close writer for new file: {}", e)))?;
+        }
+
+        let status = match self.operator.stat(&object_path).await {
+            Ok(metadata) => FileStatus {
+                path: path.full_path().to_owned(),
+                name: path.name().to_owned(),
+                is_dir: false,
+                mtime: metadata
+                    .last_modified()
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(0),
+                is_complete: true,
+                len: metadata.content_length() as i64,
+                replicas: 1,
+                block_size: 4 * 1024 * 1024,
+                file_type: FileType::File,
+                ..Default::default()
+            },
+            Err(_) => {
+                FileStatus {
+                    path: path.full_path().to_owned(),
+                    name: path.name().to_owned(),
+                    is_dir: false,
+                    mtime: 0,
+                    is_complete: false,
+                    len: 0,
+                    replicas: 1,
+                    block_size: 4 * 1024 * 1024,
+                    file_type: FileType::File,
+                    ..Default::default()
+                }
+            }
         };
 
         Ok(OpendalWriter {
@@ -641,17 +866,63 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             pos: 0,
             chunk: BytesMut::with_capacity(8 * 1024 * 1024),
             chunk_size: 8 * 1024 * 1024,
-            writer: None,
+            writer: None,  // Lazy creation
+            is_append: false,
+            seek_pos: 0,
+            random_write_buffer: None,
         })
     }
 
     async fn append(&self, path: &Path) -> FsResult<OpendalWriter> {
-        // OpenDAL doesn't support append for most backends
-        // For now, return an error
-        Err(FsError::unsupported(format!(
-            "Append operation not supported for {}",
-            path.full_path()
-        )))
+        let object_path = self.get_object_path(path)?;
+        let existing_content: bytes::Bytes = match self.operator.read(&object_path).await {
+            Ok(data) => data.to_vec().into(),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                // File doesn't exist, create a new file
+                bytes::Bytes::new()
+            }
+            Err(e) => {
+                return Err(FsError::common(format!(
+                    "Failed to read existing file for append: {}",
+                    e
+                )));
+            }
+        };
+        
+        let existing_len = existing_content.len() as i64;
+        
+        let status = FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: false,
+            mtime: 0,
+            is_complete: false,
+            len: existing_len,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            file_type: FileType::File,
+            ..Default::default()
+        };
+        
+        let mut writer = OpendalWriter {
+            operator: self.operator.clone(),
+            path: path.clone(),
+            object_path,
+            status,
+            pos: existing_len,
+            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
+            chunk_size: 8 * 1024 * 1024,
+            writer: None,
+            is_append: true, 
+            seek_pos: existing_len,
+            random_write_buffer: None,
+        };
+        
+        if !existing_content.is_empty() {
+            writer.chunk.put_slice(&existing_content);
+        }
+        
+        Ok(writer)
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
@@ -719,7 +990,6 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         let metadata = match self.operator.stat(&object_path).await {
             Ok(m) => m,
             Err(e) => {
-                // Map backend NotFound to FsError::FileNotFound so FUSE can return ENOENT
                 if e.kind() == opendal::ErrorKind::NotFound {
                     return Err(FsError::file_not_found(path.full_path()));
                 }
@@ -776,7 +1046,33 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         Ok(statuses)
     }
 
-    async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
-        err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+        use tracing::debug;
+        // OpenDAL doesn't support setting file attributes directly (like atime, mtime, mode, owner, group)
+        // However, for compatibility with commands like `touch`, we should gracefully handle
+        // attribute setting requests instead of returning an error.
+        // 
+        // For most use cases:
+        // - Time updates (atime, mtime): Ignore silently - file operations will update these naturally
+        // - Mode, owner, group: Ignore silently - HDFS handles permissions differently
+        // - Other attributes: Ignore silently
+        //
+        // This allows commands like `touch` to succeed even though we can't actually set the timestamps.
+        // The file will be created/updated, and the operation will appear successful to the user.
+        
+        // Log at debug level for troubleshooting, but don't fail
+        debug!(
+            "set_attr called for path {} with opts: atime={:?}, mtime={:?}, mode={:?}, owner={:?}, group={:?}",
+            path.full_path(),
+            opts.atime,
+            opts.mtime,
+            opts.mode,
+            opts.owner,
+            opts.group
+        );
+        
+        // Return success - we gracefully ignore attribute setting since OpenDAL doesn't support it
+        // This allows commands like `touch` to work without errors
+        Ok(())
     }
 }

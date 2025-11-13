@@ -17,9 +17,10 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
+use curvine_common::fs::Path;
 use curvine_common::state::FileStatus;
 use orpc::sys::RawPtr;
-use std::sync::Arc;
+use std::sync::Arc;  // Still needed for writer
 use tokio::sync::Mutex;
 
 pub struct FileHandle {
@@ -30,14 +31,16 @@ pub struct FileHandle {
     pub lock_owner: u64, // Owner ID of flock
     pub ofd_owner: u64,  // Owner ID of OFD lock
 
-    pub reader: Option<RawPtr<FuseReader>>,
-    pub writer: Option<Arc<Mutex<FuseWriter>>>, // Writer uses Arc for global sharing
+    pub path: Path,
+    pub reader: Mutex<Option<RawPtr<FuseReader>>>,  // Lazy-initialized on first read
+    pub writer: Option<Arc<Mutex<FuseWriter>>>,     // Writer uses Arc for global sharing
 }
 
 impl FileHandle {
     pub fn new(
         ino: u64,
         fh: u64,
+        path: Path,
         reader: Option<RawPtr<FuseReader>>,
         writer: Option<Arc<Mutex<FuseWriter>>>,
     ) -> Self {
@@ -47,7 +50,8 @@ impl FileHandle {
             locks: 0,
             lock_owner: 0,
             ofd_owner: 0,
-            reader,
+            path,
+            reader: Mutex::new(reader),  // No Arc needed, FileHandle itself is wrapped in Arc
             writer,
         }
     }
@@ -58,7 +62,14 @@ impl FileHandle {
         op: Read<'_>,
         reply: FuseResponse,
     ) -> FuseResult<()> {
-        let reader = match &self.reader {
+        let mut reader_guard = self.reader.lock().await;
+
+        if reader_guard.is_none() {
+            let new_reader = state.new_reader(&self.path).await?;
+            *reader_guard = Some(RawPtr::from_owned(new_reader));
+        }
+
+        let reader = match reader_guard.as_mut() {
             Some(v) => v,
             None => return err_fuse!(libc::EIO),
         };
@@ -92,6 +103,7 @@ impl FileHandle {
         };
 
         let mut writer = lock.lock().await;
+        // Main branch already implements random write support via async task with seek
         writer.write(op, reply).await?;
         Ok(())
     }
@@ -110,7 +122,7 @@ impl FileHandle {
         if let Some(writer) = &self.writer {
             writer.lock().await.complete(reply.take()).await?;
         }
-        if let Some(reader) = &self.reader {
+        if let Some(reader) = &mut *self.reader.lock().await {
             reader.as_mut().complete(reply.take()).await?;
         }
         Ok(())

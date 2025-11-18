@@ -249,7 +249,8 @@ impl NodeState {
                 let writer = self.new_writer(ino, path, flags).await?;
                 let reader = match self.fs.open(path).await {
                     Ok(unified_reader) => {
-                        let fuse_reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), unified_reader);
+                        let fuse_reader =
+                            FuseReader::new(&self.conf, self.fs.clone_runtime(), unified_reader);
                         Some(RawPtr::from_owned(fuse_reader))
                     }
                     Err(err) => match err {

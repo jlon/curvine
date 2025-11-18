@@ -20,7 +20,8 @@ mod s3_fuse_operations_tests {
 
     fn build_s3_conf() -> HashMap<String, String> {
         let mut conf = HashMap::new();
-        let endpoint = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        let endpoint =
+            env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
         let region = env::var("S3_REGION_NAME").unwrap_or_else(|_| "us-east-1".to_string());
         let access = env::var("S3_ACCESS_KEY").unwrap_or_else(|_| "".to_string());
         let secret = env::var("S3_SECRET_KEY").unwrap_or_else(|_| "".to_string());
@@ -51,7 +52,8 @@ mod s3_fuse_operations_tests {
     fn test_touch_operation_s3() {
         let (bucket, root) = bucket_root();
         let path = s3_path(&bucket, &format!("{}/touch_test.txt", root));
-        let fs = OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
+        let fs =
+            OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -78,7 +80,8 @@ mod s3_fuse_operations_tests {
     fn test_echo_operations_s3() {
         let (bucket, root) = bucket_root();
         let path = s3_path(&bucket, &format!("{}/echo_test.txt", root));
-        let fs = OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
+        let fs =
+            OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -106,7 +109,8 @@ mod s3_fuse_operations_tests {
                     let mut buffer = vec![0; expected_len];
                     let bytes_read = reader.read(&mut buffer).await.unwrap();
                     assert_eq!(bytes_read, expected_len);
-                    let expected: Vec<u8> = [write_content.as_slice(), append_content.as_slice()].concat();
+                    let expected: Vec<u8> =
+                        [write_content.as_slice(), append_content.as_slice()].concat();
                     assert_eq!(buffer, expected);
                 }
                 Err(e) => panic!("Failed to open file for reading: {}", e),
@@ -121,7 +125,8 @@ mod s3_fuse_operations_tests {
     fn test_vim_operations_s3() {
         let (bucket, root) = bucket_root();
         let path = s3_path(&bucket, &format!("{}/vim_test.txt", root));
-        let fs = OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
+        let fs =
+            OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -168,7 +173,8 @@ mod s3_fuse_operations_tests {
     fn test_seek_operation_s3() {
         let (bucket, root) = bucket_root();
         let path = s3_path(&bucket, &format!("{}/seek_test.txt", root));
-        let fs = OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
+        let fs =
+            OpendalFileSystem::new(&path, build_s3_conf()).expect("Failed to create S3 filesystem");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -211,14 +217,16 @@ mod s3_fuse_operations_tests {
     fn test_comprehensive_fuse_operations_s3() {
         let (bucket, root) = bucket_root();
         let test_dir = s3_path(&bucket, &format!("{}/fuse_ops_test", root));
-        let fs = OpendalFileSystem::new(&test_dir, build_s3_conf()).expect("Failed to create S3 filesystem");
+        let fs = OpendalFileSystem::new(&test_dir, build_s3_conf())
+            .expect("Failed to create S3 filesystem");
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let _ = fs.mkdir(&test_dir, true).await;
 
             let file1 = s3_path(&bucket, &format!("{}/fuse_ops_test/file1.txt", root));
-            let fs1 = OpendalFileSystem::new(&file1, build_s3_conf()).expect("Failed to create filesystem");
+            let fs1 = OpendalFileSystem::new(&file1, build_s3_conf())
+                .expect("Failed to create filesystem");
             match fs1.create(&file1, false).await {
                 Ok(mut writer) => {
                     writer.complete().await.unwrap();
@@ -227,7 +235,8 @@ mod s3_fuse_operations_tests {
             }
 
             let file2 = s3_path(&bucket, &format!("{}/fuse_ops_test/file2.txt", root));
-            let fs2 = OpendalFileSystem::new(&file2, build_s3_conf()).expect("Failed to create filesystem");
+            let fs2 = OpendalFileSystem::new(&file2, build_s3_conf())
+                .expect("Failed to create filesystem");
             match fs2.create(&file2, true).await {
                 Ok(mut writer) => {
                     writer.write(b"hello\n").await.unwrap();

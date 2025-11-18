@@ -20,7 +20,7 @@ use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::fs::Path;
 use curvine_common::state::FileStatus;
 use orpc::sys::RawPtr;
-use std::sync::Arc;  // Still needed for writer
+use std::sync::Arc; // Still needed for writer
 use tokio::sync::Mutex;
 
 pub struct FileHandle {
@@ -32,8 +32,8 @@ pub struct FileHandle {
     pub ofd_owner: u64,  // Owner ID of OFD lock
 
     pub path: Path,
-    pub reader: Mutex<Option<RawPtr<FuseReader>>>,  // Lazy-initialized on first read
-    pub writer: Option<Arc<Mutex<FuseWriter>>>,     // Writer uses Arc for global sharing
+    pub reader: Mutex<Option<RawPtr<FuseReader>>>, // Lazy-initialized on first read
+    pub writer: Option<Arc<Mutex<FuseWriter>>>,    // Writer uses Arc for global sharing
 }
 
 impl FileHandle {
@@ -51,7 +51,7 @@ impl FileHandle {
             lock_owner: 0,
             ofd_owner: 0,
             path,
-            reader: Mutex::new(reader),  // No Arc needed, FileHandle itself is wrapped in Arc
+            reader: Mutex::new(reader), // No Arc needed, FileHandle itself is wrapped in Arc
             writer,
         }
     }

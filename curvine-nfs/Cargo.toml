@@ -1,0 +1,44 @@
+[package]
+name = "curvine-nfs"
+version = "0.10.2"
+edition = "2021"
+
+[lib]
+doctest = false
+
+[dependencies]
+# Use workspace dependencies
+byteorder.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+smallvec.workspace = true
+tokio-util.workspace = true
+num_enum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+clap.workspace = true
+moka.workspace = true
+
+# Direct dependencies
+hex = "0.4"
+hostname = "0.4"
+socket2 = "0.5"
+
+# Curvine dependencies
+curvine-client.workspace = true
+curvine-common.workspace = true
+orpc.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "curvine-nfs-gateway"
+path = "src/bin/curvine-nfs-gateway.rs"
+
+[features]
+default = []
+gateway = []
+

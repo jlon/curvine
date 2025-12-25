@@ -172,6 +172,13 @@ impl Worker {
             }
         }
 
+        // Start NFS gateway if enabled
+        if conf.worker.enable_nfs_gateway {
+            info!("Starting NFS gateway alongside worker");
+            let worker_rt = self.rpc_server.clone_rt();
+            Self::start_nfs_gateway(conf.clone(), worker_rt).await;
+        }
+
         // step 3: Start rpc server
         let mut rpc_status = self.rpc_server.start();
         rpc_status.wait_running().await.unwrap();
@@ -234,6 +241,39 @@ impl Worker {
                 }
                 Err(e) => {
                     log::error!("Failed to start S3 gateway on {}: {}", listen_addr, e);
+                }
+            }
+        });
+    }
+
+    /// Start NFS gateway alongside worker
+    async fn start_nfs_gateway(conf: ClusterConf, worker_rt: Arc<Runtime>) {
+        use curvine_common::conf::NfsGatewayConf;
+        use curvine_nfs::gateway::NfsGatewayServer;
+
+        let nfs_port = conf.worker.nfs_gateway_port;
+        let listen_addr = format!("0.0.0.0:{}", nfs_port);
+
+        info!("Initializing NFS gateway on {}", listen_addr);
+
+        // Create NFS gateway configuration from cluster conf, override port
+        let mut gateway_config = conf.nfs_gateway.clone();
+        gateway_config.listen_addr = "0.0.0.0".to_string();
+        gateway_config.listen_port = nfs_port;
+
+        let rt_clone = worker_rt.clone();
+        let conf_clone = conf.clone();
+
+        worker_rt.spawn(async move {
+            match NfsGatewayServer::new(conf_clone, gateway_config, rt_clone.clone()).await {
+                Ok(server) => {
+                    info!("NFS gateway started successfully on port {}", nfs_port);
+                    if let Err(e) = server.start().await {
+                        log::error!("NFS gateway stopped with error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to start NFS gateway on port {}: {}", nfs_port, e);
                 }
             }
         });

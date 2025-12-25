@@ -28,7 +28,7 @@ else
 fi
 
 # Service configuration
-SERVICE_NAME="curvine-s3-gateway"
+SERVICE_NAME="curvine-nfs-gateway"
 PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 LOG_DIR=${CURVINE_HOME}/logs
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
@@ -36,8 +36,9 @@ GRACEFULLY_TIMEOUT=15
 
 # Default values
 DEFAULT_CONF="${CURVINE_HOME}/conf/curvine-cluster.toml"
-DEFAULT_LISTEN="0.0.0.0:9900"
-DEFAULT_REGION="us-east-1"
+DEFAULT_LISTEN="0.0.0.0:2049"
+DEFAULT_EXPORT_PATH="/"
+DEFAULT_WEB_PORT=9300
 
 # Parse command line arguments
 parse_args() {
@@ -45,14 +46,8 @@ parse_args() {
     if [[ $# -gt 0 ]] && [[ "$1" =~ ^(start|stop|status|restart)$ ]]; then
         ACTION="$1"
         shift
-    # Check for credential management actions
-    elif [[ $# -gt 0 ]] && [[ "$1" == "credential" ]]; then
-        ACTION="credential"
-        shift
-        CREDENTIAL_ACTION="$1"
-        shift
     fi
-    
+
     # Then parse options
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -64,25 +59,29 @@ parse_args() {
                 LISTEN="$2"
                 shift 2
                 ;;
-            --region)
-                REGION="$2"
+            --export-path)
+                EXPORT_PATH="$2"
                 shift 2
                 ;;
-            --access-key)
-                ACCESS_KEY="$2"
-                shift 2
-                ;;
-            --secret-key)
-                SECRET_KEY="$2"
-                shift 2
-                ;;
-            --description)
-                DESCRIPTION="$2"
-                shift 2
-                ;;
-            --show-secrets)
-                SHOW_SECRETS="true"
+            --read-only)
+                READ_ONLY="true"
                 shift
+                ;;
+            --cluster-generation)
+                CLUSTER_GENERATION="$2"
+                shift 2
+                ;;
+            --default-uid)
+                DEFAULT_UID="$2"
+                shift 2
+                ;;
+            --default-gid)
+                DEFAULT_GID="$2"
+                shift 2
+                ;;
+            --web-port)
+                WEB_PORT="$2"
+                shift 2
                 ;;
             --help|-h)
                 show_usage
@@ -103,46 +102,33 @@ show_usage() {
 Usage: $0 [ACTION] [OPTIONS]
 
 SERVICE ACTIONS:
-    start       Start the curvine-s3-gateway S3 gateway service
-    stop        Stop the curvine-s3-gateway S3 gateway service
-    status      Show the status of the curvine-s3-gateway service
-    restart     Restart the curvine-s3-gateway S3 gateway service
-
-CREDENTIAL MANAGEMENT:
-    credential add          Add a new credential
-    credential generate     Generate a new random credential
-    credential list         List all credentials
-    credential stats        Show cache statistics
+    start       Start the curvine-nfs-gateway NFS gateway service
+    stop        Stop the curvine-nfs-gateway NFS gateway service
+    status      Show the status of the curvine-nfs-gateway service
+    restart     Restart the curvine-nfs-gateway NFS gateway service
 
 SERVICE OPTIONS:
-    --conf <config>         Path to curvine cluster configuration file
-                           (default: ${CURVINE_HOME}/conf/curvine-cluster.toml)
-    --listen <host:port>    Listen address (default: 0.0.0.0:9900)
-    --region <region>       S3 region to report (default: us-east-1)
-
-CREDENTIAL OPTIONS:
-    --access-key <key>      Access key ID (for 'credential add')
-    --secret-key <key>      Secret access key (for 'credential add')
-    --description <desc>    Optional description for credential
-    --show-secrets          Show secret keys in 'credential list' (WARNING: exposes sensitive data)
+    --conf <config>             Path to curvine cluster configuration file
+                               (default: ${CURVINE_HOME}/conf/curvine-cluster.toml)
+    --listen <host:port>        Listen address (default: 0.0.0.0:2049)
+    --export-path <path>        NFS export path (default: /)
+    --read-only                 Enable read-only mode
+    --cluster-generation <gen>  Cluster generation number for file handle consistency
+    --default-uid <uid>         Default UID when owner cannot be resolved (default: 65534)
+    --default-gid <gid>         Default GID when group cannot be resolved (default: 65534)
+    --web-port <port>           Web metrics port (default: 9300, 0 to disable)
 
 GENERAL OPTIONS:
-    --help, -h              Show this help message
+    --help, -h                  Show this help message
 
 SERVICE EXAMPLES:
-    $0 start                                    # Start with default settings
-    $0 start --conf /path/to/config.toml       # Start with custom config
-    $0 start --listen 127.0.0.1:9900          # Start on specific address
-    $0 stop                                     # Stop the service
-    $0 status                                   # Check service status
-    $0 restart                                  # Restart the service
-
-CREDENTIAL EXAMPLES:
-    $0 credential add --access-key AKIATEST --secret-key secret123 --description "Test key"
-    $0 credential generate --description "Auto-generated key"
-    $0 credential list                          # List credentials (secrets hidden)
-    $0 credential list --show-secrets          # List credentials with secrets
-    $0 credential stats                         # Show cache statistics
+    $0 start                                              # Start with default settings
+    $0 start --conf /path/to/config.toml                 # Start with custom config
+    $0 start --listen 127.0.0.1:2049                     # Start on specific address
+    $0 start --export-path /data --read-only             # Start read-only mode
+    $0 stop                                               # Stop the service
+    $0 status                                             # Check service status
+    $0 restart                                            # Restart the service
 
 EOF
 }
@@ -180,7 +166,7 @@ wait_for_stop() {
     local PID=$1
     local n=$(expr ${GRACEFULLY_TIMEOUT} / 3)
     local i=0
-    
+
     while [ $i -le $n ]; do
         if kill -0 ${PID} > /dev/null 2>&1; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') Waiting for ${SERVICE_NAME} to stop gracefully..."
@@ -194,7 +180,7 @@ wait_for_stop() {
 
 # Start the service
 start_service() {
-    echo "Starting ${SERVICE_NAME} S3 Gateway..."
+    echo "Starting ${SERVICE_NAME} NFS Gateway..."
 
     # Check if already running
     if check_running; then
@@ -213,7 +199,8 @@ start_service() {
     # Set configuration values
     local CONFIG_FILE=${CONF:-${DEFAULT_CONF}}
     local LISTEN_ADDR=${LISTEN:-${DEFAULT_LISTEN}}
-    local REGION_VALUE=${REGION:-${DEFAULT_REGION}}
+    local EXPORT_PATH_VALUE=${EXPORT_PATH:-${DEFAULT_EXPORT_PATH}}
+    local WEB_PORT_VALUE=${WEB_PORT:-${DEFAULT_WEB_PORT}}
 
     # Try to read from config file if not specified
     if [ -f "$CONFIG_FILE" ]; then
@@ -227,14 +214,6 @@ start_service() {
                     LISTEN_ADDR="$LISTEN_FROM_CONFIG"
                 fi
                 echo "Using listen address from config: $LISTEN_ADDR"
-            fi
-        fi
-
-        if [ -z "$REGION" ]; then
-            local REGION_FROM_CONFIG=$(grep -E '^\s*region\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/' 2>/dev/null || echo "")
-            if [ -n "$REGION_FROM_CONFIG" ]; then
-                REGION_VALUE="$REGION_FROM_CONFIG"
-                echo "Using region from config: $REGION_FROM_CONFIG"
             fi
         fi
     else
@@ -267,32 +246,57 @@ start_service() {
             exit 1
         fi
     fi
-    
+
     # Create log directory
     mkdir -p "${LOG_DIR}"
-    
+
     echo "Configuration: $CONFIG_FILE"
     echo "Listen address: $LISTEN_ADDR"
-    echo "Region: $REGION_VALUE"
-    
+    echo "Export path: $EXPORT_PATH_VALUE"
+    if [ "$READ_ONLY" = "true" ]; then
+        echo "Mode: READ-ONLY"
+    fi
+    if [ -n "$CLUSTER_GENERATION" ]; then
+        echo "Cluster generation: $CLUSTER_GENERATION"
+    fi
+    if [ -n "$WEB_PORT_VALUE" ] && [ "$WEB_PORT_VALUE" != "0" ]; then
+        echo "Web metrics port: $WEB_PORT_VALUE"
+    fi
+
+    # Build arguments for the service
+    # Note: Options must come BEFORE the serve subcommand
+    local ARGS=()
+    ARGS+=("--conf" "$CONFIG_FILE")
+
+    # Parse listen address and port
+    local LISTEN_ADDR_PART="${LISTEN_ADDR%:*}"
+    local LISTEN_PORT_PART="${LISTEN_ADDR##*:}"
+
+    ARGS+=("--listen-addr" "$LISTEN_ADDR_PART")
+    ARGS+=("--listen-port" "$LISTEN_PORT_PART")
+    ARGS+=("--export-path" "$EXPORT_PATH_VALUE")
+
+    if [ "$READ_ONLY" = "true" ]; then
+        ARGS+=(--read-only)
+    fi
+
+    # serve subcommand comes AFTER options
+    ARGS+=("serve")
+
     # Start the service in background
     cd "${CURVINE_HOME}"
-    nohup env S3_ACCESS_KEY="$S3_ACCESS_KEY" S3_SECRET_KEY="$S3_SECRET_KEY" "${BINARY_PATH}" \
-        --conf "$CONFIG_FILE" \
-        --listen "$LISTEN_ADDR" \
-        --region "$REGION_VALUE" \
-        > "${OUT_FILE}" 2>&1 < /dev/null &
-    
+    nohup "${BINARY_PATH}" "${ARGS[@]}" > "${OUT_FILE}" 2>&1 < /dev/null &
+
     local NEW_PID=$!
     sleep 3
-    
+
     # Verify the process started successfully
     if kill -0 ${NEW_PID} > /dev/null 2>&1; then
         echo ${NEW_PID} > "${PID_FILE}"
         echo "${SERVICE_NAME} started successfully with PID ${NEW_PID}"
-        echo "Gateway available at: http://${LISTEN_ADDR}"
+        echo "NFS Gateway available at: nfs://${LISTEN_ADDR}"
         echo "Log file: ${OUT_FILE}"
-        
+
         # Show recent log output
         if [ -f "${OUT_FILE}" ]; then
             echo "Recent log output:"
@@ -311,16 +315,16 @@ start_service() {
 # Stop the service
 stop_service() {
     echo "Stopping ${SERVICE_NAME}..."
-    
+
     if [ -f "${PID_FILE}" ]; then
         local PID=$(cat ${PID_FILE})
         if kill -0 ${PID} > /dev/null 2>&1; then
             echo "Sending SIGTERM to PID ${PID}..."
             kill ${PID}
-            
+
             # Wait for graceful shutdown
             wait_for_stop ${PID}
-            
+
             # Force kill if still running
             if kill -0 ${PID} > /dev/null 2>&1; then
                 echo "Warning: ${SERVICE_NAME} did not stop gracefully after ${GRACEFULLY_TIMEOUT} seconds"
@@ -328,12 +332,12 @@ stop_service() {
                 kill -9 ${PID}
                 sleep 1
             fi
-            
+
             # Clean up PID file
             if [ -f "${PID_FILE}" ]; then
                 rm -f "${PID_FILE}"
             fi
-            
+
             echo "${SERVICE_NAME} stopped successfully"
         else
             echo "Process ${PID} is not running, cleaning up PID file"
@@ -344,79 +348,16 @@ stop_service() {
     fi
 }
 
-# Handle credential management commands
-handle_credential() {
-    # Check if binary exists
-    # First check in build/dist/lib (new build structure)
-    local BINARY_PATH="${CURVINE_HOME}/build/dist/lib/${SERVICE_NAME}"
-    if [ ! -f "$BINARY_PATH" ]; then
-        # Fallback to old structure
-        BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
-        if [ ! -f "$BINARY_PATH" ]; then
-            echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
-            echo "Please ensure the project has been built with 'make all'"
-            exit 1
-        fi
-    fi
-    
-    local CONFIG_FILE=${CONF:-${DEFAULT_CONF}}
-    local CRED_ARGS=()
-    
-    # Add configuration file if exists
-    if [ -f "$CONFIG_FILE" ]; then
-        CRED_ARGS+=(--conf "$CONFIG_FILE")
-    fi
-    
-    case "$CREDENTIAL_ACTION" in
-        "add")
-            if [ -z "$ACCESS_KEY" ] || [ -z "$SECRET_KEY" ]; then
-                echo "Error: Both --access-key and --secret-key are required for 'credential add'"
-                echo "Usage: $0 credential add --access-key <key> --secret-key <secret> [--description <desc>]"
-                exit 1
-            fi
-            CRED_ARGS+=(credential add --access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY")
-            if [ -n "$DESCRIPTION" ]; then
-                CRED_ARGS+=(--description "$DESCRIPTION")
-            fi
-            ;;
-        "generate")
-            CRED_ARGS+=(credential generate)
-            if [ -n "$DESCRIPTION" ]; then
-                CRED_ARGS+=(--description "$DESCRIPTION")
-            fi
-            ;;
-        "list")
-            CRED_ARGS+=(credential list)
-            if [ "$SHOW_SECRETS" = "true" ]; then
-                CRED_ARGS+=(--show-secrets)
-            fi
-            ;;
-        "stats")
-            CRED_ARGS+=(credential stats)
-            ;;
-        *)
-            echo "Error: Unknown credential action '$CREDENTIAL_ACTION'"
-            echo "Available actions: add, generate, list, stats"
-            show_usage
-            exit 1
-            ;;
-    esac
-    
-    # Execute the credential command
-    cd "${CURVINE_HOME}"
-    exec "$BINARY_PATH" "${CRED_ARGS[@]}"
-}
-
 # Main execution logic
 main() {
     # Parse arguments
     parse_args "$@"
-    
+
     # Set default action if none specified
     if [ -z "$ACTION" ]; then
         ACTION="start"
     fi
-    
+
     # Execute action
     case "$ACTION" in
         "start")
@@ -434,9 +375,6 @@ main() {
             sleep 2
             start_service
             ;;
-        "credential")
-            handle_credential
-            ;;
         *)
             echo "Unknown action: $ACTION"
             show_usage
@@ -446,4 +384,4 @@ main() {
 }
 
 # Run main function with all arguments
-main "$@" 
+main "$@"

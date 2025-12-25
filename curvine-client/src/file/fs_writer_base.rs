@@ -299,6 +299,11 @@ impl FsWriterBase {
         // Step 4: Reset writer state
         self.len = len;
         self.file_blocks = file_blocks;
+        // If truncating (new len < current pos), update pos to new len
+        // This ensures GETATTR returns correct file size after ftruncate
+        if len < self.pos {
+            self.pos = len;
+        }
 
         Ok(())
     }

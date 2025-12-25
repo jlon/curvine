@@ -159,6 +159,12 @@ pub struct WorkerConf {
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
+
+    // Enable NFS gateway alongside worker
+    pub enable_nfs_gateway: bool,
+
+    // NFS gateway listen port (default: 2049)
+    pub nfs_gateway_port: u16,
 }
 
 impl WorkerConf {
@@ -203,6 +209,8 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
+            enable_nfs_gateway: false,
+            nfs_gateway_port: 2049,
         }
     }
 }

@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use fxhash::FxHasher;
+use moka::notification::RemovalCause;
 use moka::sync::{Cache, CacheBuilder};
 use std::hash::{BuildHasherDefault, Hash};
 use std::ops::Deref;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct FastSyncCache<K, V>(Cache<K, V, BuildHasherDefault<FxHasher>>);
@@ -28,6 +30,19 @@ where
     pub fn new(capacity: u64, ttl: Duration) -> Self {
         let inner = CacheBuilder::new(capacity)
             .time_to_live(ttl)
+            .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
+
+        Self(inner)
+    }
+
+    /// Create cache with eviction listener for cleanup on removal
+    pub fn with_eviction_listener<L>(capacity: u64, ttl: Duration, listener: L) -> Self
+    where
+        L: Fn(Arc<K>, V, RemovalCause) + Send + Sync + 'static,
+    {
+        let inner = CacheBuilder::new(capacity)
+            .time_to_live(ttl)
+            .eviction_listener(listener)
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
         Self(inner)

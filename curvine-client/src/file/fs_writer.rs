@@ -148,7 +148,14 @@ impl Writer for FsWriter {
 
     async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
         self.flush_chunk().await?;
-        self.inner.resize(opts).await
+        let new_len = opts.len;
+        self.inner.resize(opts).await?;
+        // If truncating (new len < current pos), update pos to new len
+        // This ensures GETATTR returns correct file size after ftruncate
+        if new_len < self.pos {
+            self.pos = new_len;
+        }
+        Ok(())
     }
 }
 

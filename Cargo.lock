@@ -954,6 +954,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-nfs"
+version = "0.10.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "byteorder",
+ "clap",
+ "curvine-client",
+ "curvine-common",
+ "futures",
+ "hex",
+ "hostname",
+ "libc",
+ "moka",
+ "num_enum",
+ "orpc",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "curvine-s3-gateway"
 version = "0.2.1-beta"
 dependencies = [
@@ -1004,6 +1031,7 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-nfs",
  "curvine-s3-gateway",
  "curvine-ufs",
  "curvine-web",
@@ -1713,6 +1741,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link 0.2.1",
 ]
 
 [[package]]

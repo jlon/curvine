@@ -57,6 +57,8 @@ pub struct ClusterConf {
 
     pub s3_gateway: S3GatewayConf,
 
+    pub nfs_gateway: NfsGatewayConf,
+
     pub job: JobConf,
 
     pub cli: CliConf,
@@ -280,6 +282,7 @@ impl Default for ClusterConf {
             client: Default::default(),
             fuse: FuseConf::default(),
             s3_gateway: Default::default(),
+            nfs_gateway: Default::default(),
             job: Default::default(),
             cli: Default::default(),
         }
@@ -326,5 +329,203 @@ impl Default for S3GatewayConf {
             get_chunk_size_mb: 1.0,
             web_port: 9003,
         }
+    }
+}
+
+/// NFS Gateway configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfsGatewayConf {
+    /// Listen address (default: 0.0.0.0)
+    pub listen_addr: String,
+
+    /// Listen port (default: 2049)
+    pub listen_port: u16,
+
+    /// Export path (default: /)
+    pub export_path: String,
+
+    /// Cluster generation number for file handle consistency across instances
+    /// All NFS Gateway instances must use the same value for multi-instance deployment
+    /// If 0, will use current timestamp
+    pub cluster_generation: u64,
+
+    /// Default UID when owner cannot be resolved (default: 65534 = nobody)
+    pub default_uid: u32,
+
+    /// Default GID when group cannot be resolved (default: 65534 = nogroup)
+    pub default_gid: u32,
+
+    /// Maximum cached file handles (default: 10000)
+    pub max_handles: usize,
+
+    /// Idle timeout for file handles in seconds (default: 60)
+    pub handle_idle_timeout_secs: u64,
+
+    /// Maximum cached path entries (fileid -> path) (default: 100000)
+    pub path_cache_size: usize,
+
+    /// Path cache TTL in seconds (default: 300)
+    pub path_cache_ttl_secs: u64,
+
+    /// Read-only mode (default: false)
+    pub read_only: bool,
+
+    /// Maximum read size per request in bytes (default: 1MB)
+    pub max_read_size: u32,
+
+    /// Maximum write size per request in bytes (default: 1MB)
+    pub max_write_size: u32,
+
+    /// Web metrics port (default: 9300, 0 to disable)
+    pub web_port: u16,
+
+    // ========== I/O Cache Configuration ==========
+    /// FileBlocks cache capacity (default: 10000)
+    pub file_blocks_cache_size: u64,
+
+    /// FileBlocks cache TTL in seconds (default: 60)
+    pub file_blocks_cache_ttl_secs: u64,
+
+    /// Reader pool cache capacity - max number of files with cached readers (default: 1000)
+    pub reader_cache_size: u64,
+
+    /// Reader cache TTL in seconds (default: 300)
+    pub reader_cache_ttl_secs: u64,
+
+    /// Reader pool size per file - number of parallel readers (default: 8)
+    pub reader_pool_size: usize,
+
+    /// Writer cache capacity - max number of files with cached writers (default: 1000)
+    /// FUSE-aligned: Writers are globally shared per file for data consistency
+    pub writer_cache_size: u64,
+
+    /// Writer cache TTL in seconds (default: 300)
+    /// How long to keep Writer in cache after last access
+    pub writer_cache_ttl_secs: u64,
+
+    /// Writer idle timeout in seconds before auto-close (default: 30)
+    pub writer_idle_timeout_secs: u64,
+
+    /// Writer pool size per file - number of parallel writers (default: 4)
+    pub writer_pool_size: usize,
+
+    /// Cache cleanup interval in seconds (default: 10)
+    pub cache_cleanup_interval_secs: u64,
+
+    /// FileStatus cache capacity - max number of cached file statuses (default: 10000)
+    /// Set to -1 to disable FileStatus caching
+    pub file_status_cache_size: i64,
+
+    /// FileStatus cache TTL in seconds (default: 30)
+    pub file_status_cache_ttl_secs: u64,
+
+    // ========== NFSv4 Delegation Configuration ==========
+    /// Enable NFSv4 delegations (default: false for maximum performance)
+    /// Delegations allow clients to cache file data locally, reducing server load
+    /// but adding complexity. Only enable if your workload benefits from it.
+    pub delegation_enabled: bool,
+
+    /// Delegation recall timeout in seconds (default: 30)
+    /// Time to wait for client to return delegation before revoking it
+    pub delegation_recall_timeout_secs: u64,
+
+    /// Maximum number of active delegations (default: 1000)
+    /// Limits memory usage and prevents delegation storms
+    pub delegation_max_count: usize,
+}
+
+impl Default for NfsGatewayConf {
+    fn default() -> Self {
+        Self {
+            listen_addr: "0.0.0.0".to_string(),
+            listen_port: 2049,
+            export_path: "/".to_string(),
+            cluster_generation: 0, // 0 means use timestamp
+            default_uid: 65534,    // nobody
+            default_gid: 65534,    // nogroup
+            max_handles: 10000,
+            handle_idle_timeout_secs: 60,
+            path_cache_size: 100000,
+            path_cache_ttl_secs: 300,
+            read_only: false,
+            max_read_size: 1024 * 1024,  // 1MB
+            max_write_size: 1024 * 1024, // 1MB
+            web_port: 9300,
+            // I/O Cache defaults
+            file_blocks_cache_size: 10000,
+            file_blocks_cache_ttl_secs: 60,
+            reader_cache_size: 1000,
+            reader_cache_ttl_secs: 300,
+            reader_pool_size: 8,
+            writer_cache_size: 1000,
+            writer_cache_ttl_secs: 300,
+            writer_idle_timeout_secs: 30,
+            writer_pool_size: 4,
+            cache_cleanup_interval_secs: 10,
+            file_status_cache_size: 10000i64,
+            file_status_cache_ttl_secs: 30,
+            // NFSv4 Delegation defaults (disabled for performance)
+            delegation_enabled: false,
+            delegation_recall_timeout_secs: 30,
+            delegation_max_count: 1000,
+        }
+    }
+}
+
+impl NfsGatewayConf {
+    /// Get handle idle timeout as Duration
+    #[inline]
+    pub fn handle_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.handle_idle_timeout_secs)
+    }
+
+    /// Get path cache TTL as Duration
+    #[inline]
+    pub fn path_cache_ttl(&self) -> Duration {
+        Duration::from_secs(self.path_cache_ttl_secs)
+    }
+
+    /// Get effective cluster generation
+    ///
+    /// Returns the configured cluster_generation value. If not configured (0),
+    /// derives a stable value from cluster_id hash to ensure file handles
+    /// remain valid across NFS Gateway restarts.
+    ///
+    /// For multi-instance deployments, all instances with the same cluster_id
+    /// will automatically have consistent file handle generation.
+    #[inline]
+    pub fn effective_cluster_generation(&self, cluster_id: &str) -> u64 {
+        if self.cluster_generation == 0 {
+            // Derive stable generation from cluster_id hash
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            cluster_id.hash(&mut hasher);
+            // Ensure non-zero result
+            hasher.finish().max(1)
+        } else {
+            self.cluster_generation
+        }
+    }
+
+    /// Validate configuration
+    pub fn validate(&self) -> Result<(), String> {
+        if self.listen_port == 0 {
+            return Err("Listen port cannot be 0".to_string());
+        }
+        if self.max_handles == 0 {
+            return Err("Max handles cannot be 0".to_string());
+        }
+        if self.path_cache_size == 0 {
+            return Err("Path cache size cannot be 0".to_string());
+        }
+        if self.max_read_size == 0 {
+            return Err("Max read size cannot be 0".to_string());
+        }
+        if self.max_write_size == 0 {
+            return Err("Max write size cannot be 0".to_string());
+        }
+        Ok(())
     }
 }

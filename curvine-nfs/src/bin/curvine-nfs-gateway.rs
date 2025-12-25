@@ -43,18 +43,6 @@ pub struct NfsGatewayArgs {
     #[arg(long, help = "Enable read-only mode")]
     pub read_only: bool,
 
-    #[arg(long, help = "Cluster generation number for file handle consistency")]
-    pub cluster_generation: Option<u64>,
-
-    #[arg(long, help = "Default UID when owner cannot be resolved (default: 65534)")]
-    pub default_uid: Option<u32>,
-
-    #[arg(long, help = "Default GID when group cannot be resolved (default: 65534)")]
-    pub default_gid: Option<u32>,
-
-    #[arg(long, help = "Web metrics port (default: 9300, 0 to disable)")]
-    pub web_port: Option<u16>,
-
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -114,18 +102,6 @@ fn build_nfs_config(conf: &ClusterConf, args: &NfsGatewayArgs) -> NfsGatewayConf
     if args.read_only {
         nfs_config.read_only = true;
     }
-    if let Some(gen) = args.cluster_generation {
-        nfs_config.cluster_generation = gen;
-    }
-    if let Some(uid) = args.default_uid {
-        nfs_config.default_uid = uid;
-    }
-    if let Some(gid) = args.default_gid {
-        nfs_config.default_gid = gid;
-    }
-    if let Some(port) = args.web_port {
-        nfs_config.web_port = port;
-    }
 
     nfs_config
 }
@@ -165,7 +141,7 @@ fn serve_gateway(args: NfsGatewayArgs, conf: ClusterConf) -> CommonResult<()> {
     }
 
     tracing::info!(
-        "NFS Gateway Configuration: Listen={}:{}, Export={}, ReadOnly={}",
+        "NFS Gateway configuration - Listen: {}:{}, Export: {}, ReadOnly: {}",
         nfs_config.listen_addr,
         nfs_config.listen_port,
         nfs_config.export_path,
@@ -192,6 +168,12 @@ async fn run_server(
     let server = NfsGatewayServer::new(conf, nfs_config, rt)
         .await
         .map_err(|e| format!("Failed to create NFS Gateway: {e}"))?;
+
+    tracing::info!(
+        "NFS Gateway listening on {}:{}",
+        server.listen_ip(),
+        server.listen_port()
+    );
 
     server
         .start()

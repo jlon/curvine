@@ -53,7 +53,6 @@ pub struct CurvineNfsFileSystem {
     /// I/O cache for read/write optimization
     io_cache: Arc<IoCache>,
     /// Runtime for spawning background tasks
-    #[allow(dead_code)]
     runtime: Arc<Runtime>,
 }
 
@@ -147,6 +146,7 @@ impl CurvineNfsFileSystem {
             Ok(writer) => Ok(writer),
             Err(_) => {
                 // File doesn't exist, create it
+                tracing::debug!("NFS write: file doesn't exist, creating: {}", path);
                 let mut w = self.ufs.create(path, true).await?;
                 w.complete().await?;
 
@@ -404,10 +404,11 @@ impl NFSFileSystem for CurvineNfsFileSystem {
             Some(p) => p,
             None => {
                 let pool_size = self.io_cache.reader_pool_size;
+                let rt = self.runtime.clone();
                 let p = path.clone();
                 let ufs = self.ufs.clone();
                 // Use UnifiedReader to create NfsReader (similar to FuseReader)
-                let pool = ReaderPool::new(pool_size, || async {
+                let pool = ReaderPool::new(pool_size, rt, || async {
                     // Create UnifiedReader, which will be wrapped by NfsReader
                     ufs.open(&p).await
                 })
@@ -422,10 +423,7 @@ impl NFSFileSystem for CurvineNfsFileSystem {
         // Get a reader from pool (round-robin)
         let entry = pool.get();
 
-        // Lock the reader for exclusive access
-        let mut reader = entry.reader.lock().await;
-
-        // Read data through reader (NfsReader is thread-safe via Mutex)
+        // Read data through reader (NfsReader is thread-safe via channel)
         // Critical: fuse_read will call seek(offset) internally, which will call get_read_block(offset)
         // get_read_block fails if offset >= file_len because there's no block at file end
         // We must ensure offset < file_len before calling fuse_read
@@ -437,15 +435,12 @@ impl NFSFileSystem for CurvineNfsFileSystem {
             // reader.len() comes from file_blocks.status.len when reader was created
             // If FileBlocks were refreshed above, reader pool should have been invalidated
             // But to be safe, check reader.len() against current file_len
-            let reader_len = reader.len();
+            let reader_len = entry.reader.len();
 
             // If reader's len doesn't match current file_len, reader might be using stale FileBlocks
             // This can happen if FileBlocks were refreshed but reader pool wasn't invalidated
             if offset >= reader_len as u64 || reader_len != file_len {
                 // Reader's len is stale, refresh FileBlocks and retry
-                // Drop the lock before invalidating
-                drop(reader);
-
                 self.io_cache.file_blocks.invalidate(&id);
                 self.io_cache.reader_pools.invalidate(&id);
 
@@ -466,10 +461,11 @@ impl NFSFileSystem for CurvineNfsFileSystem {
 
                 // Re-create reader pool with fresh FileBlocks
                 let pool_size = self.io_cache.reader_pool_size;
+                let rt = self.runtime.clone();
                 let p = path.clone();
                 let ufs = self.ufs.clone();
                 // Use UnifiedReader to create NfsReader (similar to FuseReader)
-                let pool = ReaderPool::new(pool_size, || async { ufs.open(&p).await })
+                let pool = ReaderPool::new(pool_size, rt, || async { ufs.open(&p).await })
                     .await
                     .map_err(Self::fs_error_to_nfs)?;
                 let pool = Arc::new(pool);
@@ -477,8 +473,7 @@ impl NFSFileSystem for CurvineNfsFileSystem {
 
                 // Get reader and retry
                 let entry = pool.get();
-                let mut reader = entry.reader.lock().await;
-                let final_len = reader.len();
+                let final_len = entry.reader.len();
                 if offset >= final_len as u64 {
                     return Ok((vec![], true));
                 }
@@ -487,7 +482,7 @@ impl NFSFileSystem for CurvineNfsFileSystem {
                 if final_read_count == 0 {
                     return Ok((vec![], true));
                 }
-                reader
+                entry.reader
                     .fuse_read(offset as i64, final_read_count as usize)
                     .await
                     .map_err(|e| {
@@ -503,7 +498,7 @@ impl NFSFileSystem for CurvineNfsFileSystem {
                 if safe_read_count == 0 {
                     return Ok((vec![], true));
                 }
-                reader
+                entry.reader
                     .fuse_read(offset as i64, safe_read_count as usize)
                     .await
                     .map_err(|e| {
@@ -552,6 +547,11 @@ impl NFSFileSystem for CurvineNfsFileSystem {
         let entry = self
             .io_cache
             .get_or_create_writer(id, || async {
+                tracing::debug!(
+                    "NFS write: creating writer for fileid={}, path={}",
+                    id,
+                    path
+                );
                 self.get_or_create_writer_for_path(id, &path).await
             })
             .await

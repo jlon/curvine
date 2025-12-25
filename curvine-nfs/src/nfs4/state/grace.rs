@@ -150,19 +150,13 @@ pub struct FilesystemRecoveryBackend {
     _marker: std::marker::PhantomData<()>,
 }
 
-impl Default for FilesystemRecoveryBackend {
-    fn default() -> Self {
-        Self {
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
 impl FilesystemRecoveryBackend {
     /// Create new filesystem recovery backend
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -598,7 +592,7 @@ impl GracePeriodManager {
     /// // Reference automatically released when guard drops
     /// ```
     #[inline]
-    pub fn acquire_grace_status(&self, want_grace: bool) -> Result<GraceGuard<'_>, Nfs4Status> {
+    pub fn acquire_grace_status(&self, want_grace: bool) -> Result<GraceGuard, Nfs4Status> {
         if self.get_grace_status(want_grace) {
             Ok(GraceGuard::new(self))
         } else if want_grace {

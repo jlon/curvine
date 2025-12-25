@@ -248,6 +248,7 @@ impl Worker {
 
     /// Start NFS gateway alongside worker
     async fn start_nfs_gateway(conf: ClusterConf, worker_rt: Arc<Runtime>) {
+        use curvine_common::conf::NfsGatewayConf;
         use curvine_nfs::gateway::NfsGatewayServer;
 
         let nfs_port = conf.worker.nfs_gateway_port;

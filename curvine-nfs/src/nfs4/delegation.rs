@@ -18,17 +18,17 @@
 //! constantly checking with the server. The server grants a delegation
 //! and uses Backchannel to recall it when another client needs access.
 //!
-//! # Performance Benefits
+//! # Performance Note
 //!
-//! Delegations significantly improve read-heavy workloads by allowing
-//! clients to cache file attributes and data locally.
+//! **Delegations are DISABLED by default** for maximum performance.
+//! Enable only if your workload benefits from client-side caching.
 //!
 //! # Delegation Types
 //!
 //! - READ: Client can cache reads, server recalls on any write
 //! - WRITE: Client can cache reads and writes, server recalls on any access
 //!
-//! # Architecture (NFS-Ganesha aligned)
+//! # Architecture
 //!
 //! ```text
 //! Client 1                    Server                    Client 2
@@ -52,21 +52,13 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 // ============================================================================
-// Constants (NFS-Ganesha aligned)
-// ============================================================================
-
-/// Time window after recall during which new delegations are denied
-/// NFS-Ganesha: RECALL2DELEG_TIME = 10 seconds
-const RECALL2DELEG_TIME_SECS: u64 = 10;
-
-// ============================================================================
 // Configuration
 // ============================================================================
 
 /// Delegation configuration
 #[derive(Clone, Debug)]
 pub struct DelegationConfig {
-    /// Whether delegations are enabled (default: true for read performance)
+    /// Whether delegations are enabled (default: false for performance)
     pub enabled: bool,
     /// Recall timeout in seconds (default: 30)
     pub recall_timeout_secs: u64,
@@ -79,8 +71,8 @@ pub struct DelegationConfig {
 impl Default for DelegationConfig {
     fn default() -> Self {
         Self {
-            // Disabled by default due to NFSv4.1 client compatibility issues
-            // Can be enabled via configuration if needed
+            // Disabled by default for maximum performance
+            // Following NFS-Ganesha's conservative approach
             enabled: false,
             recall_timeout_secs: 30,
             max_delegations: 1000,
@@ -94,11 +86,10 @@ impl Default for DelegationConfig {
 // ============================================================================
 
 /// Delegation type
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DelegationType {
     /// No delegation
-    #[default]
     None = 0,
     /// Read delegation (client can cache reads)
     Read = 1,
@@ -133,60 +124,6 @@ pub mod open4_share_access {
 // ============================================================================
 // Delegation State
 // ============================================================================
-
-/// File-level delegation statistics (NFS-Ganesha: file_deleg_stats)
-///
-/// Tracks delegation history for heuristic decisions.
-#[derive(Clone, Debug, Default)]
-pub struct FileStats {
-    /// Current number of active delegations on this file
-    pub curr_delegations: u32,
-    /// Current delegation type
-    pub deleg_type: DelegationType,
-    /// Total number of delegations ever granted
-    pub delegation_count: u32,
-    /// Total number of recalls
-    pub recall_count: u32,
-    /// Last delegation grant time
-    pub last_delegation: Option<Instant>,
-    /// Last recall time (for RECALL2DELEG_TIME check)
-    pub last_recall: Option<Instant>,
-    /// Number of opens on this file
-    pub num_opens: u32,
-    /// Number of write opens on this file
-    pub num_write_opens: u32,
-}
-
-impl FileStats {
-    /// Check if a recent recall blocks new delegation
-    /// NFS-Ganesha: time(NULL) - fds_last_recall < RECALL2DELEG_TIME
-    #[inline]
-    pub fn has_recent_recall(&self) -> bool {
-        self.last_recall
-            .map(|t| t.elapsed().as_secs() < RECALL2DELEG_TIME_SECS)
-            .unwrap_or(false)
-    }
-
-    /// Record a new delegation grant
-    pub fn record_delegation(&mut self, deleg_type: DelegationType) {
-        self.curr_delegations += 1;
-        self.delegation_count += 1;
-        self.deleg_type = deleg_type;
-        self.last_delegation = Some(Instant::now());
-    }
-
-    /// Record a delegation recall/return
-    pub fn record_recall(&mut self) {
-        if self.curr_delegations > 0 {
-            self.curr_delegations -= 1;
-        }
-        self.recall_count += 1;
-        self.last_recall = Some(Instant::now());
-        if self.curr_delegations == 0 {
-            self.deleg_type = DelegationType::None;
-        }
-    }
-}
 
 /// Delegation state for a file
 #[derive(Clone, Debug)]
@@ -240,7 +177,9 @@ impl Delegation {
 /// Delegation Manager
 ///
 /// Manages file delegations and coordinates with Backchannel for recalls.
-/// Follows NFS-Ganesha's two-stage delegation decision process.
+///
+/// **Performance Note**: Delegations are disabled by default. Enable via
+/// configuration only if your workload benefits from client-side caching.
 pub struct DelegationManager {
     /// File ID -> Delegation
     delegations: RwLock<HashMap<Fileid4, Arc<RwLock<Delegation>>>>,
@@ -248,8 +187,6 @@ pub struct DelegationManager {
     stateid_to_file: RwLock<HashMap<[u8; 12], Fileid4>>,
     /// Client ID -> File IDs with delegations
     client_delegations: RwLock<HashMap<Clientid4, Vec<Fileid4>>>,
-    /// File ID -> File statistics (NFS-Ganesha: file_deleg_stats)
-    file_stats: RwLock<HashMap<Fileid4, FileStats>>,
     /// Backchannel manager for recalls
     backchannel: Arc<BackchannelManager>,
     /// Next stateid counter
@@ -287,7 +224,6 @@ impl DelegationManager {
             delegations: RwLock::new(HashMap::new()),
             stateid_to_file: RwLock::new(HashMap::new()),
             client_delegations: RwLock::new(HashMap::new()),
-            file_stats: RwLock::new(HashMap::new()),
             backchannel,
             next_stateid: AtomicU32::new(1),
             boot_time,
@@ -297,7 +233,7 @@ impl DelegationManager {
         }
     }
 
-    /// Generate a new delegation stateid (private)
+    /// Generate a new delegation stateid
     fn generate_stateid(&self) -> Stateid4 {
         let seq = self.next_stateid.fetch_add(1, Ordering::Relaxed);
         let mut other = [0u8; 12];
@@ -305,12 +241,6 @@ impl DelegationManager {
         other[0..4].copy_from_slice(&0xDE1E0000u32.to_le_bytes());
         other[4..8].copy_from_slice(&seq.to_le_bytes());
         Stateid4::new(1, other)
-    }
-
-    /// Generate a new delegation stateid
-    /// TEMPORARY PUBLIC for testing - should be private in production
-    pub fn generate_stateid_unsafe(&self) -> Stateid4 {
-        self.generate_stateid()
     }
 
     /// Check if delegations are enabled
@@ -355,27 +285,30 @@ impl DelegationManager {
 
         // Check if client doesn't want delegation
         if want_flags & open4_share_access::WANT_NO_DELEG != 0 {
-            debug!("Client {} explicitly doesn't want delegation", clientid);
             return None;
         }
 
-        // Determine delegation type based on want flags
-        let deleg_type = self.determine_deleg_type(want_flags)?;
-
-        // Get or create file stats
-        let is_write = deleg_type == DelegationType::Write;
-
         // Stage 1: Can we grant? (technical feasibility)
-        // NFS-Ganesha: can_we_grant_deleg()
-        if !self.can_grant(fileid, is_write) {
+        if !self.can_grant(fileid) {
             return None;
         }
 
         // Stage 2: Should we grant? (policy decision)
-        // NFS-Ganesha: should_we_grant_deleg()
-        if !self.should_grant(clientid, fileid, is_write) {
+        if !self.should_grant(clientid, fileid, want_flags) {
             return None;
         }
+
+        // Determine delegation type based on want flags
+        let deleg_type = if want_flags & open4_share_access::WANT_WRITE_DELEG != 0 {
+            DelegationType::Write
+        } else if want_flags & open4_share_access::WANT_READ_DELEG != 0 {
+            DelegationType::Read
+        } else if want_flags & open4_share_access::WANT_DELEG_ANY != 0 {
+            // Default to read delegation
+            DelegationType::Read
+        } else {
+            return None;
+        };
 
         // Generate stateid and create delegation
         let stateid = self.generate_stateid();
@@ -395,14 +328,6 @@ impl DelegationManager {
             .or_default()
             .push(fileid);
 
-        // Update file stats
-        self.file_stats
-            .write()
-            .unwrap()
-            .entry(fileid)
-            .or_default()
-            .record_delegation(deleg_type);
-
         info!(
             "Granted {:?} delegation for file {} to client {}, stateid={:?}",
             deleg_type,
@@ -414,156 +339,49 @@ impl DelegationManager {
         Some(delegation)
     }
 
-    /// Determine delegation type from want flags
-    fn determine_deleg_type(&self, want_flags: u32) -> Option<DelegationType> {
-        if want_flags & open4_share_access::WANT_WRITE_DELEG != 0 {
-            Some(DelegationType::Write)
-        } else if want_flags & open4_share_access::WANT_READ_DELEG != 0 {
-            Some(DelegationType::Read)
-        } else if want_flags & open4_share_access::WANT_DELEG_ANY != 0 {
-            // Default to read delegation for WANT_DELEG_ANY
-            Some(DelegationType::Read)
-        } else {
-            None
-        }
-    }
-
     /// Check if we CAN grant a delegation (technical feasibility)
     ///
-    /// NFS-Ganesha: can_we_grant_deleg()
+    /// Following NFS-Ganesha's can_we_grant_deleg() logic:
     /// - No conflicting locks
     /// - No anonymous operations in progress
-    /// - File doesn't already have a conflicting delegation
-    fn can_grant(&self, fileid: Fileid4, is_write: bool) -> bool {
+    /// - File doesn't already have a delegation
+    fn can_grant(&self, fileid: Fileid4) -> bool {
         // Check if file already has a delegation
-        if let Some(existing) = self.delegations.read().unwrap().get(&fileid) {
-            let deleg = existing.read().unwrap();
-            // Write delegation conflicts with any existing delegation
-            if is_write {
-                debug!(
-                    "File {} already has {:?} delegation, cannot grant write",
-                    fileid, deleg.deleg_type
-                );
-                return false;
-            }
-            // Read delegation conflicts with existing write delegation
-            if deleg.deleg_type == DelegationType::Write {
-                debug!("File {} has write delegation, cannot grant read", fileid);
-                return false;
-            }
+        if self.has_delegation(fileid) {
+            debug!(
+                "File {} already has delegation, not granting new one",
+                fileid
+            );
+            return false;
         }
 
         // TODO: Check for conflicting NLM locks (when NLM support is added)
-        // NFS-Ganesha: glist_for_each(glist, &ostate->file.lock_list)
+        // TODO: Check for anonymous operations in progress
 
         true
     }
 
     /// Check if we SHOULD grant a delegation (policy decision)
     ///
-    /// NFS-Ganesha: should_we_grant_deleg()
-    /// - Check backchannel availability (CRITICAL for delegation recall)
+    /// Following NFS-Ganesha's should_we_grant_deleg() logic:
     /// - Respect maximum delegations limit
-    /// - Check recent recall history (RECALL2DELEG_TIME)
-    /// - Check write contention
-    fn should_grant(&self, clientid: Clientid4, fileid: Fileid4, is_write: bool) -> bool {
-        // CRITICAL: Check backchannel availability first
-        // NFS-Ganesha: get_cb_chan_down(client) check in should_we_grant_deleg()
-        // (state_deleg.c line 354-370)
-        //
-        // Without a working backchannel, server cannot recall delegations when
-        // another client needs access. This can cause:
-        // 1. Client waiting for delegation-related state sync (5s timeout)
-        // 2. Deadlocks when conflicting access is needed
-        //
-        // Per RFC 5661, delegation requires backchannel for CB_RECALL.
-        // If backchannel is down, we should NOT grant delegation.
-        let backchannel_available = self.is_backchannel_available(clientid);
-        if !backchannel_available {
-            debug!(
-                "Backchannel not available for client {}, not granting delegation",
-                clientid
-            );
-            return false;
-        }
-
+    /// - Check client behavior (revoke count)
+    /// - Check recent recall history
+    fn should_grant(&self, _clientid: Clientid4, _fileid: Fileid4, _want_flags: u32) -> bool {
         // Check maximum delegations limit
-        // NFS-Ganesha: g_total_num_files_delegated >= g_max_files_delegatable
-        let current_count = self.delegations.read().unwrap().len();
-        if current_count >= self.max_delegations {
+        if self.delegations.read().unwrap().len() >= self.max_delegations {
             debug!(
-                "Maximum delegations limit reached ({}/{}), not granting",
-                current_count, self.max_delegations
+                "Maximum delegations limit reached ({}), not granting new one",
+                self.max_delegations
             );
             return false;
         }
 
-        // Check file stats for recent recall
-        // NFS-Ganesha: time(NULL) - fds_last_recall < RECALL2DELEG_TIME
-        if let Some(stats) = self.file_stats.read().unwrap().get(&fileid) {
-            if stats.has_recent_recall() {
-                debug!(
-                    "File {} had recent recall, not granting delegation (RECALL2DELEG_TIME)",
-                    fileid
-                );
-                return false;
-            }
-
-            // Check write contention
-            // NFS-Ganesha: fds_num_write_opens > 0 for read, > 1 for write
-            if !is_write && stats.num_write_opens > 0 {
-                debug!(
-                    "File {} has {} write opens, not granting read delegation",
-                    fileid, stats.num_write_opens
-                );
-                return false;
-            }
-            if is_write && stats.num_write_opens > 1 {
-                debug!(
-                    "File {} has {} write opens, not granting write delegation",
-                    fileid, stats.num_write_opens
-                );
-                return false;
-            }
-        }
-
-        // TODO: Check client revoke count (num_revokes > MAX_CLIENT_REVOKES)
+        // TODO: Check client revoke count (when client tracking is added)
+        // TODO: Check recent recall history (RECALL2DELEG_TIME)
+        // TODO: Check for write file descriptors (contention detection)
 
         true
-    }
-
-    /// Check if backchannel is available for a client
-    ///
-    /// NFS-Ganesha: get_cb_chan_down(client)
-    /// Returns true if backchannel is UP and can receive callbacks.
-    ///
-    /// IMPORTANT: Without backchannel, server cannot recall delegations,
-    /// which can cause client-side delays (5s timeout) when closing files.
-    fn is_backchannel_available(&self, clientid: Clientid4) -> bool {
-        self.backchannel.is_available_for_client(clientid)
-    }
-
-    /// Update file stats when a file is opened
-    pub fn record_open(&self, fileid: Fileid4, is_write: bool) {
-        let mut stats = self.file_stats.write().unwrap();
-        let file_stats = stats.entry(fileid).or_default();
-        file_stats.num_opens += 1;
-        if is_write {
-            file_stats.num_write_opens += 1;
-        }
-    }
-
-    /// Update file stats when a file is closed
-    pub fn record_close(&self, fileid: Fileid4, is_write: bool) {
-        let mut stats = self.file_stats.write().unwrap();
-        if let Some(file_stats) = stats.get_mut(&fileid) {
-            if file_stats.num_opens > 0 {
-                file_stats.num_opens -= 1;
-            }
-            if is_write && file_stats.num_write_opens > 0 {
-                file_stats.num_write_opens -= 1;
-            }
-        }
     }
 
     /// Recall a delegation (async, via Backchannel)
@@ -642,14 +460,6 @@ impl DelegationManager {
             files.retain(|&f| f != fileid);
         }
 
-        // Update file stats (record recall)
-        self.file_stats
-            .write()
-            .unwrap()
-            .entry(fileid)
-            .or_default()
-            .record_recall();
-
         info!(
             "Delegation returned for file {} by client {}, stateid={:?}",
             fileid,
@@ -671,24 +481,15 @@ impl DelegationManager {
 
         let mut delegations = self.delegations.write().unwrap();
         let mut stateid_to_file = self.stateid_to_file.write().unwrap();
-        let mut file_stats = self.file_stats.write().unwrap();
 
-        for fileid in &fileids {
-            if let Some(deleg) = delegations.remove(fileid) {
+        for fileid in fileids {
+            if let Some(deleg) = delegations.remove(&fileid) {
                 let stateid = deleg.read().unwrap().stateid.other;
                 stateid_to_file.remove(&stateid);
-                // Update file stats
-                file_stats.entry(*fileid).or_default().record_recall();
             }
         }
 
-        if !fileids.is_empty() {
-            info!(
-                "Revoked {} delegations for client {}",
-                fileids.len(),
-                clientid
-            );
-        }
+        info!("Revoked all delegations for client {}", clientid);
     }
 
     /// Check for timed-out recalls and revoke them
@@ -706,7 +507,6 @@ impl DelegationManager {
         drop(delegations);
 
         // Revoke timed-out delegations
-        let mut file_stats = self.file_stats.write().unwrap();
         for (fileid, clientid) in &revoked {
             if let Some(deleg) = self.delegations.write().unwrap().remove(fileid) {
                 let stateid = deleg.read().unwrap().stateid.other;
@@ -714,8 +514,6 @@ impl DelegationManager {
                 if let Some(files) = self.client_delegations.write().unwrap().get_mut(clientid) {
                     files.retain(|&f| f != *fileid);
                 }
-                // Update file stats
-                file_stats.entry(*fileid).or_default().record_recall();
                 warn!(
                     "Revoked timed-out delegation for file {} from client {}",
                     fileid, clientid
@@ -790,77 +588,27 @@ impl DelegationManager {
 // Delegation Response Encoding
 // ============================================================================
 
-/// Delegation type constants (NFS-Ganesha: nfsv41.h)
-pub mod delegation_type {
-    /// No delegation
-    pub const OPEN_DELEGATE_NONE: u32 = 0;
-    /// Read delegation
-    pub const OPEN_DELEGATE_READ: u32 = 1;
-    /// Write delegation
-    pub const OPEN_DELEGATE_WRITE: u32 = 2;
-    /// No delegation with extended info (NFSv4.1+)
-    pub const OPEN_DELEGATE_NONE_EXT: u32 = 3;
-}
-
-/// Why no delegation reasons (NFS-Ganesha: nfsv41.h)
-pub mod why_no_delegation {
-    /// Client didn't want delegation
-    pub const WND4_NOT_WANTED: u32 = 0;
-    /// Contention for file
-    pub const WND4_CONTENTION: u32 = 1;
-    /// Resource limitation
-    pub const WND4_RESOURCE: u32 = 2;
-    /// File type not supported for delegation
-    pub const WND4_NOT_SUPP_FTYPE: u32 = 3;
-}
-
 /// Encode delegation for OPEN response
-///
-/// # NFS-Ganesha Reference
-/// File: nfs4_op_open.c line 605-609
-///
-/// NFSv4.1+ with WANT_DELEG_MASK set: use OPEN_DELEGATE_NONE_EXT (3)
-/// Otherwise: use OPEN_DELEGATE_NONE (0)
 pub fn encode_open_delegation(
     delegation: Option<&Delegation>,
     _file_handle: &Nfs4FileHandle,
-    minor_version: u32,
-    client_wants_deleg: bool,
 ) -> Nfs4Result<Vec<u8>> {
     use crate::protocol::xdr::XDR;
     let mut result = Vec::new();
 
     match delegation {
         None => {
-            // No delegation granted
-            // NFS-Ganesha: nfs4_op_open.c line 605-609
-            if minor_version > 0 && client_wants_deleg {
-                // NFSv4.1+ with client requesting delegation: OPEN_DELEGATE_NONE_EXT
-                delegation_type::OPEN_DELEGATE_NONE_EXT.serialize(&mut result)?;
-                // open_none_delegation4 structure:
-                //   ond_why: why_no_delegation4
-                //   union based on ond_why (only for WND4_CONTENTION and WND4_RESOURCE)
-                why_no_delegation::WND4_NOT_SUPP_FTYPE.serialize(&mut result)?;
-                // No union data for WND4_NOT_SUPP_FTYPE
-            } else {
-                // NFSv4.0 or client didn't request delegation: OPEN_DELEGATE_NONE
-                delegation_type::OPEN_DELEGATE_NONE.serialize(&mut result)?;
-            }
+            // OPEN_DELEGATE_NONE
+            0u32.serialize(&mut result)?;
         }
         Some(deleg) => {
             match deleg.deleg_type {
                 DelegationType::None => {
-                    // Same logic as None case above
-                    if minor_version > 0 && client_wants_deleg {
-                        delegation_type::OPEN_DELEGATE_NONE_EXT.serialize(&mut result)?;
-                        why_no_delegation::WND4_NOT_SUPP_FTYPE.serialize(&mut result)?;
-                    } else {
-                        delegation_type::OPEN_DELEGATE_NONE.serialize(&mut result)?;
-                    }
+                    0u32.serialize(&mut result)?;
                 }
                 DelegationType::Read => {
                     // OPEN_DELEGATE_READ
-                    delegation_type::OPEN_DELEGATE_READ.serialize(&mut result)?;
+                    1u32.serialize(&mut result)?;
                     // open_read_delegation4
                     deleg.stateid.serialize(&mut result)?;
                     false.serialize(&mut result)?; // recall = false
@@ -873,7 +621,7 @@ pub fn encode_open_delegation(
                 }
                 DelegationType::Write => {
                     // OPEN_DELEGATE_WRITE
-                    delegation_type::OPEN_DELEGATE_WRITE.serialize(&mut result)?;
+                    2u32.serialize(&mut result)?;
                     // open_write_delegation4
                     deleg.stateid.serialize(&mut result)?;
                     false.serialize(&mut result)?; // recall = false

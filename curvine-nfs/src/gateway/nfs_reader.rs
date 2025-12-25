@@ -12,94 +12,128 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! NfsReader: A direct wrapper around UnifiedReader for high-performance reads
-//!
-//! # Performance Optimization (2025-12-30)
-//! Removed Mutex to enable true concurrent reads.
-//! Each NfsReader exclusively owns its UnifiedReader instance.
-//!
-//! # Architecture Evolution
-//! 1. Original: AsyncChannel serialization (~352 MiB/s)
-//! 2. V2: Arc<Mutex<UnifiedReader>> (~547 MiB/s)
-//! 3. V3: Direct ownership, no Mutex (target: > 1000 MiB/s)
-//!
-//! # Key Insight
-//! With ReaderPool having 8 NfsReaders, each NfsReader should independently
-//! own its UnifiedReader. No sharing = no locking = maximum concurrency.
+//! NfsReader: A wrapper around UnifiedReader that uses message queue mechanism
+//! Similar to FuseReader, ensuring each read request is independent
+//! This prevents background prefetch tasks from seeking beyond file boundaries
 
 use curvine_client::unified::UnifiedReader;
+use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
+use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+use orpc::sync::ErrorMonitor;
 use orpc::sys::DataSlice;
+use std::sync::Arc;
+use tokio::sync::oneshot;
+use tracing::error;
 
-/// Direct NFS Reader - exclusively owns UnifiedReader for zero-lock reads
-///
-/// # Design
-/// - Each NfsReader owns its UnifiedReader (no Arc, no Mutex)
-/// - ReaderPool creates 8 independent NfsReaders
-/// - True 8-way concurrency with zero lock contention
-/// - Clone is NOT supported (each reader is unique)
+enum ReadTask {
+    Read(i64, usize, oneshot::Sender<FsResult<Vec<DataSlice>>>),
+    Complete(oneshot::Sender<FsResult<()>>),
+}
+
 pub struct NfsReader {
-    /// Immutable metadata (no lock needed)
     path: Path,
     len: i64,
+    sender: AsyncSender<ReadTask>,
+    err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
-    /// Exclusively owned reader (no sharing, no locking)
-    reader: UnifiedReader,
 }
 
 impl NfsReader {
-    /// Create new NfsReader with exclusive ownership
-    pub fn new(reader: UnifiedReader) -> Self {
+    pub fn new(rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let (sender, receiver) = AsyncChannel::new(1000).split();
         let status = reader.status().clone();
+
+        let monitor = err_monitor.clone();
+        rt.spawn(async move {
+            let res = Self::read_future(reader, receiver).await;
+            match res {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("nfs reader error: {}", e);
+                    monitor.set_error(e);
+                }
+            }
+        });
 
         Self {
             path,
             len,
+            sender,
+            err_monitor,
             status,
-            reader,
         }
     }
 
-    #[inline]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    #[inline]
     pub fn len(&self) -> i64 {
         self.len
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     pub fn status(&self) -> &FileStatus {
         &self.status
     }
 
-    /// Read data at specific offset and length
-    ///
-    /// # Performance
-    /// - Zero lock overhead (no Mutex)
-    /// - Direct call to UnifiedReader.fuse_read()
-    /// - Each NfsReader in the pool operates independently
-    ///
-    /// # Thread Safety
-    /// Safe because each NfsReader is accessed by only one task at a time
-    /// (round-robin selection in ReaderPool ensures this)
-    pub async fn fuse_read(&mut self, offset: i64, len: usize) -> FsResult<Vec<DataSlice>> {
-        self.reader.fuse_read(offset, len).await
+    fn check_error(&self, e: FsError) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e)
     }
 
-    /// Complete the reader and flush any pending data
-    pub async fn complete(&mut self) -> FsResult<()> {
-        self.reader.complete().await
+    /// Read data at specific offset and length
+    /// This ensures each read request is independent, similar to FuseReader
+    /// The background task only processes explicit read requests, preventing prefetch overflow
+    ///
+    /// # Thread Safety
+    /// This method is thread-safe because AsyncSender.send() takes &self.
+    /// Multiple concurrent calls can safely send to the same channel.
+    pub async fn fuse_read(&self, offset: i64, len: usize) -> FsResult<Vec<DataSlice>> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(ReadTask::Read(offset, len, tx))
+            .await
+            .map_err(|e| self.check_error(e.into()))?;
+        rx.await
+            .map_err(|_| FsError::from("channel closed".to_string()))?
+    }
+
+    pub async fn complete(&self) -> FsResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(ReadTask::Complete(tx))
+            .await
+            .map_err(|e| self.check_error(e.into()))?;
+        rx.await
+            .map_err(|_| FsError::from("channel closed".to_string()))?
+    }
+
+    async fn read_future(
+        mut reader: UnifiedReader,
+        mut req_receiver: AsyncReceiver<ReadTask>,
+    ) -> FsResult<()> {
+        while let Some(task) = req_receiver.recv().await {
+            match task {
+                ReadTask::Read(off, len, reply) => {
+                    // Each read request is independent
+                    // fuse_read(off, len) will read exactly len bytes and return
+                    // This prevents background prefetch tasks from seeking beyond file boundaries
+                    let data = reader.fuse_read(off, len).await;
+                    let _ = reply.send(data);
+                }
+
+                ReadTask::Complete(reply) => {
+                    let res = reader.complete().await;
+                    let _ = reply.send(res);
+                }
+            }
+        }
+        Ok(())
     }
 }

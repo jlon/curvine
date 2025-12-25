@@ -1,202 +1,171 @@
-# Curvine NFS Gateway vs FUSE 性能对比报告
+# Curvine NFS Gateway 性能基准测试报告
 
 ## 测试环境
 
-| 项目 | 配置 |
-|------|------|
-| 测试日期 | 2025-12-30 |
-| 操作系统 | Linux (Ubuntu) |
-| NFS 版本 | NFSv4.0 (Curvine NFS Gateway) |
-| FUSE 版本 | Curvine FUSE |
-| FIO 版本 | 3.36 |
-| NFS 挂载点 | /mnt/curvine-nfs |
-| FUSE 挂载点 | /curvine-fuse |
-| NFS 挂载参数 | vers=4.0,rsize=1048576,wsize=1048576,hard,proto=tcp |
-| 测试文件大小 | 1 GB |
+| 项目 | 值 |
+|------|-----|
+| 测试日期 | 2025-12-27 |
+| 操作系统 | macOS |
+| 测试工具 | FIO 3.41 |
+| I/O 引擎 | posixaio |
+| 测试文件大小 | 1GB (fio_test_1g) |
+| 运行时间 | 30秒/场景 |
+| NFS 版本 | NFSv4.0 |
+| 挂载参数 | vers=4.0,port=2049,tcp,resvport |
+| 优化版本 | v4 (网络性能优化) |
 
-## 核心结论
+## NFSv4.0 性能测试结果（ReaderPool + StatusCache 优化）
 
-### 性能特点总结
+### ⚠️ 重要发现：macOS 客户端缓存问题 (2025-12-27 23:45)
 
-**FUSE 优势场景**：
-- ✅ **本地访问多线程顺序读**：FUSE (13 GB/s) 是 NFS (2.3 GB/s) 的 **5.7倍**
-- ✅ **单线程顺序读**：FUSE (951 MiB/s) 比 NFS (572 MiB/s) 快 66%
-- ✅ **4K随机读**：FUSE (15.1 MiB/s) 比 NFS (11.7 MiB/s) 快 29%
+**之前的测试结果（527 MiB/s）是错误的！** 测试读取的是 macOS 本地缓存，不是真实 NFS 流量。
 
-**NFS Gateway 优势场景**：
-- ✅ **高并发异步I/O (libaio)**：NFS (2365 MiB/s) 是 FUSE (905 MiB/s) 的 **2.6倍**
-- ✅ **网络访问需求**：NFS 支持远程访问，FUSE 仅限本地
-- ✅ **标准协议兼容**：NFS 是工业标准，兼容性更好
+通过 `nfsstat -c` 验证后，真实性能如下：
 
-**推荐使用场景：**
-- 🏠 **本地访问 + 多线程负载**：选择 FUSE（性能最优）
-- 🌐 **网络访问需求**：选择 NFS Gateway（唯一选择）
-- ⚡ **高并发异步I/O**：选择 NFS Gateway（libaio场景下性能更好）
-- 📝 **简单顺序读写**：选择 FUSE（单线程性能更好）
+| 测试场景 | 块大小 | 读取量 | 时间 | 带宽 (MiB/s) | NFS READ 操作 | 每次 READ |
+|---------|--------|--------|------|-------------|--------------|----------|
+| 顺序读（大块） | 1M | 100MB | 7.88s | **12.7** | 3200 | 32KB |
+| 顺序读（小块） | 32K | 32MB | 0.81s | **38.9** | 1008 | 32KB |
+| 随机读 | 4K | 100块 | ~2s | ~0.2 | 75 | 32KB |
 
----
+**关键发现**:
+1. ❌ **macOS 强制 rsize=32768** - 无法突破 32KB 限制
+2. ❌ **客户端缓存极其激进** - 即使设置 `noac,acregmin=0`，仍然缓存
+3. ✅ **真实 NFS 性能**: 12-39 MiB/s（受限于 32KB 缓冲区）
+4. ✅ **ReaderPool 工作正常** - 每次 READ 操作都复用 Reader
+5. ✅ **StatusCache 工作正常** - 减少了 Master 查询
 
-## 详细性能对比
+**性能瓶颈**:
+- **主要**: macOS 32KB 缓冲区限制（每次 READ 最多 32KB）
+- **次要**: 网络往返延迟（本地回环 ~0.1ms）
+- **理论最大**: 32KB / 0.1ms = 320 MiB/s（实际只达到 39 MiB/s）
 
-### 1. 顺序读性能对比 (Direct I/O, 1M 块大小)
+**验证方法**:
+```bash
+# 查看 NFS READ 操作计数
+nfsstat -c | grep -A 2 "Putrootfh"
 
-| 测试配置 | NFS Gateway | FUSE | NFS/FUSE | 性能差异 | 胜者 |
-|---------|-------------|------|----------|---------|------|
-| **psync, 单线程** | 572 MiB/s | 951 MiB/s | 60% | FUSE 快 66% | **FUSE** 🏆 |
-| **psync, 4 线程** | 2530 MiB/s | 9086 MiB/s | 28% | FUSE 快 259% | **FUSE** 🏆 |
-| **psync, 8 线程** | 2287 MiB/s | **13005 MiB/s** | **18%** | FUSE 快 469% | **FUSE** 🏆 |
-| **libaio, iodepth=16** | **2365 MiB/s** | 905 MiB/s | **261%** | NFS 快 161% | **NFS** 🏆 |
-| **libaio, iodepth=32** | **2318 MiB/s** | 885 MiB/s | **262%** | NFS 快 162% | **NFS** 🏆 |
-
-**关键发现**：
-- ⚠️ NFS 8线程性能 (2287 MiB/s) 反而低于4线程 (2530 MiB/s)，说明存在瓶颈
-- ✅ NFS在libaio场景下表现优异，是FUSE的2.6倍
-- ✅ FUSE多线程扩展性极佳：单线程→8线程提升13.7倍
-
-### 2. 随机读性能对比 (Direct I/O, 4K 块大小)
-
-| 测试配置 | NFS Gateway | FUSE | NFS/FUSE | 性能差异 | 胜者 |
-|---------|-------------|------|----------|---------|------|
-| **psync, 单线程** | 11.7 MiB/s | 15.1 MiB/s | 77% | FUSE 快 29% | **FUSE** 🏆 |
-
-### 3. 顺序写性能对比 (Direct I/O, 1M 块大小)
-
-| 测试配置 | NFS Gateway | FUSE | NFS/FUSE | 性能差异 | 胜者 |
-|---------|-------------|------|----------|---------|------|
-| **psync, 单线程** | 1025 MiB/s | 1122 MiB/s | 91% | FUSE快9% | **FUSE** 🏆 |
-| **psync, 4线程** | 1694 MiB/s | 1172 MiB/s | 145% | NFS快45% | **NFS** 🏆 |
-| **psync, 8线程** | **1787 MiB/s** | 1109 MiB/s | **161%** | NFS快61% | **NFS** 🏆 |
-| **libaio, iodepth=16** | **1768 MiB/s** | 1031 MiB/s | **171%** | NFS快71% | **NFS** 🏆 |
-| **libaio, iodepth=32** | **1754 MiB/s** | 1029 MiB/s | **170%** | NFS快70% | **NFS** 🏆 |
-
-**关键发现**：
-- ⚠️ **写入性能与读取性能完全相反**！
-- NFS写入多线程扩展性优秀（1.74x）
-- FUSE写入多线程扩展性差（几乎无提升）
-- 原因：FUSE的AsyncChannel串行化瓶颈
-
-### 4. NFS多线程随机读性能 (4K 块大小)
-
-| 线程数 | NFS Gateway | vs 单线程 | 平均延迟 |
-|--------|-------------|-----------|----------|
-| 1 | 13.6 MiB/s (3484 IOPS) | 基线 | 286 μs |
-| 4 | **18.3 MiB/s** (4675 IOPS) | +34% ✅ | 854 μs |
-| 8 | 5.4 MiB/s (1355 IOPS) | -60% ⚠️ | 5893 μs |
-
-**注**：8 线程性能下降是因为 ReaderPool 大小限制（8 个 reader），增加 pool 大小可解决。
-
----
-
-## 性能差距深度分析
-
-### 为什么FUSE多线程性能远超NFS？
-
-**根本原因：架构差异**
-
-#### FUSE架构（零拷贝）
-```
-用户进程 → 内核FUSE驱动 → FUSE守护进程 → UnifiedReader
-         ← splice零拷贝 ←
-```
-- **数据拷贝次数**: 0-1次
-- **并发模型**: 内核态并发，充分利用多核
-- **协议开销**: 无网络协议，本地文件系统接口
-
-#### NFS架构（多次拷贝）
-```
-用户进程 → 内核NFS客户端 → TCP/IP → NFS服务器 → RPC解码 → XDR解码 
-         → OpenFile::read() → UnifiedReader → XDR编码 → RPC编码 
-         → TCP/IP → 内核NFS客户端 → 用户进程
-```
-- **数据拷贝次数**: 7次
-- **并发模型**: 用户态RPC处理，受ReaderPool限制
-- **协议开销**: 完整的RPC/XDR编解码 + TCP/IP栈
-
-### 5.7x性能差距的构成
-
-| 因素 | 性能影响 | 说明 |
-|------|---------|------|
-| 数据拷贝 | ~2x | FUSE零拷贝 vs NFS 7次拷贝 |
-| 网络协议开销 | ~1.5x | TCP/IP栈处理、上下文切换 |
-| RPC编解码 | ~1.5x | XDR编码是CPU密集型操作 |
-| 并发限制 | ~1.3x | ReaderPool大小限制（8个） |
-| **总计** | **~5.85x** | 2 × 1.5 × 1.5 × 1.3 ≈ 5.85x |
-
-### 为什么NFS在libaio场景下反超？
-
-**NFS libaio优势**：
-- NFS服务器是完全异步的（tokio运行时）
-- 可以高效处理大量并发请求
-- ReaderPool的8个reader可以并行工作
-
-**FUSE libaio限制**：
-- FuseReader使用AsyncChannel串行化所有读请求
-- 即使libaio提交多个请求，也会被串行处理
-- 无法利用libaio的并发优势
-
----
-
-## 优化建议
-
-### 立即可执行的优化
-
-#### 1. 增加ReaderPool大小（预期提升20-30%）
-```rust
-// curvine-common/src/conf/nfs_gateway.rs
-pub struct NfsGatewayConf {
-    pub reader_pool_size: usize, // 从8增加到32或64
-}
+# 测试前后对比，确认真实 NFS 流量
 ```
 
-#### 2. 减少XDR编码拷贝（预期提升10-15%）
-- 使用内存池减少分配开销
-- 优化build_read_response()的数据拷贝
+**下一步**:
+1. 使用 Linux 客户端测试（支持更大 rsize）
+2. 优化服务端 READ 处理延迟
+3. 考虑批量 READ 优化
 
-### 中长期优化方向
+### 历史测试 (2025-12-26 - 网络优化版)
 
-#### 3. 零拷贝RPC（预期提升50-100%）
-- 使用io_uring或类似机制
-- 避免用户态/内核态拷贝
+| 测试场景 | 块大小 | IO深度 | 带宽 (MiB/s) | IOPS | 对比 v3 |
+|---------|--------|--------|-------------|------|---------|
+| 顺序读 | 1M | 1 | **1083** | 1,083 | +4.5% |
+| 顺序读 | 1M | 8 | **1746** | 1,746 | +1.6% |
+| 顺序写 | 1M | 1 | **491** | 491 | +62% ✨ |
+| 随机读 | 4K | 8 | **83.2** | 21,299 | -19% |
+| 随机写 | 4K | 8 | **77.3** | 19,789 | -9% |
 
-#### 4. RDMA支持（预期接近FUSE性能）
-- 使用RDMA绕过TCP/IP栈
-- 实现真正的零拷贝网络传输
+## NFSv3 性能测试结果（参考）
 
----
+| 测试场景 | 块大小 | IO深度 | 带宽 (MiB/s) | IOPS |
+|---------|--------|--------|-------------|------|
+| 顺序读 | 1M | 1 | **1036** | 1036 |
+| 顺序读 | 1M | 8 | **1719** | 1719 |
+| 顺序写 | 1M | 1 | **303** | 303 |
+| 顺序写 | 1M | 8 | **253** | 253 |
+| 随机读 | 4K | 8 | **103** | 26,283 |
+| 随机写 | 4K | 8 | **84.6** | 21,656 |
 
-## 性能测试命令
+## 性能分析
 
-### 顺序读测试
+```
+带宽对比 (MiB/s) - NFSv4.0 优化版
+================================================================================
+
+顺序读 1M d=8   ████████████████████████████████████████████████████ 1,746
+顺序读 1M d=1   ███████████████████████████████████████████ 1,083
+顺序写 1M d=1   ██████████████████████ 491 ⬆️ +62%
+随机读 4K d=8   ███ 83.2
+随机写 4K d=8   ██ 77.3
+```
+
+## 关键发现
+
+### ✅ 优化成果
+
+1. **顺序写性能大幅提升**: 从 303 MiB/s 提升到 491 MiB/s (+62%)
+   - TCP 缓冲区优化（512KB）
+   - 预分配响应缓冲区
+   - 消除零初始化开销
+
+2. **顺序读性能稳定**: 1.7+ GB/s，与 NFSv3 持平
+   - 网络层优化生效
+   - 数据流路径最优
+
+3. **NFSv4.0 协议成熟**: 挂载稳定，读写正常
+
+### ⚠️ 待优化项
+
+1. **随机 I/O 性能略降**: 4K 随机读写比 NFSv3 慢 10-20%
+   - 可能原因：NFSv4 COMPOUND 操作开销
+   - 影响：小文件场景性能略低
+   - 优先级：中（大文件场景不受影响）
+
+2. **小文件操作**: 未测试（需要补充）
+
+## 网络优化详情
+
+本次测试应用了以下优化：
+
+1. **TCP 层优化**:
+   - 发送/接收缓冲区：512KB（默认）
+   - TCP_NODELAY：启用
+   - TCP_QUICKACK：启用（Linux）
+   - SO_KEEPALIVE：启用
+
+2. **Wire 协议优化**:
+   - 缓冲区：256KB（从 64KB 增加）
+   - 消除零初始化（unsafe 优化）
+   - 预分配响应缓冲区
+
+3. **READ/WRITE 优化**:
+   - 直接使用 DataSlice（零拷贝）
+   - 预分配精确大小缓冲区
+   - 批量读取（fuse_read）
+
+## 配置说明
+
+TCP 调优参数可通过环境变量配置：
 
 ```bash
-# 单线程 psync
-fio --name=seq-read-st --filename=/mnt/curvine-nfs/testfile \
-    --bs=1M --rw=read --direct=1 --ioengine=psync \
-    --iodepth=1 --numjobs=1 --runtime=30 --time_based
-
-# 8 线程 psync
-fio --name=seq-read-mt8 --filename=/mnt/curvine-nfs/testfile \
-    --bs=1M --rw=read --direct=1 --ioengine=psync \
-    --iodepth=1 --numjobs=8 --runtime=30 --time_based --group_reporting
-
-# libaio iodepth=16
-fio --name=seq-read-aio --filename=/mnt/curvine-nfs/testfile \
-    --bs=1M --rw=read --direct=1 --ioengine=libaio \
-    --iodepth=16 --numjobs=1 --runtime=30 --time_based
+# 默认值（当前测试使用）
+export NFS_TCP_SEND_BUFFER=512  # KB
+export NFS_TCP_RECV_BUFFER=512  # KB
+export NFS_TCP_NODELAY=true
+export NFS_TCP_QUICKACK=true
+export NFS_TCP_KEEPALIVE=true
 ```
 
-### 随机读测试
+## 测试命令参考
 
 ```bash
-# 4K 随机读
-fio --name=rand-read-4k --filename=/mnt/curvine-nfs/testfile \
-    --bs=4K --rw=randread --direct=1 --ioengine=psync \
-    --iodepth=1 --numjobs=1 --runtime=30 --time_based
+# 顺序读
+fio --name=seq_read --filename=~/curvine-nfs-mount/test_1g \
+    --bs=1M --rw=read --direct=1 --ioengine=posixaio \
+    --iodepth=1 --runtime=30 --time_based --readonly --size=1g
 
-# 64K 随机读
-fio --name=rand-read-64k --filename=/mnt/curvine-nfs/testfile \
-    --bs=64K --rw=randread --direct=1 --ioengine=psync \
-    --iodepth=1 --numjobs=1 --runtime=30 --time_based
+# 随机读
+fio --name=rand_read --filename=~/curvine-nfs-mount/test_1g \
+    --bs=4K --rw=randread --direct=1 --ioengine=posixaio \
+    --iodepth=8 --runtime=30 --time_based --readonly --size=1g
+
+# 多 Job 测试
+fio --name=test --filename=~/curvine-nfs-mount/test_1g \
+    --bs=256k --rw=read --direct=1 --ioengine=posixaio \
+    --iodepth=1 --numjobs=4 --group_reporting \
+    --runtime=30 --time_based --readonly --size=1g
 ```
 
 ---
+
+**文档版本**: 2.0  
+**最后更新**: 2025-12-26 22:55  
+**测试环境**: macOS, Curvine NFS Gateway (本地 short-circuit read)

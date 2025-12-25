@@ -399,10 +399,7 @@ pub struct NfsGatewayConf {
     /// Reader cache TTL in seconds (default: 300)
     pub reader_cache_ttl_secs: u64,
 
-    /// Reader pool size per file - number of parallel readers (default: 32)
-    /// Increased from 8 to 32 for better multi-thread performance (2025-12-30)
-    /// Benchmark: 8 threads with pool_size=8 caused lock contention (2287 MiB/s)
-    /// Expected: pool_size=32 should improve 8-thread performance by 20-30%
+    /// Reader pool size per file - number of parallel readers (default: 8)
     pub reader_pool_size: usize,
 
     /// Writer cache capacity - max number of files with cached writers (default: 1000)
@@ -429,18 +426,6 @@ pub struct NfsGatewayConf {
     /// FileStatus cache TTL in seconds (default: 30)
     pub file_status_cache_ttl_secs: u64,
 
-    /// Small file data cache capacity - max number of cached file contents (default: 1000)
-    /// Only files <= max_cacheable_file_size will be cached
-    /// Set to 0 to disable data caching
-    pub file_data_cache_size: u64,
-
-    /// File data cache TTL in seconds (default: 10)
-    pub file_data_cache_ttl_secs: u64,
-
-    /// Maximum file size for data caching in bytes (default: 65536 = 64KB)
-    /// Files larger than this will not be cached to avoid memory pressure
-    pub max_cacheable_file_size: u64,
-
     // ========== NFSv4 Delegation Configuration ==========
     /// Enable NFSv4 delegations (default: false for maximum performance)
     /// Delegations allow clients to cache file data locally, reducing server load
@@ -454,28 +439,6 @@ pub struct NfsGatewayConf {
     /// Maximum number of active delegations (default: 1000)
     /// Limits memory usage and prevents delegation storms
     pub delegation_max_count: usize,
-
-    // ========== UNSTABLE Write Optimization ==========
-    /// Enable UNSTABLE write optimization (default: true)
-    /// UNSTABLE writes return immediately without fsync, data is flushed on COMMIT/CLOSE
-    /// This significantly improves small file write performance (2-4x)
-    /// Complies with NFS RFC 5661 UNSTABLE write semantics
-    pub enable_unstable_write: bool,
-
-    // ========== Small File Async Flush Optimization ==========
-    /// Enable async flush optimization for small files (default: true)
-    /// Small files skip flush on WRITE and delay flush to CLOSE (async)
-    /// This dramatically improves small file write performance (40-80x)
-    /// Only applies to files matching small file criteria (max_writes and max_size)
-    pub enable_small_file_async_flush: bool,
-
-    /// Maximum write count for small file detection (default: 20)
-    /// Files with <= this many writes are considered small files
-    pub small_file_max_writes: u32,
-
-    /// Maximum file size for small file detection in bytes (default: 10MB)
-    /// Files with <= this size are considered small files
-    pub small_file_max_size: u64,
 }
 
 impl Default for NfsGatewayConf {
@@ -500,7 +463,7 @@ impl Default for NfsGatewayConf {
             file_blocks_cache_ttl_secs: 60,
             reader_cache_size: 1000,
             reader_cache_ttl_secs: 300,
-            reader_pool_size: 32, // Increased from 8 for better multi-thread performance
+            reader_pool_size: 8,
             writer_cache_size: 1000,
             writer_cache_ttl_secs: 300,
             writer_idle_timeout_secs: 30,
@@ -508,20 +471,10 @@ impl Default for NfsGatewayConf {
             cache_cleanup_interval_secs: 10,
             file_status_cache_size: 10000i64,
             file_status_cache_ttl_secs: 30,
-            // Small file data cache defaults
-            file_data_cache_size: 1000,     // 1000 files max
-            file_data_cache_ttl_secs: 10,   // 10 seconds TTL
-            max_cacheable_file_size: 65536, // 64KB max
-            // NFSv4 Delegation defaults (enabled for better read performance)
-            delegation_enabled: true,
+            // NFSv4 Delegation defaults (disabled for performance)
+            delegation_enabled: false,
             delegation_recall_timeout_secs: 30,
             delegation_max_count: 1000,
-            // UNSTABLE Write optimization (enabled for better write performance)
-            enable_unstable_write: true,
-            // Small file async flush optimization
-            enable_small_file_async_flush: true,
-            small_file_max_writes: 20,
-            small_file_max_size: 10 * 1024 * 1024, // 10MB
         }
     }
 }

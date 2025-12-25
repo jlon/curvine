@@ -41,6 +41,7 @@ use crate::nfs4::compound::{CompoundContext, CompoundHandler};
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
+use tracing::debug;
 
 /// OPENATTR operation handler
 ///
@@ -59,6 +60,11 @@ pub async fn op_openattr(
     _ctx: &CompoundContext,
     _handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
+    // Read OPENATTR4args (line 57-58)
     let _createdir = input.read_u32::<BigEndian>()?;
+
+    debug!("OPENATTR: not supported (same as NFS-Ganesha)");
+
+    // Return NOTSUPP (line 62)
     Err(Nfs4Status::Notsupp.into())
 }

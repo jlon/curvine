@@ -12,72 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! NFSv4.1 Session Management - Optimized for High Concurrency
+//! NFSv4.1 Session Management
 //!
-//! # Performance Optimizations (2025-12-31)
-//!
-//! 1. **Lock-free Slot Acquisition**: Use atomic CAS for slot state
-//! 2. **Session Trunking**: Multiple TCP connections share one session
-//! 3. **Increased Slot Count**: 128 slots for better parallelism
-//! 4. **RwLock for Session Lookup**: Read-heavy workload optimization
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    Session Manager                               │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  sessions: RwLock<HashMap<SessionId, Arc<Session>>>             │
-//! │  client_sessions: RwLock<HashMap<ClientId, Vec<SessionId>>>     │
-//! │  connection_sessions: RwLock<HashMap<ConnId, SessionId>>        │
-//! └─────────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                       Session                                    │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  sessionid: [u8; 16]                                            │
-//! │  clientid: u64                                                  │
-//! │  slots: Vec<Slot>  (128 slots for parallel requests)            │
-//! │  connections: AtomicU32 (trunking: multiple TCP connections)    │
-//! └─────────────────────────────────────────────────────────────────┘
-//!                              │
-//!                              ▼
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                        Slot (Lock-free)                          │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  sequence: AtomicU32                                            │
-//! │  state: AtomicU8 (FREE=0, IN_USE=1, CACHED=2)                   │
-//! │  cached_reply: Mutex<Option<CachedReply>>                       │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
+//! Implements session-based exactly-once semantics through:
+//! - Session creation and destruction
+//! - Slot-based request sequencing
+//! - Reply caching for replay detection
 
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use crate::nfs4::types::{Clientid4, Sessionid4};
+use crate::nfs4::DEFAULT_SLOT_COUNT;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-/// Default slot count per session
-/// Aligned with NFS-Ganesha default: NFS41_NB_SLOTS_DEF = 64
-/// Reference: nfs-ganesha/src/include/sal_data.h
-pub const DEFAULT_SLOT_COUNT: u32 = 64;
-
-/// Maximum slot count (RFC 5661 allows up to 2^32-1)
-pub const MAX_SLOT_COUNT: u32 = 1024;
-
-/// Slot states for lock-free state machine
-const SLOT_FREE: u8 = 0;
-const SLOT_IN_USE: u8 = 1;
-const SLOT_CACHED: u8 = 2;
-
-// ============================================================================
-// Slot - Lock-free Request Sequencing Unit
+// Slot - Request Sequencing Unit
 // ============================================================================
 
 /// Cached reply for replay detection
@@ -87,209 +38,110 @@ pub struct CachedReply {
     pub reply: Vec<u8>,
 }
 
-pub enum SlotAcquireResult {
-    Acquired { new_sequenceid: u32 },
-    Replay { cached_reply: Vec<u8> },
-}
-
-/// Slot for exactly-once semantics (Lock-free design)
-///
-/// # Performance Optimization
-/// Uses atomic operations for state transitions to avoid mutex contention.
-/// Only the cached_reply uses a Mutex (rarely accessed).
-///
-/// # State Machine
-/// ```text
-/// FREE ──acquire()──► IN_USE ──release()──► CACHED
-///   ▲                                          │
-///   └──────────────expire()───────────────────┘
-/// ```
+/// Slot for exactly-once semantics
 pub struct Slot {
     /// Slot ID
     pub slot_id: u32,
-    /// Current sequence number (atomic for lock-free read)
+    /// Current sequence number
     sequence: AtomicU32,
-    /// Slot state: FREE(0), IN_USE(1), CACHED(2)
-    state: AtomicU8,
-    /// Cached reply for replay (only accessed on replay, rare)
-    cached_reply: Mutex<Option<CachedReply>>,
+    /// Whether slot is in use
+    in_use: std::sync::Mutex<bool>,
+    /// Cached reply for replay
+    cached_reply: std::sync::Mutex<Option<CachedReply>>,
 }
 
 impl Slot {
-    /// Create a new slot with initial sequence = 0
-    /// Aligned with NFS-Ganesha: gsh_calloc initializes to 0
     pub fn new(slot_id: u32) -> Self {
         Self {
             slot_id,
-            // NFS-Ganesha: slot->sequence starts at 0
-            // First request should have sequenceid = 1
-            // Check: slot->sequence + 1 == sa_sequenceid (0 + 1 == 1)
-            sequence: AtomicU32::new(0),
-            state: AtomicU8::new(SLOT_FREE),
-            cached_reply: Mutex::new(None),
+            sequence: AtomicU32::new(1),
+            in_use: std::sync::Mutex::new(false),
+            cached_reply: std::sync::Mutex::new(None),
         }
     }
 
-    /// Get current sequence number (lock-free)
+    /// Get current sequence number
     #[inline]
     pub fn sequence(&self) -> u32 {
         self.sequence.load(Ordering::Acquire)
     }
 
-    /// Check and acquire slot for a request (lock-free fast path)
-    ///
-    /// # NFS-Ganesha Reference
-    /// File: nfs4_op_sequence.c, line 209-290
-    ///
-    /// Key logic:
-    /// ```c
-    /// if (slot->sequence + 1 != arg_SEQUENCE4->sa_sequenceid) {
-    ///     // Handle replay or misordered
-    /// }
-    /// slot->sequence += 1;
-    /// res_SEQUENCE4->sr_sequenceid = slot->sequence;
-    /// ```
-    ///
-    /// # Returns
-    pub fn acquire(&self, seq: u32) -> Result<SlotAcquireResult, Nfs4Status> {
+    /// Check and acquire slot for a request
+    /// Returns Ok(()) if sequence matches and slot acquired
+    /// Returns cached reply if this is a replay
+    pub fn acquire(&self, seq: u32) -> Result<Option<CachedReply>, Nfs4Status> {
         let current_seq = self.sequence.load(Ordering::Acquire);
-        let expected_seq = current_seq.wrapping_add(1);
 
-        if seq == expected_seq {
-            // Correct sequence - try to acquire with CAS (lock-free)
-            match self.state.compare_exchange(
-                SLOT_FREE,
-                SLOT_IN_USE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    *self.cached_reply.lock().unwrap() = None;
-                    let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-                    Ok(SlotAcquireResult::Acquired {
-                        new_sequenceid: new_seq,
-                    })
-                }
-                Err(SLOT_IN_USE) => {
-                    // Slot already in use - concurrent request
-                    Err(Nfs4Status::SeqMisordered)
-                }
-                Err(SLOT_CACHED) => {
-                    // Slot has cached reply - try to transition to IN_USE
-                    match self.state.compare_exchange(
-                        SLOT_CACHED,
-                        SLOT_IN_USE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => {
-                            *self.cached_reply.lock().unwrap() = None;
-                            let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-                            Ok(SlotAcquireResult::Acquired {
-                                new_sequenceid: new_seq,
-                            })
+        match seq.cmp(&current_seq) {
+            std::cmp::Ordering::Less => {
+                // Old sequence - check if it's a replay
+                if seq == current_seq.saturating_sub(1) {
+                    let cached = self.cached_reply.lock().unwrap();
+                    if let Some(ref reply) = *cached {
+                        if reply.sequence == seq {
+                            return Ok(Some(reply.clone()));
                         }
-                        Err(_) => Err(Nfs4Status::SeqMisordered),
                     }
                 }
-                Err(_) => Err(Nfs4Status::SeqMisordered),
+                Err(Nfs4Status::SeqMisordered)
             }
-        } else if seq == current_seq {
-            if let Some(cached) = self.cached_reply.lock().unwrap().clone() {
-                Ok(SlotAcquireResult::Replay {
-                    cached_reply: cached.reply,
-                })
-            } else {
-                Err(Nfs4Status::RetryUncachedRep)
+            std::cmp::Ordering::Greater => {
+                // Sequence too high
+                Err(Nfs4Status::SeqMisordered)
             }
-        } else {
-            // Sequence mismatch
-            Err(Nfs4Status::SeqMisordered)
+            std::cmp::Ordering::Equal => {
+                // Correct sequence - try to acquire
+                let mut in_use = self.in_use.lock().unwrap();
+                if *in_use {
+                    return Err(Nfs4Status::SeqMisordered);
+                }
+                *in_use = true;
+                // Increment sequence for next request
+                self.sequence.fetch_add(1, Ordering::Release);
+                Ok(None)
+            }
         }
     }
 
-    /// Get cached reply for replay
-    pub fn get_cached_reply(&self) -> Option<CachedReply> {
-        self.cached_reply.lock().unwrap().clone()
-    }
-
     /// Release slot and cache reply
-    #[inline]
     pub fn release(&self, reply: Vec<u8>) {
-        let seq = self.sequence.load(Ordering::Acquire);
-
-        // Cache the reply (mutex only for write, rare operation)
+        let seq = self.sequence.load(Ordering::Acquire).saturating_sub(1);
         *self.cached_reply.lock().unwrap() = Some(CachedReply {
             sequence: seq,
             reply,
         });
-
-        // Transition to CACHED state
-        self.state.store(SLOT_CACHED, Ordering::Release);
-    }
-
-    /// Release slot without caching (for errors)
-    #[inline]
-    pub fn release_no_cache(&self) {
-        *self.cached_reply.lock().unwrap() = None;
-        self.state.store(SLOT_FREE, Ordering::Release);
+        *self.in_use.lock().unwrap() = false;
     }
 }
 
 // ============================================================================
-// Session - Supports Trunking (Multiple Connections)
+// Session
 // ============================================================================
 
-/// NFSv4.1 Session with Trunking Support
-///
-/// # Session Trunking (RFC 5661 Section 2.10.3)
-/// Multiple TCP connections can share the same session, allowing:
-/// - Higher aggregate throughput
-/// - Better utilization of multi-core systems
-/// - Resilience to connection failures
-///
-/// # Thread Safety
-/// - slots: Each slot is independently lock-free
-/// - connections: Atomic counter for trunking
+/// NFSv4.1 Session
 pub struct Session {
     /// Session ID (16 bytes)
     pub sessionid: Sessionid4,
     /// Associated client ID
     pub clientid: Clientid4,
-    /// Fore channel slots (lock-free)
+    /// Fore channel slots
     slots: Vec<Slot>,
-    /// Number of active connections (trunking)
-    connections: AtomicU32,
     /// Creation time
     pub created: Instant,
-    /// Session flags (e.g., CONN_BACK_CHAN)
-    pub flags: AtomicU32,
-    /// Backchannel program number (from CREATE_SESSION)
-    /// NFS-Ganesha: nfs41_session->cb_program
-    pub cb_program: AtomicU32,
-    /// Whether backchannel is established
-    /// NFS-Ganesha: session->flags & session_bc_up
-    pub backchannel_up: AtomicU8,
 }
 
 impl Session {
     pub fn new(sessionid: Sessionid4, clientid: Clientid4, slot_count: u32) -> Self {
-        let slot_count = slot_count.min(MAX_SLOT_COUNT);
         let slots = (0..slot_count).map(Slot::new).collect();
         Self {
             sessionid,
             clientid,
             slots,
-            connections: AtomicU32::new(1), // First connection
             created: Instant::now(),
-            flags: AtomicU32::new(0),
-            cb_program: AtomicU32::new(0),
-            backchannel_up: AtomicU8::new(0),
         }
     }
 
-    /// Get slot by ID (no lock needed)
-    #[inline]
+    /// Get slot by ID
     pub fn get_slot(&self, slot_id: u32) -> Option<&Slot> {
         self.slots.get(slot_id as usize)
     }
@@ -305,76 +157,15 @@ impl Session {
     pub fn slot_count(&self) -> u32 {
         self.slots.len() as u32
     }
-
-    /// Add a connection (trunking)
-    #[inline]
-    pub fn add_connection(&self) -> u32 {
-        self.connections.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    /// Remove a connection
-    #[inline]
-    pub fn remove_connection(&self) -> u32 {
-        self.connections.fetch_sub(1, Ordering::AcqRel) - 1
-    }
-
-    /// Get connection count
-    #[inline]
-    pub fn connection_count(&self) -> u32 {
-        self.connections.load(Ordering::Acquire)
-    }
-
-    /// Set session flags
-    #[inline]
-    pub fn set_flags(&self, flags: u32) {
-        self.flags.store(flags, Ordering::Release);
-    }
-
-    /// Get session flags
-    #[inline]
-    pub fn get_flags(&self) -> u32 {
-        self.flags.load(Ordering::Acquire)
-    }
-
-    /// Set callback program number (from CREATE_SESSION)
-    /// NFS-Ganesha: nfs41_session->cb_program = arg->csa_cb_program
-    #[inline]
-    pub fn set_cb_program(&self, program: u32) {
-        self.cb_program.store(program, Ordering::Release);
-    }
-
-    /// Get callback program number
-    #[inline]
-    pub fn get_cb_program(&self) -> u32 {
-        self.cb_program.load(Ordering::Acquire)
-    }
-
-    /// Mark backchannel as established
-    /// NFS-Ganesha: atomic_set_uint32_t_bits(&session->flags, session_bc_up)
-    #[inline]
-    pub fn set_backchannel_up(&self) {
-        self.backchannel_up.store(1, Ordering::Release);
-    }
-
-    /// Check if backchannel is up
-    #[inline]
-    pub fn is_backchannel_up(&self) -> bool {
-        self.backchannel_up.load(Ordering::Acquire) != 0
-    }
 }
 
 // ============================================================================
-// SessionManager - Optimized for Read-Heavy Workloads
+// SessionManager
 // ============================================================================
 
-/// Session Manager - manages all sessions with trunking support
-///
-/// # Performance Optimizations
-/// 1. RwLock for session lookup (read-heavy)
-/// 2. Connection-to-session mapping for fast lookup
-/// 3. Lazy cleanup of expired sessions
+/// Session Manager - manages all sessions
 pub struct SessionManager {
-    /// Session ID -> Session (RwLock for read-heavy access)
+    /// Session ID -> Session
     sessions: RwLock<HashMap<Sessionid4, Arc<Session>>>,
     /// Client ID -> Session IDs
     client_sessions: RwLock<HashMap<Clientid4, Vec<Sessionid4>>>,
@@ -388,10 +179,6 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self::with_slot_count(DEFAULT_SLOT_COUNT)
-    }
-
-    pub fn with_slot_count(slot_count: u32) -> Self {
         let boot_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -402,7 +189,7 @@ impl SessionManager {
             client_sessions: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             boot_time,
-            default_slot_count: slot_count.min(MAX_SLOT_COUNT),
+            default_slot_count: DEFAULT_SLOT_COUNT,
         }
     }
 
@@ -417,20 +204,10 @@ impl SessionManager {
 
     /// Create a new session for a client
     pub fn create_session(&self, clientid: Clientid4) -> Nfs4Result<Arc<Session>> {
-        self.create_session_with_flags(clientid, 0)
-    }
-
-    /// Create a new session with flags
-    pub fn create_session_with_flags(
-        &self,
-        clientid: Clientid4,
-        flags: u32,
-    ) -> Nfs4Result<Arc<Session>> {
         let sessionid = self.generate_sessionid();
         let session = Arc::new(Session::new(sessionid, clientid, self.default_slot_count));
-        session.set_flags(flags);
 
-        // Store session (write lock)
+        // Store session
         self.sessions
             .write()
             .unwrap()
@@ -445,18 +222,15 @@ impl SessionManager {
             .push(sessionid);
 
         tracing::info!(
-            "CREATE_SESSION: sessionid={:02x?} clientid={} slots={} flags={:#x}",
-            &sessionid[..8],
-            clientid,
-            self.default_slot_count,
-            flags
+            "Created session {:?} for client {}",
+            &sessionid[..4],
+            clientid
         );
 
         Ok(session)
     }
 
-    /// Get session by ID (fast path with read lock)
-    #[inline]
+    /// Get session by ID
     pub fn get_session(&self, sessionid: &Sessionid4) -> Option<Arc<Session>> {
         self.sessions.read().unwrap().get(sessionid).cloned()
     }
@@ -480,12 +254,7 @@ impl SessionManager {
             sessions.retain(|s| s != sessionid);
         }
 
-        tracing::info!(
-            "DESTROY_SESSION: sessionid={:02x?} clientid={}",
-            &sessionid[..8],
-            session.clientid
-        );
-
+        tracing::info!("Destroyed session {:?}", &sessionid[..4]);
         Ok(())
     }
 
@@ -504,94 +273,27 @@ impl SessionManager {
         }
     }
 
-    /// Process SEQUENCE operation (optimized)
-    ///
-    /// # NFS-Ganesha Reference
-    /// File: nfs4_op_sequence.c, line 196-260
-    ///
-    /// # Returns
-    /// - Ok((session, new_sequenceid, highest_slot, target_highest_slot, status_flags))
-    /// - new_sequenceid is the value to return in the response (slot->sequence after increment)
-    #[allow(clippy::type_complexity)]
+    /// Process SEQUENCE operation
+    /// Returns (highest_slot, target_highest_slot, status_flags)
     pub fn sequence(
         &self,
         sessionid: &Sessionid4,
         slot_id: u32,
         sequence_id: u32,
-    ) -> Nfs4Result<(Arc<Session>, u32, u32, u32, u32)> {
-        // Fast path: read lock for session lookup
-        let session = self.get_session(sessionid).ok_or_else(|| {
-            self.log_session_not_found(sessionid);
-            Nfs4Status::BadSession
-        })?;
+    ) -> Nfs4Result<(Arc<Session>, Option<CachedReply>, u32, u32, u32)> {
+        let session = self.get_session(sessionid).ok_or(Nfs4Status::BadSession)?;
 
-        // Get slot (no lock)
-        let slot = session.get_slot(slot_id).ok_or_else(|| {
-            tracing::error!(
-                "SEQUENCE: BadSlot - slot_id={} >= max_slots={}",
-                slot_id,
-                session.slot_count()
-            );
-            Nfs4Status::BadSlot
-        })?;
+        let slot = session.get_slot(slot_id).ok_or(Nfs4Status::BadSlot)?;
 
-        // Lock-free slot acquisition
-        let current_seq = slot.sequence();
-        let new_sequenceid = match slot.acquire(sequence_id) {
-            Ok(SlotAcquireResult::Acquired { new_sequenceid }) => new_sequenceid,
-            Ok(SlotAcquireResult::Replay { .. }) => {
-                return Err(Nfs4Status::RetryUncachedRep.into());
-            }
-            Err(e) => {
-                tracing::error!(
-                    "SEQUENCE: {:?} - slot={} request_seq={} current_seq={} (expected={})",
-                    e, slot_id, sequence_id, current_seq, current_seq.wrapping_add(1)
-                );
-                return Err(e.into());
-            }
-        };
+        let cached = slot.acquire(sequence_id)?;
 
-        tracing::debug!(
-            "SEQUENCE: success sessionid={:02x?} slot={} req_seq={} resp_seq={}",
-            &sessionid[..8], slot_id, sequence_id, new_sequenceid
-        );
-
-        // Return session info with the NEW sequence id for response
         Ok((
             session.clone(),
-            new_sequenceid,
+            cached,
             session.highest_slot(),
             session.highest_slot(),
-            session.get_flags(),
+            0, // status_flags
         ))
-    }
-
-    /// Log session not found error with known sessions for debugging
-    fn log_session_not_found(&self, sessionid: &Sessionid4) {
-        let sessions = self.sessions.read().unwrap();
-        tracing::error!(
-            "SEQUENCE: BadSession - sessionid={:02x?} not found, known sessions: {}",
-            &sessionid[..8],
-            sessions
-                .keys()
-                .map(|k| format!("{:02x?}", &k[..8]))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    pub fn replay_reply(
-        &self,
-        sessionid: &Sessionid4,
-        slot_id: u32,
-        sequence_id: u32,
-    ) -> Option<Vec<u8>> {
-        let session = self.get_session(sessionid)?;
-        let slot = session.get_slot(slot_id)?;
-        if slot.sequence() != sequence_id {
-            return None;
-        }
-        slot.get_cached_reply().map(|c| c.reply)
     }
 
     /// Cache reply for a slot
@@ -602,94 +304,10 @@ impl SessionManager {
             }
         }
     }
-
-    /// Release slot without caching (for errors)
-    pub fn release_slot(&self, sessionid: &Sessionid4, slot_id: u32) {
-        if let Some(session) = self.get_session(sessionid) {
-            if let Some(slot) = session.get_slot(slot_id) {
-                slot.release_no_cache();
-            }
-        }
-    }
-
-    /// Get default slot count
-    #[inline]
-    pub fn default_slot_count(&self) -> u32 {
-        self.default_slot_count
-    }
 }
 
 impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_slot_acquire_release() {
-        let slot = Slot::new(0);
-
-        // First acquire should succeed
-        match slot.acquire(1).unwrap() {
-            SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 1),
-            _ => panic!("unexpected acquire result"),
-        }
-
-        // Release with reply
-        slot.release(vec![1, 2, 3]);
-
-        // Replay should return cached reply
-        match slot.acquire(1).unwrap() {
-            SlotAcquireResult::Replay { cached_reply } => assert_eq!(cached_reply, vec![1, 2, 3]),
-            _ => panic!("unexpected replay result"),
-        }
-
-        // Next sequence should succeed
-        match slot.acquire(2).unwrap() {
-            SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 2),
-            _ => panic!("unexpected acquire result"),
-        }
-    }
-
-    #[test]
-    fn test_session_trunking() {
-        let session = Session::new([0u8; 16], 1, 64);
-
-        assert_eq!(session.connection_count(), 1);
-
-        // Add connections (trunking)
-        assert_eq!(session.add_connection(), 2);
-        assert_eq!(session.add_connection(), 3);
-        assert_eq!(session.connection_count(), 3);
-
-        // Remove connection
-        assert_eq!(session.remove_connection(), 2);
-        assert_eq!(session.connection_count(), 2);
-    }
-
-    #[test]
-    fn test_session_manager() {
-        let manager = SessionManager::with_slot_count(64);
-
-        // Create session
-        let session = manager.create_session(12345).unwrap();
-        assert_eq!(session.clientid, 12345);
-        assert_eq!(session.slot_count(), 64);
-
-        // Get session
-        let retrieved = manager.get_session(&session.sessionid).unwrap();
-        assert_eq!(retrieved.clientid, 12345);
-
-        // Destroy session
-        manager.destroy_session(&session.sessionid).unwrap();
-        assert!(manager.get_session(&session.sessionid).is_none());
     }
 }

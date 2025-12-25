@@ -165,28 +165,6 @@ impl BackchannelManager {
         }
     }
 
-    /// Check if backchannel is available for a client
-    ///
-    /// NFS-Ganesha: get_cb_chan_down(client) returns true if DOWN
-    /// This function returns true if backchannel is UP (available).
-    ///
-    /// IMPORTANT: Without backchannel, server cannot recall delegations,
-    /// which can cause client-side delays when closing files.
-    pub fn is_available_for_client(&self, client_id: Clientid4) -> bool {
-        let client_sessions = self.client_sessions.read().unwrap();
-        if let Some(session_ids) = client_sessions.get(&client_id) {
-            let channels = self.channels.read().unwrap();
-            for session_id in session_ids {
-                if let Some(conn) = channels.get(session_id) {
-                    if conn.state == BackchannelState::Up {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
     /// Register a backchannel for a session
     pub fn register(
         &self,
@@ -248,15 +226,15 @@ impl BackchannelManager {
         // Try to find an active backchannel
         for session_id in session_ids {
             if let Some(conn) = channels.get(session_id) {
-                // Collapse nested if statements (clippy::collapsible_if)
-                if conn.state == BackchannelState::Up && conn.callback_tx.send(task.clone()).is_ok()
-                {
-                    debug!(
-                        "Sent callback to client {} via session {:?}",
-                        client_id,
-                        &session_id[..4]
-                    );
-                    return Ok(());
+                if conn.state == BackchannelState::Up {
+                    if conn.callback_tx.send(task.clone()).is_ok() {
+                        debug!(
+                            "Sent callback to client {} via session {:?}",
+                            client_id,
+                            &session_id[..4]
+                        );
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -276,8 +254,7 @@ impl BackchannelManager {
         // Find a session for this client
         let sessions = self.client_sessions.read().unwrap();
         let session_ids = sessions.get(&client_id).ok_or(Nfs4Status::BadSession)?;
-        // Dereference instead of clone for Copy type (clippy::clone_on_copy)
-        let session_id = *session_ids.first().ok_or(Nfs4Status::BadSession)?;
+        let session_id = session_ids.first().ok_or(Nfs4Status::BadSession)?.clone();
 
         let task = CallbackTask {
             session_id,

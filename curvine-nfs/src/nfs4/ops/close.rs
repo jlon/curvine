@@ -47,6 +47,7 @@ use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
+use tracing::info;
 
 /// CLOSE operation handler
 ///
@@ -71,63 +72,50 @@ pub async fn op_close(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    let _seqid = input.read_u32::<BigEndian>()?;
+    // Parse CLOSE4args
+    let seqid = input.read_u32::<BigEndian>()?;
     let mut stateid = Stateid4::default();
     stateid.deserialize(input)?;
 
-    tracing::debug!("CLOSE: stateid={:?}", stateid);
+    info!(
+        "CLOSE: seqid={} stateid={:02x?}",
+        seqid,
+        &stateid.other[..4]
+    );
 
-    // Step 1: Check stateid correctness
+    // Step 1: Get state by stateid.other (NFS-Ganesha: nfs4_Check_Stateid with STATEID_SPECIAL_FOR_CLOSE)
+    // For CLOSE, we accept any seqid - only check stateid.other
     let open_state = handler
         .opens
         .get_state(&stateid)
         .ok_or(Nfs4Status::BadStateid)?;
 
     let fileid = open_state.fileid;
-    let clientid = open_state.clientid;
-    let share_access = open_state.get_access();
 
-    tracing::info!(
-        "CLOSE: fileid={} path={} stateid={:?}",
+    info!(
+        "CLOSE: Verified stateid for fileid={} owner={:02x?}",
         fileid,
-        open_state.path.path(),
-        stateid
+        &open_state.owner_val[..open_state.owner_val.len().min(8)]
     );
 
-    // Update delegation heuristics (NFS-Ganesha: fds_num_opens tracking)
-    let is_write_open = (share_access & 0x02) != 0;
-    handler.delegations.record_close(fileid, is_write_open);
-
-    // Step 2: Clean all associated lock states (NFS-Ganesha: state_unlock_all)
-    // Release all locks held by this client on this file
-    release_locks_for_open(handler, clientid, fileid);
-
-    // Step 3: Delete the open state
+    // Step 2: Delete state (NFS-Ganesha: state_del_locked)
+    // This removes the state from all HashMaps
     let closed_state = handler.opens.close(&stateid)?;
 
-    // Step 4: Close file (FSAL closes fd if this is the last reference)
-    tracing::debug!("CLOSE: fileid={} calling close_file", fileid);
-    // ⏱️ PERF: Measure close_file time (includes complete/flush)
-    let close_start = std::time::Instant::now();
+    // Step 3: Close file (NFS-Ganesha: fsal_close2)
+    // This decrements OpenFile ref_count and calls complete() if last reference
     handler.fs.close_file(closed_state.fileid).await?;
-    let close_elapsed = close_start.elapsed();
-    tracing::warn!(
-        "⏱️ PERF_CLOSE_FILE: fileid={} elapsed_us={}",
-        fileid,
-        close_elapsed.as_micros()
-    );
-    tracing::debug!("CLOSE: fileid={} completed successfully", fileid);
 
-    // Build response
+    // Step 4: Build response
     let mut result = Vec::new();
 
+    // Return special stateid for NFSv4.1+ (NFS-Ganesha line 264)
     if ctx.minor_version > 0 {
-        // NFSv4.1+: Return special invalid stateid to prevent re-use
-        // NFS-Ganesha: memcpy all_zero + seqid = UINT32_MAX
+        // Special invalid stateid (all zeros with seqid=0xFFFFFFFF)
         let invalid_stateid = Stateid4::new(0xFFFFFFFF, [0u8; 12]);
         invalid_stateid.serialize(&mut result)?;
     } else {
-        // NFSv4.0: Return updated stateid with incremented seqid
+        // NFSv4.0: increment seqid
         let mut response_stateid = stateid;
         response_stateid.seqid = response_stateid.seqid.wrapping_add(1);
         if response_stateid.seqid == 0 {
@@ -136,51 +124,11 @@ pub async fn op_close(
         response_stateid.serialize(&mut result)?;
     }
 
+    info!(
+        "CLOSE SUCCESS: fileid={} stateid={:02x?}",
+        fileid,
+        &stateid.other[..4]
+    );
+
     Ok(result)
-}
-
-/// Release all locks associated with an open state
-///
-/// NFS-Ganesha Reference: nfs4_op_close.c line 244-256
-/// ```c
-/// glist_for_each_safe(glist, glistn, &state_found->state_data.share.share_lockstates) {
-///     state_t *lock_state = glist_entry(glist, state_t, state_data.lock.state_sharelist);
-///     state_unlock_all(state_obj, lock_state);
-///     state_del_locked(lock_state);
-/// }
-/// ```
-fn release_locks_for_open(
-    handler: &CompoundHandler,
-    clientid: crate::nfs4::types::Clientid4,
-    fileid: crate::nfs4::types::Fileid4,
-) {
-    // Get all lock states for this client
-    let lock_states = handler.locks.export_locks();
-
-    for lock_state in lock_states {
-        // Only process locks belonging to this client
-        if lock_state.owner.clientid != clientid {
-            continue;
-        }
-
-        // Check if any lock entry is on this file
-        let has_file_lock = {
-            let entries = lock_state.lock_entries.read().unwrap();
-            entries.iter().any(|e| e.fileid == fileid)
-        };
-
-        if has_file_lock {
-            // Release all lock ranges on this file
-            // NFS-Ganesha: state_unlock_all() releases all locks in the state
-            if let Err(e) = handler.locks.unlock(&lock_state.stateid, 0, u64::MAX) {
-                tracing::warn!("CLOSE: Failed to release lock for file {}: {:?}", fileid, e);
-            } else {
-                tracing::debug!(
-                    "CLOSE: Released locks for file {} stateid={:02x?}",
-                    fileid,
-                    &lock_state.stateid.other[..4]
-                );
-            }
-        }
-    }
 }

@@ -201,7 +201,6 @@ pub struct OpenManager {
     /// (File ID, Owner Val) -> Stateid (for state reuse - NFS-Ganesha aligned)
     /// This allows finding existing state for same file+owner combination
     /// NFS-Ganesha: nfs4_State_Get_Obj(file_obj, owner)
-    #[allow(clippy::type_complexity)]
     file_owner_state: RwLock<HashMap<(Fileid4, Vec<u8>), [u8; 12]>>,
     /// Next stateid counter
     next_stateid: AtomicU32,
@@ -333,6 +332,17 @@ impl OpenManager {
         if let Some(stateid_key) = existing_stateid {
             // Found existing state - reuse it (NFS-Ganesha behavior)
             if let Some(state) = self.states.read().unwrap().get(&stateid_key).cloned() {
+                tracing::info!(
+                    "🔄 OPEN: Reusing existing state for file {} owner={:02x?}, stateid={:02x?}, current_access={:#x}, current_deny={:#x}, requested_access={:#x}, requested_deny={:#x}",
+                    fileid,
+                    &owner_val[..owner_val.len().min(8)],
+                    &stateid_key[..4],
+                    state.get_access(),
+                    state.get_deny(),
+                    access,
+                    deny
+                );
+
                 // Check if we need to upgrade access/deny modes
                 let current_access = state.get_access();
                 let current_deny = state.get_deny();
@@ -345,6 +355,14 @@ impl OpenManager {
 
                     *state.share_access.write().unwrap() = new_access;
                     *state.share_deny.write().unwrap() = new_deny;
+
+                    tracing::info!(
+                        "🔄 OPEN: Upgraded state modes for file {} owner={:02x?}, new_access={:#x}, new_deny={:#x}",
+                        fileid,
+                        &owner_val[..owner_val.len().min(8)],
+                        new_access,
+                        new_deny
+                    );
                 } else {
                     // Check conflicts with current modes
                     self.check_share_conflict(fileid, access, deny, Some(clientid))?;
@@ -356,6 +374,13 @@ impl OpenManager {
         }
 
         // No existing state - create new one (NFS-Ganesha: alloc_state)
+        tracing::info!(
+            "🆕 OPEN: Creating NEW state for file {} owner={:02x?}, access={:#x}, deny={:#x}",
+            fileid,
+            &owner_val[..owner_val.len().min(8)],
+            access,
+            deny
+        );
 
         // Check share conflicts
         self.check_share_conflict(fileid, access, deny, Some(clientid))?;
@@ -366,13 +391,7 @@ impl OpenManager {
 
         // Create open state with owner_val
         let state = Arc::new(OpenState::new(
-            stateid,
-            clientid,
-            owner_val.clone(),
-            fileid,
-            path,
-            access,
-            deny,
+            stateid, clientid, owner_val.clone(), fileid, path, access, deny,
         ));
 
         // Store state
@@ -398,6 +417,15 @@ impl OpenManager {
             .write()
             .unwrap()
             .insert((fileid, owner_val.clone()), stateid_key);
+
+        tracing::info!(
+            "✅ OPEN: Created new state for file {} owner={:02x?}, stateid={:02x?}, access={:#x}, deny={:#x}",
+            fileid,
+            &owner_val[..owner_val.len().min(8)],
+            &stateid.other[..4],
+            access,
+            deny
+        );
 
         // Return new state with new_state = true (NFS-Ganesha aligned)
         Ok((state, true))
@@ -446,6 +474,13 @@ impl OpenManager {
             .remove(&stateid.other)
             .ok_or(Nfs4Status::BadStateid)?;
 
+        tracing::info!(
+            "🔴 CLOSE: stateid={:02x?} fileid={} owner={:02x?}",
+            &stateid.other[..4],
+            state.fileid,
+            &state.owner_val[..state.owner_val.len().min(8)]
+        );
+
         // Remove from file_opens
         if let Some(opens) = self.file_opens.write().unwrap().get_mut(&state.fileid) {
             opens.retain(|s| s != &stateid.other);
@@ -462,26 +497,13 @@ impl OpenManager {
             .unwrap()
             .remove(&(state.fileid, state.owner_val.clone()));
 
+        tracing::info!(
+            "✅ CLOSE: State deleted for file {} owner={:02x?}",
+            state.fileid,
+            &state.owner_val[..state.owner_val.len().min(8)]
+        );
+
         Ok(state)
-    }
-
-    /// Get all open states for a client (for cleanup)
-    ///
-    /// Returns a list of OpenState references for the client.
-    /// Used by cleanup_client to close all OpenFiles before removing states.
-    pub fn get_client_opens(&self, clientid: Clientid4) -> Vec<Arc<OpenState>> {
-        let client_opens = self.client_opens.read().unwrap();
-        let states = self.states.read().unwrap();
-
-        client_opens
-            .get(&clientid)
-            .map(|stateids| {
-                stateids
-                    .iter()
-                    .filter_map(|sid| states.get(sid).cloned())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Close all opens for a client
@@ -513,104 +535,6 @@ impl OpenManager {
             .values()
             .map(Arc::clone)
             .collect()
-    }
-
-    /// Restore persisted open state (for recovery after server restart)
-    ///
-    /// This method is called during grace period to restore persisted opens.
-    /// The state is marked as unconfirmed until client reclaims it with CLAIM_PREVIOUS.
-    ///
-    /// # NFS-Ganesha Reference
-    /// From nfs4_recovery.c: state recovery during grace period
-    ///
-    /// # Arguments
-    /// - stateid: Persisted stateid.other (12 bytes)
-    /// - clientid: Client ID
-    /// - fileid: File ID
-    /// - path: File path
-    /// - access: Share access mode
-    /// - deny: Share deny mode
-    /// - owner_val: Owner value (will be looked up from persisted state)
-    pub fn restore_persisted_state(
-        &self,
-        stateid: [u8; 12],
-        clientid: Clientid4,
-        fileid: Fileid4,
-        path: Path,
-        access: u32,
-        deny: u32,
-        owner_val: Vec<u8>,
-    ) -> Nfs4Result<Arc<OpenState>> {
-        // Check if state already exists (should not happen during recovery)
-        if self.states.read().unwrap().contains_key(&stateid) {
-            tracing::warn!(
-                "Restore: stateid {:02x?} already exists, skipping",
-                &stateid[..4]
-            );
-            return Err(Nfs4Status::BadStateid.into());
-        }
-
-        // Create stateid from persisted stateid.other
-        let stateid_obj = Stateid4::new(1, stateid);
-
-        // Create open state (unconfirmed, will be confirmed on CLAIM_PREVIOUS)
-        let state = Arc::new(OpenState::new(
-            stateid_obj,
-            clientid,
-            owner_val.clone(),
-            fileid,
-            path,
-            access,
-            deny,
-        ));
-
-        // Store state
-        self.states.write().unwrap().insert(stateid, state.clone());
-        self.file_opens
-            .write()
-            .unwrap()
-            .entry(fileid)
-            .or_default()
-            .push(stateid);
-        self.client_opens
-            .write()
-            .unwrap()
-            .entry(clientid)
-            .or_default()
-            .push(stateid);
-
-        // Track (file, owner) -> stateid mapping for CLAIM_PREVIOUS lookup
-        self.file_owner_state
-            .write()
-            .unwrap()
-            .insert((fileid, owner_val), stateid);
-
-        tracing::info!(
-            "Restored persisted open state: stateid={:02x?} clientid={} fileid={}",
-            &stateid[..4],
-            clientid,
-            fileid
-        );
-
-        Ok(state)
-    }
-
-    /// Find persisted state by (fileid, owner_val) for CLAIM_PREVIOUS
-    ///
-    /// This is used during CLAIM_PREVIOUS to find the state that was restored from persistence.
-    pub fn find_persisted_state(
-        &self,
-        fileid: Fileid4,
-        owner_val: &[u8],
-    ) -> Option<Arc<OpenState>> {
-        let stateid_key = self
-            .file_owner_state
-            .read()
-            .unwrap()
-            .get(&(fileid, owner_val.to_vec()))
-            .copied()?;
-
-        self.states.read().unwrap().get(&stateid_key).cloned()
     }
 }
 

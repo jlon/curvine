@@ -47,12 +47,6 @@ pub struct ClientState {
     pub create_session_sequence: std::sync::atomic::AtomicU32,
     /// Cached CREATE_SESSION response for replay detection
     pub create_session_slot: RwLock<CreateSessionSlot>,
-    /// Allow reclaim during grace period (NFS-Ganesha: cid_allow_reclaim)
-    /// Set to true when client reconnects during grace period
-    pub allow_reclaim: std::sync::atomic::AtomicBool,
-    /// Reclaim complete flag (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete)
-    /// Set to true after RECLAIM_COMPLETE operation
-    pub reclaim_complete: std::sync::atomic::AtomicBool,
 }
 
 impl ClientState {
@@ -66,8 +60,6 @@ impl ClientState {
             // Per RFC 5661, CREATE_SESSION sequence starts at 1
             create_session_sequence: std::sync::atomic::AtomicU32::new(1),
             create_session_slot: RwLock::new(CreateSessionSlot::default()),
-            allow_reclaim: std::sync::atomic::AtomicBool::new(false),
-            reclaim_complete: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -115,30 +107,6 @@ impl ClientState {
     /// Get cached CREATE_SESSION response
     pub fn get_cached_create_session_response(&self) -> CreateSessionSlot {
         self.create_session_slot.read().unwrap().clone()
-    }
-
-    /// Set allow_reclaim flag (NFS-Ganesha: cid_allow_reclaim)
-    pub fn set_allow_reclaim(&self, allow: bool) {
-        self.allow_reclaim
-            .store(allow, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Check if reclaim is allowed
-    pub fn allow_reclaim(&self) -> bool {
-        self.allow_reclaim
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Set reclaim_complete flag (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete)
-    pub fn set_reclaim_complete(&self, complete: bool) {
-        self.reclaim_complete
-            .store(complete, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Check if reclaim is complete
-    pub fn is_reclaim_complete(&self) -> bool {
-        self.reclaim_complete
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -225,11 +193,7 @@ impl ClientManager {
             .unwrap()
             .insert(owner_id, clientid);
 
-        tracing::info!(
-            "Registered new client {} with create_session_sequence={}",
-            clientid,
-            seqid
-        );
+        tracing::info!("Registered new client {} with create_session_sequence={}", clientid, seqid);
         Ok((clientid, seqid, 0))
     }
 
@@ -248,9 +212,11 @@ impl ClientManager {
         let clients = self.clients.read().unwrap();
         for (&clientid, client) in clients.iter() {
             if client.is_confirmed() {
+                tracing::info!("Found confirmed client {} for NFSv4.0 operation", clientid);
                 return Some(clientid);
             }
         }
+        tracing::warn!("No confirmed clients found for NFSv4.0 operation");
         None
     }
 
@@ -262,24 +228,14 @@ impl ClientManager {
         client.confirm();
         client.renew();
 
+        tracing::info!("Confirmed client {}", clientid);
         Ok(())
     }
 
     /// Renew client lease
-    ///
-    /// # NFS-Ganesha Reference
-    /// From nfs4_op_renew.c: nfs_client_id_get_confirmed()
-    /// Only confirmed clients can renew their lease.
     pub fn renew_lease(&self, clientid: Clientid4) -> Nfs4Result<()> {
         let clients = self.clients.read().unwrap();
         let client = clients.get(&clientid).ok_or(Nfs4Status::StaleClientid)?;
-
-        // Only confirmed clients can renew (NFS-Ganesha: nfs_client_id_get_confirmed)
-        if !client.is_confirmed() {
-            tracing::debug!("RENEW: client {} is not confirmed", clientid);
-            return Err(Nfs4Status::StaleClientid.into());
-        }
-
         client.renew();
         Ok(())
     }
@@ -291,6 +247,7 @@ impl ClientManager {
                 .write()
                 .unwrap()
                 .remove(&client.owner.co_ownerid);
+            tracing::info!("Purged client {}", clientid);
         }
     }
 
@@ -320,70 +277,6 @@ impl ClientManager {
             .iter()
             .map(|(&id, state)| (id, Arc::clone(state)))
             .collect()
-    }
-
-    /// Restore persisted client state (for recovery after server restart)
-    ///
-    /// This method is called during grace period to restore persisted clients.
-    /// The client is marked with allow_reclaim=true to allow CLAIM_PREVIOUS operations.
-    ///
-    /// # NFS-Ganesha Reference
-    /// From nfs4_recovery.c: client recovery during grace period
-    pub fn restore_persisted_client(
-        &self,
-        persisted: &crate::nfs4::state::persistence::PersistedClient,
-    ) -> Nfs4Result<()> {
-        use crate::nfs4::types::ClientOwner4;
-
-        // Check if client already exists (should not happen during recovery)
-        if self
-            .clients
-            .read()
-            .unwrap()
-            .contains_key(&persisted.clientid)
-        {
-            tracing::warn!(
-                "Restore: client {} already exists, skipping",
-                persisted.clientid
-            );
-            return Err(Nfs4Status::StaleClientid.into());
-        }
-
-        // Create ClientOwner4 from persisted data
-        let owner = ClientOwner4 {
-            co_ownerid: persisted.client_owner.clone(),
-            co_verifier: persisted.verifier,
-        };
-
-        // Create client state
-        let client = Arc::new(ClientState::new(persisted.clientid, owner));
-
-        // Restore confirmed state
-        if persisted.confirmed {
-            client.confirm();
-        }
-
-        // Mark client as allowing reclaim (NFS-Ganesha: cid_allow_reclaim = true)
-        // This allows the client to use CLAIM_PREVIOUS during grace period
-        client.set_allow_reclaim(true);
-
-        // Store client
-        self.clients
-            .write()
-            .unwrap()
-            .insert(persisted.clientid, client.clone());
-        self.owner_to_client
-            .write()
-            .unwrap()
-            .insert(persisted.client_owner.clone(), persisted.clientid);
-
-        tracing::info!(
-            "Restored persisted client: clientid={} confirmed={}",
-            persisted.clientid,
-            persisted.confirmed
-        );
-
-        Ok(())
     }
 }
 

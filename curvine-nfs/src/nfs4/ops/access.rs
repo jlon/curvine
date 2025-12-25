@@ -64,6 +64,7 @@ use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
+use tracing::info;
 
 // Access mode constants (RFC 5661, Section 18.1.3)
 pub mod access_mode {
@@ -73,15 +74,15 @@ pub mod access_mode {
     pub const EXTEND: u32 = 0x00000008;
     pub const DELETE: u32 = 0x00000010;
     pub const EXECUTE: u32 = 0x00000020;
-
+    
     // NFSv4.2 extended attributes (RFC 7862)
     pub const XAREAD: u32 = 0x00000040;
     pub const XAWRITE: u32 = 0x00000080;
     pub const XALIST: u32 = 0x00000100;
-
+    
     // All basic access modes
     pub const ALL_BASIC: u32 = READ | LOOKUP | MODIFY | EXTEND | DELETE | EXECUTE;
-
+    
     // All extended modes (NFSv4.2+)
     pub const ALL_EXTENDED: u32 = XAREAD | XAWRITE | XALIST;
 }
@@ -103,27 +104,40 @@ pub async fn op_access(
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
+    // Parse ACCESS4args
     let access = input.read_u32::<BigEndian>()?;
+    
+    info!("ACCESS: access={:#x}", access);
 
+    // Determine maximum allowed access based on minor version
+    // NFS-Ganesha line 77-82
     let max_access = if ctx.minor_version >= 2 {
         access_mode::ALL_BASIC | access_mode::ALL_EXTENDED
     } else {
         access_mode::ALL_BASIC
     };
 
+    // Check for input parameter's sanity (NFS-Ganesha line 95-99)
     if access > max_access {
         return Err(Nfs4Status::Inval.into());
     }
 
+    // Get current filehandle (NFS-Ganesha: nfs4_sanity_check_FH)
     let fh = ctx.require_current_fh()?;
-
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
+    // Perform the 'access' call (NFS-Ganesha line 102-104)
     let (supported, allowed) = check_access(handler, fileid, access).await?;
 
+    // Build response
     let mut result = Vec::new();
     supported.serialize(&mut result)?;
     allowed.serialize(&mut result)?;
+
+    info!(
+        "ACCESS SUCCESS: access={:#x} supported={:#x} allowed={:#x}",
+        access, supported, allowed
+    );
 
     Ok(result)
 }
@@ -152,10 +166,13 @@ async fn check_access(
     fileid: Fileid4,
     requested: u32,
 ) -> Nfs4Result<(u32, u32)> {
+    // Get file status to determine type
     let status = handler.fs.get_status(fileid).await?;
 
+    // Determine supported access modes based on file type
     let supported = match status.file_type {
         curvine_common::state::FileType::Dir => {
+            // Directories support: READ (list), LOOKUP, MODIFY, EXTEND, DELETE
             access_mode::READ
                 | access_mode::LOOKUP
                 | access_mode::MODIFY
@@ -163,12 +180,26 @@ async fn check_access(
                 | access_mode::DELETE
         }
         curvine_common::state::FileType::File => {
-            access_mode::READ | access_mode::MODIFY | access_mode::EXTEND | access_mode::EXECUTE
+            // Regular files support: READ, MODIFY, EXTEND, EXECUTE
+            access_mode::READ
+                | access_mode::MODIFY
+                | access_mode::EXTEND
+                | access_mode::EXECUTE
         }
-        curvine_common::state::FileType::Link => access_mode::READ,
-        _ => access_mode::READ,
+        curvine_common::state::FileType::Link => {
+            // Symbolic links support: READ (readlink)
+            access_mode::READ
+        }
+        _ => {
+            // Other file types: minimal support
+            access_mode::READ
+        }
     };
 
+    // For now, allow all requested access that is supported
+    // TODO: Implement proper permission checking based on file mode and user credentials
+    // NOTE: Even if we deny access here, we should NOT return error
+    // (NFS-Ganesha line 106-109: ERR_FSAL_ACCESS also returns NFS4_OK)
     let allowed = requested & supported;
 
     Ok((supported, allowed))

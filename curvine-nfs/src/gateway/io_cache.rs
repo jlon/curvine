@@ -22,7 +22,6 @@ use orpc::sync::FastSyncCache;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::debug;
 
 /// I/O cache configuration
 #[derive(Debug, Clone)]
@@ -71,13 +70,15 @@ impl From<&NfsGatewayConf> for IoCacheConfig {
 }
 
 pub struct ReaderEntry {
-    pub reader: NfsReader,
+    pub reader: tokio::sync::Mutex<NfsReader>,
 }
 
 impl ReaderEntry {
     #[inline]
     pub fn new(reader: NfsReader) -> Self {
-        Self { reader }
+        Self {
+            reader: tokio::sync::Mutex::new(reader),
+        }
     }
 }
 
@@ -126,9 +127,7 @@ impl ReaderPool {
 }
 
 impl Drop for ReaderPool {
-    fn drop(&mut self) {
-        debug!("ReaderPool: dropping {} readers", self.readers.len());
-    }
+    fn drop(&mut self) {}
 }
 
 pub struct WriterEntry {
@@ -160,21 +159,16 @@ impl IoCache {
         let reader_pools = FastSyncCache::with_eviction_listener(
             config.reader_capacity,
             Duration::from_secs(config.reader_ttl_secs),
-            |key, _pool, cause| {
-                debug!("ReaderPool evicted: fileid={}, cause={:?}", key, cause);
-            },
+            |_key, _pool, _cause| {},
         );
 
         let writers = FastSyncCache::with_eviction_listener(
             config.writer_capacity,
             Duration::from_secs(config.writer_ttl_secs),
-            |key, entry: Arc<WriterEntry>, cause| {
-                debug!("Writer evicted: fileid={}, cause={:?}", key, cause);
+            |_key, entry: Arc<WriterEntry>, _cause| {
                 tokio::spawn(async move {
                     let mut writer = entry.writer.lock().await;
-                    if let Err(e) = writer.complete().await {
-                        debug!("Failed to complete writer for fileid={}: {}", key, e);
-                    }
+                    let _ = writer.complete().await;
                 });
             },
         );
@@ -248,7 +242,6 @@ impl IoCache {
     /// Complete and remove writer for a file
     pub async fn complete_writer(&self, fileid: u64) {
         if let Some(entry) = self.writers.remove(&fileid) {
-            debug!("IoCache: completing writer for fileid={}", fileid);
             let _ = entry.writer.lock().await.complete().await;
         }
         self.file_blocks.invalidate(&fileid);

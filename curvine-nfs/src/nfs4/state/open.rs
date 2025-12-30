@@ -332,17 +332,6 @@ impl OpenManager {
         if let Some(stateid_key) = existing_stateid {
             // Found existing state - reuse it (NFS-Ganesha behavior)
             if let Some(state) = self.states.read().unwrap().get(&stateid_key).cloned() {
-                tracing::info!(
-                    "🔄 OPEN: Reusing existing state for file {} owner={:02x?}, stateid={:02x?}, current_access={:#x}, current_deny={:#x}, requested_access={:#x}, requested_deny={:#x}",
-                    fileid,
-                    &owner_val[..owner_val.len().min(8)],
-                    &stateid_key[..4],
-                    state.get_access(),
-                    state.get_deny(),
-                    access,
-                    deny
-                );
-
                 // Check if we need to upgrade access/deny modes
                 let current_access = state.get_access();
                 let current_deny = state.get_deny();
@@ -355,14 +344,6 @@ impl OpenManager {
 
                     *state.share_access.write().unwrap() = new_access;
                     *state.share_deny.write().unwrap() = new_deny;
-
-                    tracing::info!(
-                        "🔄 OPEN: Upgraded state modes for file {} owner={:02x?}, new_access={:#x}, new_deny={:#x}",
-                        fileid,
-                        &owner_val[..owner_val.len().min(8)],
-                        new_access,
-                        new_deny
-                    );
                 } else {
                     // Check conflicts with current modes
                     self.check_share_conflict(fileid, access, deny, Some(clientid))?;
@@ -374,13 +355,6 @@ impl OpenManager {
         }
 
         // No existing state - create new one (NFS-Ganesha: alloc_state)
-        tracing::info!(
-            "🆕 OPEN: Creating NEW state for file {} owner={:02x?}, access={:#x}, deny={:#x}",
-            fileid,
-            &owner_val[..owner_val.len().min(8)],
-            access,
-            deny
-        );
 
         // Check share conflicts
         self.check_share_conflict(fileid, access, deny, Some(clientid))?;
@@ -423,15 +397,6 @@ impl OpenManager {
             .write()
             .unwrap()
             .insert((fileid, owner_val.clone()), stateid_key);
-
-        tracing::info!(
-            "✅ OPEN: Created new state for file {} owner={:02x?}, stateid={:02x?}, access={:#x}, deny={:#x}",
-            fileid,
-            &owner_val[..owner_val.len().min(8)],
-            &stateid.other[..4],
-            access,
-            deny
-        );
 
         // Return new state with new_state = true (NFS-Ganesha aligned)
         Ok((state, true))
@@ -480,13 +445,6 @@ impl OpenManager {
             .remove(&stateid.other)
             .ok_or(Nfs4Status::BadStateid)?;
 
-        tracing::info!(
-            "🔴 CLOSE: stateid={:02x?} fileid={} owner={:02x?}",
-            &stateid.other[..4],
-            state.fileid,
-            &state.owner_val[..state.owner_val.len().min(8)]
-        );
-
         // Remove from file_opens
         if let Some(opens) = self.file_opens.write().unwrap().get_mut(&state.fileid) {
             opens.retain(|s| s != &stateid.other);
@@ -502,12 +460,6 @@ impl OpenManager {
             .write()
             .unwrap()
             .remove(&(state.fileid, state.owner_val.clone()));
-
-        tracing::info!(
-            "✅ CLOSE: State deleted for file {} owner={:02x?}",
-            state.fileid,
-            &state.owner_val[..state.owner_val.len().min(8)]
-        );
 
         Ok(state)
     }

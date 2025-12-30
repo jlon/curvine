@@ -15,46 +15,42 @@
 //! NfsReader: A direct wrapper around UnifiedReader for high-performance reads
 //!
 //! # Performance Optimization (2025-12-30)
-//! Removed channel-based serialization mechanism to improve sequential read performance.
-//! Each NfsReader now directly wraps UnifiedReader, allowing true concurrent reads
-//! when used with ReaderPool.
+//! Removed Mutex to enable true concurrent reads.
+//! Each NfsReader exclusively owns its UnifiedReader instance.
 //!
-//! # Previous Architecture (with channel)
-//! - Each NfsReader had an AsyncChannel that serialized all read requests
-//! - Even with 8 readers in ReaderPool, each reader processed requests one-by-one
-//! - Sequential read performance: ~352 MiB/s
+//! # Architecture Evolution
+//! 1. Original: AsyncChannel serialization (~352 MiB/s)
+//! 2. V2: Arc<Mutex<UnifiedReader>> (~547 MiB/s)
+//! 3. V3: Direct ownership, no Mutex (target: > 1000 MiB/s)
 //!
-//! # New Architecture (direct)
-//! - NfsReader directly wraps UnifiedReader with Arc<Mutex<...>>
-//! - Multiple concurrent reads can be processed simultaneously
-//! - Target sequential read performance: > 3000 MiB/s
+//! # Key Insight
+//! With ReaderPool having 8 NfsReaders, each NfsReader should independently
+//! own its UnifiedReader. No sharing = no locking = maximum concurrency.
 
 use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
-/// Direct NFS Reader - wraps UnifiedReader without channel serialization
+/// Direct NFS Reader - exclusively owns UnifiedReader for zero-lock reads
 ///
 /// # Design
-/// - Uses Arc<Mutex<UnifiedReader>> for thread-safe concurrent access
-/// - No channel mechanism - reads are processed directly
-/// - Clone is cheap (Arc clone)
-/// - When used with ReaderPool, enables true concurrent reads
+/// - Each NfsReader owns its UnifiedReader (no Arc, no Mutex)
+/// - ReaderPool creates 8 independent NfsReaders
+/// - True 8-way concurrency with zero lock contention
+/// - Clone is NOT supported (each reader is unique)
 pub struct NfsReader {
     /// Immutable metadata (no lock needed)
     path: Path,
     len: i64,
     status: FileStatus,
-    /// Mutable reader state (protected by Mutex)
-    reader: Arc<Mutex<UnifiedReader>>,
+    /// Exclusively owned reader (no sharing, no locking)
+    reader: UnifiedReader,
 }
 
 impl NfsReader {
-    /// Create new NfsReader (no background task needed)
+    /// Create new NfsReader with exclusive ownership
     pub fn new(reader: UnifiedReader) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
@@ -64,7 +60,7 @@ impl NfsReader {
             path,
             len,
             status,
-            reader: Arc::new(Mutex::new(reader)),
+            reader,
         }
     }
 
@@ -90,23 +86,20 @@ impl NfsReader {
 
     /// Read data at specific offset and length
     ///
-    /// # Thread Safety
-    /// Uses Mutex to ensure thread-safe access to UnifiedReader.
-    /// Multiple concurrent calls will be serialized by the Mutex,
-    /// but with ReaderPool (8 readers), we get 8-way concurrency.
-    ///
     /// # Performance
-    /// - No channel overhead
+    /// - Zero lock overhead (no Mutex)
     /// - Direct call to UnifiedReader.fuse_read()
-    /// - Mutex contention is minimal with ReaderPool
-    pub async fn fuse_read(&self, offset: i64, len: usize) -> FsResult<Vec<DataSlice>> {
-        let mut reader = self.reader.lock().await;
-        reader.fuse_read(offset, len).await
+    /// - Each NfsReader in the pool operates independently
+    ///
+    /// # Thread Safety
+    /// Safe because each NfsReader is accessed by only one task at a time
+    /// (round-robin selection in ReaderPool ensures this)
+    pub async fn fuse_read(&mut self, offset: i64, len: usize) -> FsResult<Vec<DataSlice>> {
+        self.reader.fuse_read(offset, len).await
     }
 
     /// Complete the reader and flush any pending data
-    pub async fn complete(&self) -> FsResult<()> {
-        let mut reader = self.reader.lock().await;
-        reader.complete().await
+    pub async fn complete(&mut self) -> FsResult<()> {
+        self.reader.complete().await
     }
 }

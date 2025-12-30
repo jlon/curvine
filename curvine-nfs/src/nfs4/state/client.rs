@@ -216,11 +216,9 @@ impl ClientManager {
         let clients = self.clients.read().unwrap();
         for (&clientid, client) in clients.iter() {
             if client.is_confirmed() {
-                tracing::info!("Found confirmed client {} for NFSv4.0 operation", clientid);
                 return Some(clientid);
             }
         }
-        tracing::warn!("No confirmed clients found for NFSv4.0 operation");
         None
     }
 
@@ -232,7 +230,6 @@ impl ClientManager {
         client.confirm();
         client.renew();
 
-        tracing::info!("Confirmed client {}", clientid);
         Ok(())
     }
 
@@ -251,7 +248,6 @@ impl ClientManager {
                 .write()
                 .unwrap()
                 .remove(&client.owner.co_ownerid);
-            tracing::info!("Purged client {}", clientid);
         }
     }
 

@@ -73,13 +73,11 @@ pub async fn op_open_confirm(
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // NFSv4.1+ does not use OPEN_CONFIRM (line 73-76)
     if ctx.minor_version > 0 {
         debug!("OPEN_CONFIRM not supported in NFSv4.{}", ctx.minor_version);
         return Err(Nfs4Status::Notsupp.into());
     }
 
-    // Read OPEN_CONFIRM4args (line 57-58)
     let mut stateid = Stateid4::default();
     stateid.deserialize(input)?;
     let seqid = input.read_u32::<BigEndian>()?;
@@ -90,13 +88,9 @@ pub async fn op_open_confirm(
         seqid
     );
 
-    // Check filehandle (line 79-84)
     let fh = ctx.require_current_fh()?;
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
-    // Get state by stateid.other (line 87-96)
-    // Note: We use get_state() not verify_stateid() because OPEN_CONFIRM
-    // must accept the stateid from OPEN response regardless of seqid
     let open_state = handler
         .opens
         .get_state(&stateid)
@@ -110,7 +104,6 @@ pub async fn op_open_confirm(
         open_state.get_deny()
     );
 
-    // Verify file matches (sanity check)
     if open_state.fileid != fileid {
         debug!(
             "OPEN_CONFIRM: fileid mismatch state={} current={}",
@@ -119,16 +112,13 @@ pub async fn op_open_confirm(
         return Err(Nfs4Status::BadStateid.into());
     }
 
-    // Check if already confirmed (line 119-123)
     if open_state.is_confirmed() {
         info!("OPEN_CONFIRM: state already confirmed, returning BAD_STATEID");
         return Err(Nfs4Status::BadStateid.into());
     }
 
-    // Mark as confirmed (line 126)
     open_state.set_confirmed(true);
 
-    // Increment seqid and build response (line 129)
     let new_seqid = open_state.next_seqid();
     let confirmed_stateid = Stateid4::new(new_seqid, stateid.other);
 
@@ -139,7 +129,6 @@ pub async fn op_open_confirm(
         new_seqid
     );
 
-    // Build response
     let mut result = Vec::new();
     confirmed_stateid.serialize(&mut result)?;
 

@@ -146,47 +146,23 @@ impl PathCache {
     /// - new_path: The new path of the file
     /// - new_fileid: The fileid after rename (may be different from old_fileid)
     fn rename(&self, old_fileid: Fileid4, old_path: &str, new_path: &str, new_fileid: Fileid4) {
-        tracing::info!(
-            "PathCache::rename: old_fileid={} old_path={} new_path={} new_fileid={}",
-            old_fileid,
-            old_path,
-            new_path,
-            new_fileid
-        );
-
         // Step 1: Remove old path -> fileid mapping
         self.path_to_id.invalidate(old_path);
 
         // Step 2: Remove target path's old mapping (if target exists, it's overwritten)
         if let Some(target_fileid) = self.path_to_id.get(new_path) {
-            tracing::info!(
-                "PathCache::rename: Target path {} has existing fileid={}, removing",
-                new_path,
-                target_fileid
-            );
             self.id_to_path.invalidate(&target_fileid);
             self.path_to_id.invalidate(new_path);
         }
 
         // Step 3: Remove old fileid -> path mapping (if fileid changed)
         if old_fileid != new_fileid {
-            tracing::info!(
-                "PathCache::rename: fileid changed from {} to {}, removing old mapping",
-                old_fileid,
-                new_fileid
-            );
             self.id_to_path.invalidate(&old_fileid);
         }
 
         // Step 4: Add new mappings
         self.id_to_path.insert(new_fileid, new_path.to_string());
         self.path_to_id.insert(new_path.to_string(), new_fileid);
-
-        tracing::info!(
-            "PathCache::rename: Updated cache - fileid={} -> path={}",
-            new_fileid,
-            new_path
-        );
     }
 }
 
@@ -274,12 +250,6 @@ impl OpenFile {
     /// NFS-Ganesha: fsal_start_fd_work()
     pub fn add_ref(&self) -> u32 {
         let old_count = self.ref_count.fetch_add(1, Ordering::AcqRel);
-        tracing::debug!(
-            "OpenFile::add_ref: fileid={} ref_count {} -> {}",
-            self.fileid,
-            old_count,
-            old_count + 1
-        );
         old_count + 1
     }
 
@@ -288,12 +258,6 @@ impl OpenFile {
     /// NFS-Ganesha: fsal_complete_fd_work()
     pub fn release_ref(&self) -> bool {
         let old_count = self.ref_count.fetch_sub(1, Ordering::AcqRel);
-        tracing::debug!(
-            "OpenFile::release_ref: fileid={} ref_count {} -> {}",
-            self.fileid,
-            old_count,
-            old_count - 1
-        );
         old_count == 1 // Last reference
     }
 
@@ -351,21 +315,8 @@ impl OpenFile {
             return Ok(());
         }
 
-        tracing::info!(
-            "Upgrading OpenFile access: fileid={} current={:#x} new={:#x} combined={:#x}",
-            self.fileid,
-            current_access,
-            new_access,
-            combined_access
-        );
-
         // Step 2: Create ReaderPool if needed (no locks held during async operation)
         if need_reader {
-            tracing::info!(
-                "Creating ReaderPool for upgrade: fileid={} pool_size={}",
-                self.fileid,
-                pool_size
-            );
             let path = self.path.clone();
             let reader_pool = ReaderPool::new(pool_size, || {
                 let p = path.clone();
@@ -381,7 +332,6 @@ impl OpenFile {
 
         // Step 4: Create Writer if needed (no locks held during async operation)
         if need_writer {
-            tracing::info!("Creating Writer for upgrade: fileid={}", self.fileid);
             let flags = OpenFlags::new_write_only().set_create(false);
             let opts = ufs.cv().create_opts_builder().build();
             let writer = ufs
@@ -407,7 +357,7 @@ impl OpenFile {
     ///
     /// # Thread Safety
     /// Uses ReaderPool with round-robin selection for concurrent reads.
-    /// NfsReader is thread-safe (uses channel internally), no external lock needed.
+    /// Each NfsReader is protected by Mutex in ReaderEntry.
     pub async fn read(&self, offset: u64, count: u32) -> Nfs4Result<(Vec<DataSlice>, bool)> {
         // Step 1: Get ReaderPool entry (release RwLock before await)
         let reader_entry = {
@@ -419,10 +369,13 @@ impl OpenFile {
             pool.get()
         }; // RwLock released here - CRITICAL for Send trait
 
-        // Step 2: Get file length (no lock needed - NfsReader.len() is immutable)
-        let file_len = reader_entry.reader.len();
+        // Step 2: Lock the reader (each reader is independent)
+        let mut reader = reader_entry.reader.lock().await;
 
-        // Step 3: Check bounds
+        // Step 3: Get file length (no additional lock needed)
+        let file_len = reader.len();
+
+        // Step 4: Check bounds
         if offset >= file_len as u64 {
             return Ok((vec![], true));
         }
@@ -434,14 +387,13 @@ impl OpenFile {
             return Ok((vec![], true));
         }
 
-        // Step 4: Perform read operation (NfsReader is thread-safe via channel)
-        let slices = reader_entry
-            .reader
+        // Step 5: Perform read operation (zero-copy, direct call)
+        let slices = reader
             .fuse_read(offset as i64, read_count as usize)
             .await
             .map_err(Nfs4Error::from)?;
 
-        // Step 5: Calculate EOF
+        // Step 6: Calculate EOF
         let total_len: usize = slices.iter().map(|s| s.len()).sum();
         let eof = total_len < count as usize || (offset + total_len as u64) >= file_len as u64;
 
@@ -493,7 +445,6 @@ impl OpenFile {
                 tracing::error!("Failed to flush Writer for file {}: {:?}", self.fileid, e);
                 Nfs4Error::from(e)
             })?;
-            tracing::info!("✅ Flushed Writer for file {} (CLOSE)", self.fileid);
         }
         Ok(())
     }
@@ -517,18 +468,6 @@ impl OpenFile {
                     );
                     Nfs4Error::from(e)
                 })?;
-                tracing::info!("✅ Completed Writer for file {}", self.fileid);
-            }
-        }
-
-        // Step 2: Complete all Readers in the pool
-        // Note: ReaderPool will be dropped when OpenFile is dropped,
-        // which will trigger NfsReader's background tasks to complete.
-        // We just log here for debugging purposes.
-        {
-            let pool_guard = self.reader_pool.read().unwrap();
-            if pool_guard.is_some() {
-                tracing::info!("✅ ReaderPool will be released for file {}", self.fileid);
             }
         }
 
@@ -674,7 +613,6 @@ impl Nfs4FileSystem {
         // Try cache first if enabled
         if let Some(ref cache) = self.status_cache {
             if let Some(status) = cache.get(&fileid) {
-                tracing::debug!("FileStatus cache hit for fileid={}", fileid);
                 return Ok(status);
             }
         }
@@ -688,31 +626,14 @@ impl Nfs4FileSystem {
         // IMPORTANT: Do NOT cache status when Writer is active, as writer_pos changes frequently
         let has_active_writer = if let Some(open_file) = self.get_open_file(fileid) {
             if let Some(writer_pos) = open_file.get_writer_pos().await {
-                tracing::info!(
-                    "📝 [GETATTR] fileid={} backend_size={} writer_pos={}",
-                    fileid,
-                    status.len,
-                    writer_pos
-                );
                 if writer_pos > status.len {
-                    tracing::info!(
-                        "📝 [GETATTR] fileid={} adjusting size from {} to {} (Writer pos)",
-                        fileid,
-                        status.len,
-                        writer_pos
-                    );
                     status.len = writer_pos;
                 }
                 true // Has active Writer
             } else {
-                tracing::debug!(
-                    "📝 [GETATTR] fileid={} no writer_pos (Writer is None)",
-                    fileid
-                );
                 false
             }
         } else {
-            tracing::debug!("📝 [GETATTR] fileid={} no OpenFile", fileid);
             false
         };
 
@@ -722,11 +643,6 @@ impl Nfs4FileSystem {
             if let Some(ref cache) = self.status_cache {
                 cache.insert(fileid, status.clone());
             }
-        } else {
-            tracing::debug!(
-                "📝 [GETATTR] fileid={} - NOT caching status (active Writer)",
-                fileid
-            );
         }
 
         Ok(status)
@@ -748,7 +664,6 @@ impl Nfs4FileSystem {
     /// returns the updated attributes.
     #[inline]
     pub fn invalidate_status_cache_for_write(&self, fileid: Fileid4) {
-        tracing::debug!("Invalidating status cache after WRITE: fileid={}", fileid);
         self.invalidate_status_cache(fileid);
     }
 
@@ -788,12 +703,7 @@ impl Nfs4FileSystem {
             // OpenFile exists - this means another state already opened this file.
             // We need to add_ref() because we're creating a NEW state.
             // NFS-Ganesha: each state holds a reference to the fd
-            let new_ref = open_file.add_ref();
-            tracing::info!(
-                "🔄 [OPEN2 REUSE] fileid={} - OpenFile exists, added ref for new state, ref_count={}",
-                fileid,
-                new_ref
-            );
+            open_file.add_ref();
 
             // Upgrade access if needed
             open_file
@@ -812,12 +722,7 @@ impl Nfs4FileSystem {
 
         if let Some(open_file) = double_check_result {
             // Race condition: another thread created the OpenFile
-            let new_ref = open_file.add_ref();
-            tracing::info!(
-                "🔄 [OPEN2 RACE] fileid={} - OpenFile created by another thread, added ref, ref_count={}",
-                fileid,
-                new_ref
-            );
+            open_file.add_ref();
             open_file
                 .upgrade_access(access, &self.ufs, pool_size)
                 .await?;
@@ -828,20 +733,8 @@ impl Nfs4FileSystem {
         // ref_count starts at 1 (for this new state)
         let path = self.get_path(fileid)?;
 
-        tracing::info!(
-            "🆕 [OPEN2] fileid={} access={:#x} path={} - Creating NEW OpenFile",
-            fileid,
-            access,
-            path.path()
-        );
-
         // Create ReaderPool if read access requested
         let reader_pool = if access & 0x01 != 0 {
-            tracing::info!(
-                "Creating ReaderPool for fileid={} pool_size={}",
-                fileid,
-                pool_size
-            );
             let p = path.clone();
             let ufs = self.ufs.clone();
             match ReaderPool::new(pool_size, || {
@@ -851,20 +744,9 @@ impl Nfs4FileSystem {
             })
             .await
             {
-                Ok(pool) => {
-                    tracing::info!(
-                        "✅ ReaderPool created: fileid={} pool_size={}",
-                        fileid,
-                        pool.size()
-                    );
-                    Some(Arc::new(pool))
-                }
+                Ok(pool) => Some(Arc::new(pool)),
                 Err(e) => {
-                    tracing::error!(
-                        "❌ Failed to create ReaderPool for fileid={}: {:?}",
-                        fileid,
-                        e
-                    );
+                    tracing::error!("Failed to create ReaderPool for fileid={}: {:?}", fileid, e);
                     return Err(Nfs4Error::from(e));
                 }
             }
@@ -874,16 +756,12 @@ impl Nfs4FileSystem {
 
         // Create Writer if write access requested
         let writer = if access & 0x02 != 0 {
-            tracing::info!("Creating Writer for fileid={}", fileid);
             let flags = OpenFlags::new_write_only().set_create(false);
             let opts = self.ufs.cv().create_opts_builder().build();
             match self.ufs.open_with_opts(&path, opts, flags).await {
-                Ok(w) => {
-                    tracing::info!("✅ Writer created for fileid={}", fileid);
-                    Some(w)
-                }
+                Ok(w) => Some(w),
                 Err(e) => {
-                    tracing::error!("❌ Failed to create Writer for fileid={}: {:?}", fileid, e);
+                    tracing::error!("Failed to create Writer for fileid={}: {:?}", fileid, e);
                     return Err(Nfs4Error::from(e));
                 }
             }
@@ -898,13 +776,6 @@ impl Nfs4FileSystem {
             .write()
             .unwrap()
             .insert(fileid, open_file.clone());
-
-        tracing::info!(
-            "✅ [OPEN2 SUCCESS] fileid={} ref_count={} access={:#x}",
-            fileid,
-            open_file.ref_count.load(Ordering::Acquire),
-            access
-        );
 
         Ok(open_file)
     }
@@ -954,32 +825,21 @@ impl Nfs4FileSystem {
         if let Some(open_file) = open_file {
             // Only increment ref_count if add_ref is true
             // For post-CREATE OPEN, we don't increment because CREATE already did
-            let new_ref = if add_ref {
-                open_file.add_ref()
-            } else {
-                open_file
-                    .ref_count
-                    .load(std::sync::atomic::Ordering::Acquire)
-            };
+            if add_ref {
+                open_file.add_ref();
+            }
 
             // Upgrade access mode if needed (NFS-Ganesha: fsal_reopen2)
             open_file
                 .upgrade_access(access, &self.ufs, pool_size)
                 .await?;
 
-            tracing::info!(
-                "✅ [REOPEN2] fileid={} access upgraded to {:#x}, ref_count={}, add_ref={}",
-                fileid,
-                access,
-                new_ref,
-                add_ref
-            );
             Ok(())
         } else {
             // OpenFile doesn't exist - this shouldn't happen for state reuse
             // But we handle it gracefully by creating a new one
             tracing::warn!(
-                "⚠️  [REOPEN2] fileid={} - OpenFile not found, creating new one",
+                "REOPEN2: OpenFile not found for fileid={}, creating new one",
                 fileid
             );
             self.open_file(fileid, access).await?;
@@ -1005,36 +865,22 @@ impl Nfs4FileSystem {
         };
 
         let open_file = open_file.ok_or_else(|| {
-            tracing::warn!("⚠️  [CLOSE] fileid={} - OpenFile not found", fileid);
+            tracing::warn!("CLOSE: OpenFile not found for fileid={}", fileid);
             Nfs4Error::with_message(Nfs4Status::BadStateid, "OpenFile not found")
         })?;
 
         let is_last = open_file.release_ref();
 
         if is_last {
-            tracing::info!(
-                "🔴 [CLOSE LAST] fileid={} - Last reference, calling complete() and removing from HashMap",
-                fileid
-            );
-
             // Call complete() to commit data
             open_file.complete().await?;
 
             // Invalidate status cache after complete()
             // This ensures subsequent GETATTR returns the updated file size/mtime
             self.invalidate_status_cache(fileid);
-            tracing::info!("🔄 [CLOSE] fileid={} - Invalidated status cache", fileid);
 
             // Remove from HashMap
             self.open_files.write().unwrap().remove(&fileid);
-
-            tracing::info!("✅ [CLOSE SUCCESS] fileid={} - OpenFile removed", fileid);
-        } else {
-            tracing::info!(
-                "🔵 [CLOSE] fileid={} - Not last reference, ref_count={}",
-                fileid,
-                open_file.ref_count.load(Ordering::Acquire)
-            );
         }
 
         Ok(())
@@ -1088,14 +934,12 @@ impl Nfs4FileSystem {
 
         // Try PathCache first (path -> fileid)
         if let Some(fileid) = self.path_cache.get_fileid(&child_path_str) {
-            tracing::debug!("lookup: PathCache hit for path={}", child_path_str);
             // Try StatusCache (fileid -> FileStatus)
             let status = self.get_status(fileid).await?;
             return Ok((fileid, status));
         }
 
         // Cache miss - query from Master
-        tracing::debug!("lookup: PathCache miss for path={}", child_path_str);
         let status = self
             .ufs
             .get_status(&child_path)
@@ -1172,23 +1016,16 @@ impl Nfs4FileSystem {
         name: &str,
     ) -> Nfs4Result<(Fileid4, FileStatus)> {
         if self.config.read_only {
-            tracing::warn!("Attempted to create file in read-only mode");
+            tracing::warn!("CREATE: Attempted to create file in read-only mode");
             return Err(Nfs4Status::Rofs.into());
         }
 
         let parent_path = self.get_path(parent_id)?;
         let child_path = self.build_child_path(&parent_path, name)?;
 
-        tracing::info!(
-            "Creating file: parent_id={}, name={}, path={}",
-            parent_id,
-            name,
-            child_path.path()
-        );
-
         // Check if file already exists
         if self.ufs.get_status(&child_path).await.is_ok() {
-            tracing::warn!("File already exists: {}", child_path.path());
+            tracing::warn!("CREATE: File already exists: {}", child_path.path());
             return Err(Nfs4Status::Exist.into());
         }
 
@@ -1221,13 +1058,6 @@ impl Nfs4FileSystem {
 
         // Invalidate parent directory's status cache so NFS client sees updated change_info
         self.invalidate_status_cache(parent_id);
-
-        tracing::info!(
-            "Successfully created file: id={}, path={}, size={}",
-            fileid,
-            child_path.path(),
-            status.len
-        );
 
         Ok((fileid, status))
     }
@@ -1281,14 +1111,10 @@ impl Nfs4FileSystem {
 
         let parent_path = self.get_path(parent_id)?;
         let child_path = self.build_child_path(&parent_path, name)?;
-        let child_path_str = child_path.to_string();
-
-        tracing::info!("REMOVE: path={}", child_path_str);
 
         // Step 1: Get file ID for cache cleanup
         let fileid = if let Ok(status) = self.ufs.get_status(&child_path).await {
             let fileid = status.id as u64;
-            tracing::info!("REMOVE: fileid={} path={}", fileid, child_path_str);
 
             // Step 2: Clean up path_cache
             self.path_cache.remove(fileid);
@@ -1298,7 +1124,6 @@ impl Nfs4FileSystem {
 
             Some(fileid)
         } else {
-            tracing::warn!("REMOVE: File not found: {}", child_path_str);
             None
         };
 
@@ -1310,11 +1135,7 @@ impl Nfs4FileSystem {
                 let open_files = self.open_files.read().unwrap();
                 open_files.get(&fileid).cloned()
             };
-            if let Some(_open_file) = open_file {
-                tracing::warn!(
-                    "REMOVE: File {} is still open, removing from open_files HashMap",
-                    fileid
-                );
+            if open_file.is_some() {
                 // Remove from HashMap - the OpenFile will be dropped when all references are gone
                 self.open_files.write().unwrap().remove(&fileid);
             }
@@ -1328,8 +1149,6 @@ impl Nfs4FileSystem {
 
         // Step 6: Invalidate parent directory's status cache so NFS client sees updated change_info
         self.invalidate_status_cache(parent_id);
-
-        tracing::info!("REMOVE: Completed path={}", child_path_str);
 
         Ok(())
     }
@@ -1368,8 +1187,6 @@ impl Nfs4FileSystem {
         let to_path = self.build_child_path(&to_parent_path, to_name)?;
         let to_path_str = to_path.to_string();
 
-        tracing::info!("RENAME: {} -> {}", from_path_str, to_path_str);
-
         // Step 1: Get old file status (before rename)
         let old_status = self
             .ufs
@@ -1378,16 +1195,9 @@ impl Nfs4FileSystem {
             .map_err(Nfs4Error::from)?;
         let old_fileid = old_status.id as u64;
 
-        tracing::info!(
-            "RENAME: old_fileid={} from_path={}",
-            old_fileid,
-            from_path_str
-        );
-
         // Step 2: Check if target exists (will be overwritten)
         let target_exists = self.ufs.get_status(&to_path).await.is_ok();
         if target_exists {
-            tracing::info!("RENAME: Target {} exists, will be overwritten", to_path_str);
             // Invalidate target's cache entries
             self.path_cache.remove_by_path(&to_path_str);
         }
@@ -1406,13 +1216,6 @@ impl Nfs4FileSystem {
             .await
             .map_err(Nfs4Error::from)?;
         let new_fileid = new_status.id as u64;
-
-        tracing::info!(
-            "RENAME: new_fileid={} to_path={} (fileid_changed={})",
-            new_fileid,
-            to_path_str,
-            old_fileid != new_fileid
-        );
 
         // Step 5: Update path_cache atomically
         self.path_cache
@@ -1434,22 +1237,9 @@ impl Nfs4FileSystem {
         if old_fileid != new_fileid {
             let mut open_files = self.open_files.write().unwrap();
             if let Some(open_file) = open_files.remove(&old_fileid) {
-                tracing::info!(
-                    "RENAME: Moving OpenFile from fileid={} to fileid={}",
-                    old_fileid,
-                    new_fileid
-                );
                 open_files.insert(new_fileid, open_file);
             }
         }
-
-        tracing::info!(
-            "RENAME: Completed {} -> {} (old_fileid={} new_fileid={})",
-            from_path_str,
-            to_path_str,
-            old_fileid,
-            new_fileid
-        );
 
         Ok(())
     }
@@ -1637,12 +1427,6 @@ impl Nfs4FileSystem {
             let alloc_opts =
                 curvine_common::state::FileAllocOpts::with_alloc(write_end, Default::default());
             writer.resize(alloc_opts).await.map_err(Nfs4Error::from)?;
-            tracing::debug!(
-                "Stateless WRITE: auto-extended file from {} to {} for fileid={}",
-                current_len,
-                write_end,
-                fileid
-            );
         }
 
         // Write and complete immediately
@@ -1655,13 +1439,6 @@ impl Nfs4FileSystem {
 
         // Invalidate status cache
         self.invalidate_status_cache(fileid);
-
-        tracing::debug!(
-            "Stateless WRITE: completed for fileid={} offset={} len={}",
-            fileid,
-            offset,
-            data_len
-        );
 
         Ok(data_len)
     }
@@ -1695,13 +1472,6 @@ impl Nfs4FileSystem {
         if let Some(new_size) = size {
             let status = self.get_status(fileid).await?;
             if new_size != status.len as u64 {
-                tracing::info!(
-                    "SETATTR: Resizing file {} from {} to {}",
-                    fileid,
-                    status.len,
-                    new_size
-                );
-
                 // Try to use existing OpenFile's NfsWriter first
                 let open_file = self.get_open_file(fileid);
                 if let Some(open_file) = open_file {
@@ -1714,14 +1484,9 @@ impl Nfs4FileSystem {
                     if let Some(writer) = writer {
                         let opts = FileAllocOpts::with_truncate(new_size as i64);
                         writer.resize(opts).await.map_err(|e| {
-                            tracing::error!("Failed to resize file {}: {:?}", fileid, e);
+                            tracing::error!("SETATTR: Failed to resize file {}: {:?}", fileid, e);
                             Nfs4Error::from(e)
                         })?;
-                        tracing::info!(
-                            "✅ Resized file {} to {} using existing NfsWriter",
-                            fileid,
-                            new_size
-                        );
                     } else {
                         // No Writer in OpenFile, create temporary one
                         self.resize_with_temp_writer(&path, fileid, new_size)
@@ -1769,12 +1534,6 @@ impl Nfs4FileSystem {
         fileid: Fileid4,
         new_size: u64,
     ) -> Nfs4Result<()> {
-        tracing::info!(
-            "Creating temporary Writer for resize: fileid={} new_size={}",
-            fileid,
-            new_size
-        );
-
         let flags = OpenFlags::new_write_only().set_create(false);
         let opts = self.ufs.cv().create_opts_builder().build();
         let mut writer = self
@@ -1785,17 +1544,11 @@ impl Nfs4FileSystem {
 
         let alloc_opts = curvine_common::state::FileAllocOpts::with_truncate(new_size as i64);
         writer.resize(alloc_opts).await.map_err(|e| {
-            tracing::error!("Failed to resize file {}: {:?}", fileid, e);
+            tracing::error!("SETATTR: Failed to resize file {}: {:?}", fileid, e);
             Nfs4Error::from(e)
         })?;
 
         writer.complete().await.map_err(Nfs4Error::from)?;
-
-        tracing::info!(
-            "✅ Resized file {} to {} using temporary Writer",
-            fileid,
-            new_size
-        );
 
         Ok(())
     }

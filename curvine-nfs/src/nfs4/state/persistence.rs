@@ -196,12 +196,6 @@ impl StatePersistenceManager {
         let locks_dir = format!("{state_dir}/locks");
         let recovery_meta = format!("{state_dir}/recovery.meta");
 
-        tracing::info!(
-            "State persistence initialized for instance '{}' at {}",
-            instance_id,
-            state_dir
-        );
-
         Self {
             fs,
             config,
@@ -610,7 +604,7 @@ impl StatePersistenceManager {
         }
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "State snapshot saved: {} clients, {} opens, {} locks (epoch: {}, took: {:?})",
             client_count, open_count, lock_count, epoch, elapsed
         );
@@ -728,6 +722,11 @@ impl StatePersistenceManager {
 
         writer.flush().await.map_err(|e| {
             error!("Failed to flush state file {}: {:?}", path, e);
+            Nfs4Status::Serverfault
+        })?;
+
+        writer.complete().await.map_err(|e| {
+            error!("Failed to complete state file {}: {:?}", path, e);
             Nfs4Status::Serverfault
         })?;
 

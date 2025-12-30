@@ -67,7 +67,6 @@ use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Read, Write};
-use tracing::debug;
 
 /// READDIR operation handler
 ///
@@ -86,105 +85,66 @@ pub async fn op_readdir(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Parse READDIR4args (NFS-Ganesha line 560)
     let cookie = input.read_u64::<BigEndian>()?;
     let mut cookieverf: [u8; 8] = [0; 8];
     input.read_exact(&mut cookieverf)?;
     let dircount = input.read_u32::<BigEndian>()?;
     let maxcount = input.read_u32::<BigEndian>()?;
 
-    // Read requested attributes bitmap (NFS-Ganesha line 570)
     let bitmap_len = input.read_u32::<BigEndian>()?;
     let mut attr_request = Vec::new();
     for _ in 0..bitmap_len {
         attr_request.push(input.read_u32::<BigEndian>()?);
     }
 
-    debug!(
-        "READDIR: cookie={} dircount={} maxcount={} attrs={:?}",
-        cookie, dircount, maxcount, attr_request
-    );
-
-    // Get directory filehandle (NFS-Ganesha: nfs4_sanity_check_FH at line 580)
     let fh = ctx.require_current_fh()?;
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
-    // Cookie validation (NFS-Ganesha line 590)
-    // Cookies 1 and 2 are reserved for "." and ".."
     if cookie == 1 || cookie == 2 {
         return Err(Nfs4Status::BadCookie.into());
     }
 
-    // Calculate max entries (NFS-Ganesha line 600)
-    // Use dircount as a hint, but also respect maxcount
     let max_entries = if dircount > 0 {
         (dircount / 64).max(16) as usize
     } else {
-        256 // Default max entries
+        256
     };
 
-    // Read directory entries (NFS-Ganesha: fsal_readdir at line 610)
     let (entries, eof) = handler.fs.readdir(fileid, cookie, max_entries).await?;
 
-    debug!(
-        "READDIR: fileid={} got {} entries, eof={}",
-        fileid,
-        entries.len(),
-        eof
-    );
-
-    // Build response (NFS-Ganesha line 620)
     let mut result = Vec::new();
 
-    // Cookie verifier (NFS-Ganesha line 630)
-    // For simplicity, use zeros (many servers do this)
     let response_verifier: [u8; 8] = [0; 8];
     result.write_all(&response_verifier)?;
 
-    // Encode entries (NFS-Ganesha: xdr_encode_entry4 at line 640)
-    let mut total_size = 8; // cookieverf size
+    let mut total_size = 8;
     let max_response_size = maxcount as usize;
 
     for (entry_cookie, name, status) in entries {
-        // Check if we have space for this entry (NFS-Ganesha line 650)
-        // Estimate: cookie(8) + name_len(4) + name + attrs + next_entry(4)
         let entry_size_estimate = 8 + 4 + name.len() + 100 + 4;
         if total_size + entry_size_estimate > max_response_size {
-            debug!(
-                "READDIR: stopping due to maxcount, encoded {} entries",
-                result.len()
-            );
             break;
         }
 
-        // Encode entry (NFS-Ganesha line 660)
-        // entry4: cookie + name + attrs + nextentry
-        if let Err(e) = encode_entry(
+        if encode_entry(
             &mut result,
             entry_cookie,
             &name,
             &status,
             &attr_request,
             handler,
-        ) {
-            debug!("READDIR: failed to encode entry {}: {:?}", name, e);
+        )
+        .is_err()
+        {
             break;
         }
 
         total_size = result.len();
     }
 
-    // Encode "no more entries" marker (NFS-Ganesha line 680)
-    false.serialize(&mut result)?; // nextentry = FALSE
+    false.serialize(&mut result)?;
 
-    // Encode EOF (NFS-Ganesha line 690)
     eof.serialize(&mut result)?;
-
-    debug!(
-        "READDIR: completed, result_len={} eof={}",
-        result.len(),
-        eof
-    );
 
     Ok(result)
 }
@@ -203,16 +163,12 @@ fn encode_entry(
     attr_request: &[u32],
     _handler: &CompoundHandler,
 ) -> Nfs4Result<()> {
-    // nextentry = TRUE (has entry)
     true.serialize(output)?;
 
-    // cookie
     cookie.serialize(output)?;
 
-    // name (component4)
     name.as_bytes().to_vec().serialize(output)?;
 
-    // attrs (fattr4)
     let attrs = crate::nfs4::types::FileAttrs::from_status(status);
     let fattr = crate::nfs4::handlers::encode_fattr4(&attrs, attr_request, None)?;
     fattr.serialize(output)?;

@@ -272,13 +272,6 @@ impl LockState {
                 new_end.saturating_sub(new_offset)
             };
             *new_entry.length.write().unwrap() = new_length;
-
-            tracing::debug!(
-                "Merged {} lock entries into range {}+{}",
-                to_remove.len(),
-                new_offset,
-                new_length
-            );
         }
 
         // Remove merged entries (reverse order)
@@ -319,11 +312,6 @@ impl LockState {
             // Check if fully covered
             if offset <= entry_offset && unlock_end >= entry_end {
                 // Fully covered - remove entire entry
-                tracing::debug!(
-                    "Removing lock entry {}+{} (fully covered by unlock)",
-                    entry_offset,
-                    entry.get_length()
-                );
                 continue;
             }
 
@@ -338,7 +326,6 @@ impl LockState {
                     left_length,
                 ));
                 new_entries.push(left_entry);
-                tracing::debug!("Created left fragment {}+{}", entry_offset, left_length);
             }
 
             // Right fragment: [unlock_end, entry_end)
@@ -356,7 +343,6 @@ impl LockState {
                     right_length,
                 ));
                 new_entries.push(right_entry);
-                tracing::debug!("Created right fragment {}+{}", right_offset, right_length);
             }
         }
 
@@ -548,13 +534,6 @@ impl LockManager {
             if !blocking {
                 // Non-blocking lock request with conflicts -> return DENIED
                 self.stats.total_denied.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    "Lock denied: {} conflicts found for file {} at {}+{}",
-                    conflicts.len(),
-                    fileid,
-                    offset,
-                    length
-                );
                 return Err(Nfs4Error::with_message(
                     Nfs4Status::Denied,
                     format!("Lock conflict with {} existing locks", conflicts.len()),
@@ -591,14 +570,6 @@ impl LockManager {
             // Add lock entry to existing state (with merging)
             state.add_lock_entry(new_entry);
 
-            tracing::debug!(
-                "Added lock entry to existing state {:?} for file {} at {}+{}",
-                &existing.other[..4],
-                fileid,
-                offset,
-                length
-            );
-
             // Return updated stateid (incremented seqid)
             Ok(state.update_stateid())
         } else {
@@ -627,14 +598,6 @@ impl LockManager {
                 .write()
                 .unwrap()
                 .insert(lock_owner.clone(), stateid_key);
-
-            tracing::debug!(
-                "Created new lock state {:?} for file {} at {}+{}",
-                &stateid_key[..4],
-                fileid,
-                offset,
-                length
-            );
 
             Ok(stateid)
         };
@@ -708,24 +671,12 @@ impl LockManager {
                 .unwrap()
                 .remove(&removed_state.owner);
 
-            tracing::debug!(
-                "Lock state {:?} fully released (no more entries)",
-                &stateid.other[..4]
-            );
-
             self.stats.total_released.fetch_add(1, Ordering::Relaxed);
 
             // Return updated stateid (even though state is deleted)
             Ok(state.update_stateid())
         } else {
             // State still has lock entries - return updated stateid
-            tracing::debug!(
-                "Lock state {:?} partially released at {}+{}",
-                &stateid.other[..4],
-                offset,
-                length
-            );
-
             self.stats.total_released.fetch_add(1, Ordering::Relaxed);
 
             // Return updated stateid (incremented seqid, same state)

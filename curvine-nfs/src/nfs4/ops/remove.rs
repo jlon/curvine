@@ -61,7 +61,6 @@ use crate::nfs4::compound::CompoundHandler;
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use crate::protocol::xdr::*;
 use std::io::Read;
-use tracing::debug;
 
 /// REMOVE operation handler
 ///
@@ -80,55 +79,30 @@ pub async fn op_remove(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read filename (NFS-Ganesha line 60)
     let mut name: Vec<u8> = Vec::new();
     name.deserialize(input)?;
     let name_str = String::from_utf8_lossy(&name).to_string();
 
-    debug!("REMOVE: name={}", name_str);
-
-    // Validate filename (NFS-Ganesha: nfs4_utf8string_scan at line 70)
     validate_filename(&name_str)?;
 
-    // Get parent directory filehandle (NFS-Ganesha: nfs4_sanity_check_FH at line 80)
     let parent_fh = ctx.require_current_fh()?;
     let parent_id = handler.fs.fh_to_fileid(parent_fh)?;
 
-    // Get parent change attribute before removal (NFS-Ganesha line 90)
     let parent_status_before = handler.fs.get_status_cached(parent_id).await?;
     let change_before = parent_status_before.mtime as u64;
 
-    debug!(
-        "REMOVE: parent={} name={} change_before={}",
-        parent_id, name_str, change_before
-    );
-
-    // Remove file/directory (NFS-Ganesha: fsal_remove at line 100)
     handler.fs.remove(parent_id, &name_str).await?;
 
-    // Get parent change attribute after removal (NFS-Ganesha line 110)
     let parent_status_after = handler.fs.get_status_cached(parent_id).await?;
     let change_after = parent_status_after.mtime as u64;
 
-    debug!(
-        "REMOVE: completed, change_after={} (delta={})",
-        change_after,
-        change_after.wrapping_sub(change_before)
-    );
-
-    // Build response - change_info4 (NFS-Ganesha line 120)
     let mut result = Vec::new();
 
-    // atomic (bool) - TRUE if we got both before and after atomically
-    // In our case, we got them separately, so FALSE
-    // NFS-Ganesha checks if FSAL returned valid pre/post attrs
-    let atomic = true; // Simplified: assume atomic for now
+    let atomic = true;
     atomic.serialize(&mut result)?;
 
-    // before (changeid4)
     change_before.serialize(&mut result)?;
 
-    // after (changeid4)
     change_after.serialize(&mut result)?;
 
     Ok(result)
@@ -145,22 +119,18 @@ pub async fn op_remove(
 /// - Path separators (/)
 /// - Special names ("." and "..")
 fn validate_filename(name: &str) -> Nfs4Result<()> {
-    // Empty name is invalid
     if name.is_empty() {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Check for null bytes
     if name.contains('\0') {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Check for path separator (/)
     if name.contains('/') {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Cannot remove "." or ".."
     if name == "." || name == ".." {
         return Err(Nfs4Status::Inval.into());
     }

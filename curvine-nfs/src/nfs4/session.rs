@@ -221,12 +221,6 @@ impl SessionManager {
             .or_default()
             .push(sessionid);
 
-        tracing::info!(
-            "Created session {:?} for client {}",
-            &sessionid[..4],
-            clientid
-        );
-
         Ok(session)
     }
 
@@ -254,7 +248,6 @@ impl SessionManager {
             sessions.retain(|s| s != sessionid);
         }
 
-        tracing::info!("Destroyed session {:?}", &sessionid[..4]);
         Ok(())
     }
 

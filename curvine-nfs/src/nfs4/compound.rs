@@ -296,8 +296,6 @@ impl CompoundHandler {
         let scheduler = ScheduledExecutor::new("grace-period-reaper", 5000);
         if let Err(e) = scheduler.start(reaper) {
             tracing::error!("Failed to start grace period reaper: {}", e);
-        } else {
-            tracing::info!("Grace period reaper started (check interval: 5s)");
         }
 
         // Start delegation recall timeout reaper only if delegations are enabled
@@ -307,11 +305,7 @@ impl CompoundHandler {
             let deleg_scheduler = ScheduledExecutor::new("delegation-reaper", 5000);
             if let Err(e) = deleg_scheduler.start(deleg_reaper) {
                 tracing::error!("Failed to start delegation reaper: {}", e);
-            } else {
-                tracing::info!("Delegation reaper started (check interval: 5s)");
             }
-        } else {
-            tracing::debug!("Delegation reaper not started (delegations disabled)");
         }
 
         Self {

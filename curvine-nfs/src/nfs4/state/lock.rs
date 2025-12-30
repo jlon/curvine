@@ -514,6 +514,7 @@ impl LockManager {
     /// - For new_lock_owner: create new LockState with first LockEntry
     /// - For existing_lock_owner: find LockState, add/merge LockEntry
     /// - Returns the stateid (new or existing with updated seqid)
+    #[allow(clippy::too_many_arguments)]
     pub fn lock(
         &self,
         clientid: Clientid4,

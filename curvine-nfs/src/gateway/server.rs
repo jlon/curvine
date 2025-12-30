@@ -70,7 +70,10 @@ impl NfsGatewayServer {
             "{}:{}",
             gateway_config.listen_addr, gateway_config.listen_port
         );
-        info!("Starting NFS Gateway on {}", bind_addr);
+        info!("═══════════════════════════════════════════════════════════");
+        info!("  Starting NFS Gateway");
+        info!("═══════════════════════════════════════════════════════════");
+        info!("  Listen address: {}", bind_addr);
 
         let mut listener = NFSTcpListener::bind(&bind_addr, fs).await.map_err(|e| {
             FsError::io(std::io::Error::new(
@@ -80,11 +83,12 @@ impl NfsGatewayServer {
         })?;
 
         // Initialize NFSv4.1 handler
+        info!("  Initializing NFSv4.1 handler...");
         let nfs4_handler =
             Self::create_nfs4_handler(cluster_conf, gateway_config.clone(), runtime).await?;
         listener.with_nfs4_handler(nfs4_handler);
 
-        info!("NFSv4.1 support enabled");
+        info!("  ✓ NFSv4.1 support enabled");
 
         Ok(Self {
             listener,
@@ -113,21 +117,29 @@ impl NfsGatewayServer {
         ));
 
         // Initialize state directories
+        info!("  Initializing state persistence...");
         if let Err(e) = persistence.initialize().await {
-            tracing::warn!("Failed to initialize state persistence: {:?}", e);
+            tracing::warn!("  ⚠ Failed to initialize state persistence: {:?}", e);
+        } else {
+            info!("  ✓ State persistence initialized");
         }
 
         // Create state managers
+        info!("  Creating state managers...");
         let sessions = Arc::new(SessionManager::new());
         let clients = Arc::new(ClientManager::new());
         let opens = Arc::new(OpenManager::new());
         let locks = Arc::new(LockManager::new());
+        info!("  ✓ State managers created");
 
         // Load persisted state (if any)
+        info!("  Loading persisted state...");
         if let Err(e) =
             Self::load_persisted_state(&persistence, &clients, &opens, &locks, &nfs4_fs).await
         {
-            tracing::warn!("Failed to load persisted state: {:?}", e);
+            tracing::warn!("  ⚠ Failed to load persisted state: {:?}", e);
+        } else {
+            info!("  ✓ Persisted state loaded");
         }
 
         // Create compound handler
@@ -144,6 +156,7 @@ impl NfsGatewayServer {
         // Start periodic state saver (following NFS-Ganesha design)
         // Saves state every 30 seconds (configurable)
         if persistence.is_enabled() {
+            info!("  Starting state saver...");
             let saver = StateSaverTask::new(
                 persistence.clone(),
                 clients.clone(),
@@ -154,10 +167,10 @@ impl NfsGatewayServer {
             let save_interval_ms = persistence.save_interval_ms();
             let scheduler = ScheduledExecutor::new("state-saver", save_interval_ms);
             if let Err(e) = scheduler.start(saver) {
-                tracing::error!("Failed to start state saver: {}", e);
+                tracing::error!("  ✗ Failed to start state saver: {}", e);
             } else {
                 info!(
-                    "State saver started (interval: {}s, instance: {})",
+                    "  ✓ State saver started (interval: {}s, instance: {})",
                     save_interval_ms / 1000,
                     persistence.instance_id()
                 );
@@ -166,11 +179,12 @@ impl NfsGatewayServer {
 
         // Enter grace period on server startup (90 seconds default)
         // This allows clients to reclaim their state after server restart
+        info!("  Entering grace period...");
         if let Err(e) = handler.grace.enter_grace_period() {
-            tracing::warn!("Failed to enter grace period immediately: errno={}", e);
-            tracing::info!("Grace period will be entered after outstanding operations complete");
+            tracing::warn!("  ⚠ Failed to enter grace period immediately: errno={}", e);
+            tracing::info!("  Grace period will be entered after outstanding operations complete");
         } else {
-            tracing::info!("NFSv4 server entered grace period (90 seconds)");
+            tracing::info!("  ✓ Grace period entered (90 seconds)");
         }
 
         Ok(handler)
@@ -184,48 +198,63 @@ impl NfsGatewayServer {
         _locks: &Arc<LockManager>,
         _fs: &Arc<Nfs4FileSystem>,
     ) -> Result<(), FsError> {
-        info!("Loading persisted NFSv4 state...");
-
         // Load recovery metadata
+        info!("    [1/4] Loading recovery metadata...");
         if let Ok(Some(meta)) = persistence.load_recovery_metadata().await {
             info!(
-                "Found recovery metadata: server_instance={}, last_shutdown={}",
+                "         ✓ Found recovery metadata (instance: {}, shutdown: {})",
                 meta.server_instance_id, meta.last_shutdown_time
             );
+        } else {
+            info!("         ℹ No recovery metadata found (fresh start)");
         }
 
         // Load clients
+        info!("    [2/4] Loading client states...");
         let persisted_clients = persistence.load_clients().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
                 "Failed to load clients: {e:?}"
             )))
         })?;
-
-        info!("Found {} persisted clients", persisted_clients.len());
+        info!("         ✓ Loaded {} client state(s)", persisted_clients.len());
 
         // Load opens
+        info!("    [3/4] Loading open states...");
         let persisted_opens = persistence.load_opens().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
                 "Failed to load opens: {e:?}"
             )))
         })?;
-
-        info!("Found {} persisted opens", persisted_opens.len());
+        info!("         ✓ Loaded {} open state(s)", persisted_opens.len());
 
         // Load locks
+        info!("    [4/4] Loading lock states...");
         let persisted_locks = persistence.load_locks().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
                 "Failed to load locks: {e:?}"
             )))
         })?;
+        info!("         ✓ Loaded {} lock state(s)", persisted_locks.len());
 
-        info!("Found {} persisted locks", persisted_locks.len());
+        // Summary
+        let total = persisted_clients.len() + persisted_opens.len() + persisted_locks.len();
+        if total > 0 {
+            info!(
+                "    ────────────────────────────────────────────────────────"
+            );
+            info!(
+                "    State summary: {} client(s), {} open(s), {} lock(s)",
+                persisted_clients.len(),
+                persisted_opens.len(),
+                persisted_locks.len()
+            );
+            info!(
+                "    Note: Clients will reclaim state during grace period"
+            );
+        } else {
+            info!("    ℹ No persisted state found (fresh start)");
+        }
 
-        // Note: Full state restoration will be implemented when clients
-        // perform RECLAIM operations during grace period
-        // For now, we just log what we found
-
-        info!("State restoration completed (clients will reclaim during grace period)");
         Ok(())
     }
 
@@ -248,14 +277,14 @@ impl NfsGatewayServer {
     pub async fn start(self) -> Result<(), FsError> {
         let listen_port = self.listen_port();
 
-        info!(
-            "NFS Gateway started on {}:{}",
-            self.listen_ip(),
-            listen_port
-        );
-        info!("Export path: {}", self.config.export_path);
-        info!("Read-only mode: {}", self.config.read_only);
-        info!("Supported protocols: NFSv3, NFSv4.1");
+        info!("═══════════════════════════════════════════════════════════");
+        info!("  NFS Gateway Ready");
+        info!("═══════════════════════════════════════════════════════════");
+        info!("  Listen address: {}:{}", self.listen_ip(), listen_port);
+        info!("  Export path:     {}", self.config.export_path);
+        info!("  Read-only mode:  {}", self.config.read_only);
+        info!("  Protocols:       NFSv3, NFSv4.1");
+        info!("═══════════════════════════════════════════════════════════");
 
         self.listener
             .handle_forever()

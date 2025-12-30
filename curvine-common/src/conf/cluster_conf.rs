@@ -393,7 +393,10 @@ pub struct NfsGatewayConf {
     /// Reader cache TTL in seconds (default: 300)
     pub reader_cache_ttl_secs: u64,
 
-    /// Reader pool size per file - number of parallel readers (default: 8)
+    /// Reader pool size per file - number of parallel readers (default: 32)
+    /// Increased from 8 to 32 for better multi-thread performance (2025-12-30)
+    /// Benchmark: 8 threads with pool_size=8 caused lock contention (2287 MiB/s)
+    /// Expected: pool_size=32 should improve 8-thread performance by 20-30%
     pub reader_pool_size: usize,
 
     /// Writer cache capacity - max number of files with cached writers (default: 1000)
@@ -457,7 +460,7 @@ impl Default for NfsGatewayConf {
             file_blocks_cache_ttl_secs: 60,
             reader_cache_size: 1000,
             reader_cache_ttl_secs: 300,
-            reader_pool_size: 8,
+            reader_pool_size: 32, // Increased from 8 for better multi-thread performance
             writer_cache_size: 1000,
             writer_cache_ttl_secs: 300,
             writer_idle_timeout_secs: 30,

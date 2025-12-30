@@ -150,13 +150,19 @@ pub struct FilesystemRecoveryBackend {
     _marker: std::marker::PhantomData<()>,
 }
 
+impl Default for FilesystemRecoveryBackend {
+    fn default() -> Self {
+        Self {
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
 impl FilesystemRecoveryBackend {
     /// Create new filesystem recovery backend
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self {
-            _marker: std::marker::PhantomData,
-        }
+        Self::default()
     }
 }
 

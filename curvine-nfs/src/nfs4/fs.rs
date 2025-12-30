@@ -1452,6 +1452,7 @@ impl Nfs4FileSystem {
     /// When size is set, we use Writer::resize() to truncate/extend the file.
     /// This requires an open Writer, so we get it from OpenFile if available,
     /// or create a temporary one.
+    #[allow(clippy::too_many_arguments)]
     pub async fn setattr(
         &self,
         fileid: Fileid4,

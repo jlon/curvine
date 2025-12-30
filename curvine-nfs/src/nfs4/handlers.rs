@@ -250,13 +250,169 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             input.read_exact(&mut verifier)?;
             info!("Skipped SETCLIENTID_CONFIRM args: clientid + verifier");
         }
+        Nfs4Op::Close => {
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            info!("Skipped CLOSE args: seqid + stateid");
+        }
+        Nfs4Op::Write => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _offset = input.read_u64::<BigEndian>()?;
+            let _stable = input.read_u32::<BigEndian>()?;
+            let mut data: Vec<u8> = Vec::new();
+            data.deserialize(input)?;
+            info!("Skipped WRITE args: stateid + offset + stable + data ({} bytes)", data.len());
+        }
+        Nfs4Op::Commit => {
+            let _offset = input.read_u64::<BigEndian>()?;
+            let _count = input.read_u32::<BigEndian>()?;
+            info!("Skipped COMMIT args: offset + count");
+        }
+        Nfs4Op::Access => {
+            let _access = input.read_u32::<BigEndian>()?;
+            info!("Skipped ACCESS args: access");
+        }
+        Nfs4Op::OpenDowngrade => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let _access = input.read_u32::<BigEndian>()?;
+            let _deny = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPEN_DOWNGRADE args: stateid + seqid + access + deny");
+        }
+        Nfs4Op::Setattr => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped SETATTR args: stateid + fattr4");
+        }
+        Nfs4Op::Readdir => {
+            let _cookie = input.read_u64::<BigEndian>()?;
+            let mut cookieverf = [0u8; 8];
+            input.read_exact(&mut cookieverf)?;
+            let _dircount = input.read_u32::<BigEndian>()?;
+            let _maxcount = input.read_u32::<BigEndian>()?;
+            let mut bitmap: Vec<u32> = Vec::new();
+            bitmap.deserialize(input)?;
+            info!("Skipped READDIR args: cookie + cookieverf + dircount + maxcount + bitmap");
+        }
+        Nfs4Op::Create => {
+            let obj_type = input.read_u32::<BigEndian>()?;
+            match obj_type {
+                5 => {
+                    let mut link: Vec<u8> = Vec::new();
+                    link.deserialize(input)?;
+                }
+                3 | 4 => {
+                    let _spec1 = input.read_u32::<BigEndian>()?;
+                    let _spec2 = input.read_u32::<BigEndian>()?;
+                }
+                _ => {}
+            }
+            let mut name: Vec<u8> = Vec::new();
+            name.deserialize(input)?;
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped CREATE args: objtype + [link/spec] + name + fattr4");
+        }
+        Nfs4Op::Remove => {
+            let mut name: Vec<u8> = Vec::new();
+            name.deserialize(input)?;
+            info!("Skipped REMOVE args: name");
+        }
+        Nfs4Op::Rename => {
+            let mut oldname: Vec<u8> = Vec::new();
+            oldname.deserialize(input)?;
+            let mut newname: Vec<u8> = Vec::new();
+            newname.deserialize(input)?;
+            info!("Skipped RENAME args: oldname + newname");
+        }
+        Nfs4Op::Link => {
+            let mut newname: Vec<u8> = Vec::new();
+            newname.deserialize(input)?;
+            info!("Skipped LINK args: newname");
+        }
+        Nfs4Op::Readlink => {
+            info!("Skipped READLINK args: no arguments");
+        }
+        Nfs4Op::Open => {
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let _share_access = input.read_u32::<BigEndian>()?;
+            let _share_deny = input.read_u32::<BigEndian>()?;
+            let mut owner: Vec<u8> = Vec::new();
+            owner.deserialize(input)?;
+            let opentype = input.read_u32::<BigEndian>()?;
+            if opentype == 1 {
+                let createmode = input.read_u32::<BigEndian>()?;
+                match createmode {
+                    0 => {
+                        let mut verifier = [0u8; 8];
+                        input.read_exact(&mut verifier)?;
+                    }
+                    1 => {
+                        let mut name: Vec<u8> = Vec::new();
+                        name.deserialize(input)?;
+                    }
+                    _ => {}
+                }
+                let mut createattrs: Vec<u32> = Vec::new();
+                createattrs.deserialize(input)?;
+                let mut fattr = Fattr4::default();
+                fattr.deserialize(input)?;
+            }
+            info!("Skipped OPEN args: seqid + share_access + share_deny + owner + [create]");
+        }
+        Nfs4Op::OpenConfirm => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _seqid = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPEN_CONFIRM args: stateid + seqid");
+        }
+        Nfs4Op::Renew => {
+            let _clientid = input.read_u64::<BigEndian>()?;
+            info!("Skipped RENEW args: clientid");
+        }
+        Nfs4Op::ReclaimComplete => {
+            let _one_fs = input.read_u32::<BigEndian>()?;
+            info!("Skipped RECLAIM_COMPLETE args: one_fs");
+        }
+        Nfs4Op::Delegreturn => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            info!("Skipped DELEGRETURN args: stateid");
+        }
+        Nfs4Op::Nverify | Nfs4Op::Verify => {
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped {:?} args: fattr4", op);
+        }
+        Nfs4Op::Lock | Nfs4Op::Lockt | Nfs4Op::Locku => {
+            warn!("Skipping {:?} args: complex structure, may cause issues", op);
+        }
+        Nfs4Op::ReleaseLockowner => {
+            let _clientid = input.read_u64::<BigEndian>()?;
+            let mut owner: Vec<u8> = Vec::new();
+            owner.deserialize(input)?;
+            info!("Skipped RELEASE_LOCKOWNER args: clientid + owner");
+        }
+        Nfs4Op::ExchangeId | Nfs4Op::CreateSession | Nfs4Op::DestroySession => {
+            warn!("Skipping {:?} args: complex structure, may cause issues", op);
+        }
+        Nfs4Op::Lookupp => {
+            info!("Skipped LOOKUPP args: no arguments");
+        }
+        Nfs4Op::Openattr => {
+            let _attr_type = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPENATTR args: attr_type");
+        }
         _ => {
             warn!(
                 "Cannot skip arguments for operation {:?} - not implemented",
                 op
             );
-            // For safety, try to read a small amount and hope for the best
-            // This is a limitation that should be addressed for production
         }
     }
     Ok(())

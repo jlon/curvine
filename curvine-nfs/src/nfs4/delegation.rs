@@ -213,7 +213,7 @@ impl DelegationManager {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        tracing::info!(
+        tracing::debug!(
             "Delegation manager initialized: enabled={}, recall_timeout={}s, max_delegations={}",
             config.enabled,
             config.recall_timeout_secs,

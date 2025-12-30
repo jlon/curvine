@@ -44,6 +44,7 @@ pub async fn op_open(
 
     let opentype = input.read_u32::<BigEndian>()?;
 
+    #[allow(clippy::type_complexity)]
     let mut create_attrs: Option<(
         Option<u32>,
         Option<u32>,

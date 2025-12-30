@@ -53,6 +53,7 @@ pub struct CurvineNfsFileSystem {
     /// I/O cache for read/write optimization
     io_cache: Arc<IoCache>,
     /// Runtime for spawning background tasks
+    #[allow(dead_code)]
     runtime: Arc<Runtime>,
 }
 

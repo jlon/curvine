@@ -268,6 +268,7 @@ impl SessionManager {
 
     /// Process SEQUENCE operation
     /// Returns (highest_slot, target_highest_slot, status_flags)
+    #[allow(clippy::type_complexity)]
     pub fn sequence(
         &self,
         sessionid: &Sessionid4,

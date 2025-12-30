@@ -201,6 +201,7 @@ pub struct OpenManager {
     /// (File ID, Owner Val) -> Stateid (for state reuse - NFS-Ganesha aligned)
     /// This allows finding existing state for same file+owner combination
     /// NFS-Ganesha: nfs4_State_Get_Obj(file_obj, owner)
+    #[allow(clippy::type_complexity)]
     file_owner_state: RwLock<HashMap<(Fileid4, Vec<u8>), [u8; 12]>>,
     /// Next stateid counter
     next_stateid: AtomicU32,

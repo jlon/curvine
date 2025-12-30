@@ -125,6 +125,7 @@ pub async fn op_setattr(
 /// Returns tuple of (mode, uid, gid, size, atime, mtime).
 ///
 /// This function is also used by CREATE and OPEN operations for parsing createattrs.
+#[allow(clippy::type_complexity)]
 pub(crate) fn parse_setattr_attrs(
     fattr: &Fattr4,
 ) -> Nfs4Result<(

@@ -141,7 +141,7 @@ fn serve_gateway(args: NfsGatewayArgs, conf: ClusterConf) -> CommonResult<()> {
     }
 
     tracing::info!(
-        "NFS Gateway configuration - Listen: {}:{}, Export: {}, ReadOnly: {}",
+        "NFS Gateway Configuration: Listen={}:{}, Export={}, ReadOnly={}",
         nfs_config.listen_addr,
         nfs_config.listen_port,
         nfs_config.export_path,
@@ -169,11 +169,6 @@ async fn run_server(
         .await
         .map_err(|e| format!("Failed to create NFS Gateway: {e}"))?;
 
-    tracing::info!(
-        "NFS Gateway listening on {}:{}",
-        server.listen_ip(),
-        server.listen_port()
-    );
 
     server
         .start()

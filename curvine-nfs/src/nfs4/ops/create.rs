@@ -284,6 +284,7 @@ fn validate_link_content(link_content: &str) -> Nfs4Result<()> {
 /// Extracts attribute values from the XDR-encoded fattr4 structure.
 /// Returns tuple of (mode, uid, gid, size, atime, mtime).
 /// Same logic as SETATTR's parse_setattr_attrs.
+#[allow(clippy::type_complexity)]
 fn parse_create_attrs(
     fattr: &Fattr4,
 ) -> Nfs4Result<(

@@ -113,13 +113,19 @@ pub async fn op_open_downgrade(
 
     // Validate new access is subset of current (line 218-227)
     if (current_access & new_access) != new_access {
-        info!("OPEN_DOWNGRADE: new access {:#x} not subset of current {:#x}", new_access, current_access);
+        info!(
+            "OPEN_DOWNGRADE: new access {:#x} not subset of current {:#x}",
+            new_access, current_access
+        );
         return Err(Nfs4Status::Inval.into());
     }
 
     // Validate new deny is subset of current (line 230-238)
     if (current_deny & new_deny) != new_deny {
-        info!("OPEN_DOWNGRADE: new deny {:#x} not subset of current {:#x}", new_deny, current_deny);
+        info!(
+            "OPEN_DOWNGRADE: new deny {:#x} not subset of current {:#x}",
+            new_deny, current_deny
+        );
         return Err(Nfs4Status::Inval.into());
     }
 

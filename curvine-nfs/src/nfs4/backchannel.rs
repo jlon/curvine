@@ -226,15 +226,15 @@ impl BackchannelManager {
         // Try to find an active backchannel
         for session_id in session_ids {
             if let Some(conn) = channels.get(session_id) {
-                if conn.state == BackchannelState::Up {
-                    if conn.callback_tx.send(task.clone()).is_ok() {
-                        debug!(
-                            "Sent callback to client {} via session {:?}",
-                            client_id,
-                            &session_id[..4]
-                        );
-                        return Ok(());
-                    }
+                // Collapse nested if statements (clippy::collapsible_if)
+                if conn.state == BackchannelState::Up && conn.callback_tx.send(task.clone()).is_ok()
+                {
+                    debug!(
+                        "Sent callback to client {} via session {:?}",
+                        client_id,
+                        &session_id[..4]
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -254,7 +254,8 @@ impl BackchannelManager {
         // Find a session for this client
         let sessions = self.client_sessions.read().unwrap();
         let session_ids = sessions.get(&client_id).ok_or(Nfs4Status::BadSession)?;
-        let session_id = session_ids.first().ok_or(Nfs4Status::BadSession)?.clone();
+        // Dereference instead of clone for Copy type (clippy::clone_on_copy)
+        let session_id = *session_ids.first().ok_or(Nfs4Status::BadSession)?;
 
         let task = CallbackTask {
             session_id,

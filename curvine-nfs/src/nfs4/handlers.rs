@@ -41,11 +41,11 @@ pub async fn handle_nfs4(
     // NFSv4 only has procedure 0 (NULL) and 1 (COMPOUND)
     match call.proc {
         0 => {
-            info!("NFSv4 NULL({}) - ping request", xid);
+            debug!("NFSv4 NULL({}) - ping request", xid);
             handle_null(xid, output)?;
         }
         1 => {
-            info!("NFSv4 COMPOUND({}) - starting compound request", xid);
+            debug!("NFSv4 COMPOUND({}) - starting compound request", xid);
             handle_compound(xid, input, output, context).await?;
         }
         _ => {
@@ -59,7 +59,7 @@ pub async fn handle_nfs4(
 
 /// Handle NULL procedure
 fn handle_null(xid: u32, output: &mut impl Write) -> Result<(), anyhow::Error> {
-    info!("NFSv4 NULL({}) - responding to ping", xid);
+    debug!("NFSv4 NULL({}) - responding to ping", xid);
     make_success_reply(xid).serialize(output)?;
     Ok(())
 }
@@ -78,7 +78,7 @@ async fn handle_compound(
     let minor_version = input.read_u32::<BigEndian>()?;
     let op_count = input.read_u32::<BigEndian>()? as usize;
 
-    info!(
+    debug!(
         "NFSv4 COMPOUND({}) tag={:?} minor={} ops={}",
         xid,
         String::from_utf8_lossy(&tag),
@@ -120,7 +120,7 @@ async fn handle_compound(
         let op_code = input.read_u32::<BigEndian>()?;
         let op = Nfs4Op::from(op_code);
 
-        info!("  Op[{}]: {:?} ({})", i, op, op_code);
+        debug!("  Op[{}]: {:?} ({})", i, op, op_code);
 
         // Execute operation
         let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
@@ -143,7 +143,7 @@ async fn handle_compound(
     }
 
     // Write response
-    info!(
+    debug!(
         "COMPOUND response: xid={} status={:?} tag_len={} results_count={}",
         xid,
         overall_status,
@@ -157,7 +157,7 @@ async fn handle_compound(
     (results.len() as u32).serialize(output)?;
 
     for (op, status, data) in results {
-        info!(
+        debug!(
             "  Result: op={:?}({}) status={:?} data_len={}",
             op,
             op as u32,
@@ -197,7 +197,7 @@ fn skip_remaining_ops(input: &mut impl Read, count: usize) -> Result<(), anyhow:
 
 /// Skip operation arguments (for error recovery)
 fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::Error> {
-    info!("Skipping arguments for operation {:?}", op);
+    debug!("Skipping arguments for operation {:?}", op);
 
     match op {
         Nfs4Op::Sequence => {
@@ -294,7 +294,9 @@ async fn execute_operation(
         Nfs4Op::Setclientid => op_setclientid(input, ctx, handler).await,
         Nfs4Op::SetclientidConfirm => op_setclientid_confirm(input, ctx, handler).await,
         Nfs4Op::Renew => op_renew(input, ctx, handler).await,
-        Nfs4Op::OpenConfirm => crate::nfs4::ops::open_confirm::op_open_confirm(input, ctx, handler).await,
+        Nfs4Op::OpenConfirm => {
+            crate::nfs4::ops::open_confirm::op_open_confirm(input, ctx, handler).await
+        }
         // NFSv4.1 operations
         Nfs4Op::Sequence => op_sequence(input, ctx, handler).await,
         Nfs4Op::ExchangeId => op_exchange_id(input, ctx, handler).await,
@@ -311,7 +313,9 @@ async fn execute_operation(
         Nfs4Op::Lookup => op_lookup(input, ctx, handler).await,
         Nfs4Op::Lookupp => op_lookupp(ctx, handler).await,
         Nfs4Op::Open => op_open(input, ctx, handler).await,
-        Nfs4Op::OpenDowngrade => crate::nfs4::ops::open_downgrade::op_open_downgrade(input, ctx, handler).await,
+        Nfs4Op::OpenDowngrade => {
+            crate::nfs4::ops::open_downgrade::op_open_downgrade(input, ctx, handler).await
+        }
         Nfs4Op::Close => op_close(input, ctx, handler).await,
         Nfs4Op::Read => op_read(input, ctx, handler).await,
         Nfs4Op::Write => op_write(input, ctx, handler).await,
@@ -597,7 +601,7 @@ async fn op_destroy_session(
 /// PUTROOTFH - set current FH to root
 fn op_putrootfh(ctx: &mut CompoundContext, handler: &CompoundHandler) -> Nfs4Result<Vec<u8>> {
     let fh = handler.fs.fileid_to_fh(handler.fs.root_fileid());
-    info!(
+    debug!(
         "PUTROOTFH: root_fileid={} fh_len={} fh_data={:02x?}",
         handler.fs.root_fileid(),
         fh.data.len(),
@@ -1205,9 +1209,9 @@ fn encode_fsid(output: &mut Vec<u8>) -> Nfs4Result<()> {
 /// This is the key difference from NFSv3:
 /// - NFSv3: READ/WRITE directly, io_cache manages Reader/Writer
 /// - NFSv4.1: OPEN first, Reader/Writer bound to OpenState
-/// OPEN - open a file
 ///
 /// # Architecture
+///
 /// Delegates to ops::open::op_open() which mirrors NFS-Ganesha's nfs4_op_open.c
 async fn op_open(
     input: &mut impl Read,
@@ -1563,7 +1567,9 @@ async fn op_renew(
     Ok(Vec::new())
 }
 
-/// OPEN_CONFIRM - NFSv4.0 open confirmation (not needed in NFSv4.1)
+// OPEN_CONFIRM - NFSv4.0 open confirmation (not needed in NFSv4.1)
+// Implementation is in ops/open_confirm.rs
+
 // ============================================================================
 // Common Operations (NFSv4.0 and NFSv4.1)
 // ============================================================================
@@ -2106,4 +2112,3 @@ fn op_putpubfh(ctx: &mut CompoundContext, handler: &CompoundHandler) -> Nfs4Resu
     ctx.current_fh = Some(root_fh);
     Ok(Vec::new())
 }
-

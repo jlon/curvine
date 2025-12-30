@@ -139,6 +139,20 @@ pub async fn op_rename(
         src_change_before, src_change_after, dst_change_before, dst_change_after
     );
 
+    // Log warning if change values are the same (indicates potential cache issue)
+    if src_change_before == src_change_after {
+        tracing::warn!(
+            "RENAME: src_change_before == src_change_after ({}) - NFS client may not refresh cache!",
+            src_change_before
+        );
+    }
+    if dst_change_before == dst_change_after {
+        tracing::warn!(
+            "RENAME: dst_change_before == dst_change_after ({}) - NFS client may not refresh cache!",
+            dst_change_before
+        );
+    }
+
     // Build response - source_cinfo + target_cinfo (NFS-Ganesha line 160)
     let mut result = Vec::new();
 

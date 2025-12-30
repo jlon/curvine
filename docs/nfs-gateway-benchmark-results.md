@@ -1,171 +1,152 @@
-# Curvine NFS Gateway 性能基准测试报告
+# Curvine NFS Gateway 性能测试报告
 
 ## 测试环境
 
-| 项目 | 值 |
-|------|-----|
-| 测试日期 | 2025-12-27 |
-| 操作系统 | macOS |
-| 测试工具 | FIO 3.41 |
-| I/O 引擎 | posixaio |
-| 测试文件大小 | 1GB (fio_test_1g) |
-| 运行时间 | 30秒/场景 |
+| 项目 | 配置 |
+|------|------|
+| 测试日期 | 2025-12-30 |
+| 操作系统 | Linux (Ubuntu) |
 | NFS 版本 | NFSv4.0 |
-| 挂载参数 | vers=4.0,port=2049,tcp,resvport |
-| 优化版本 | v4 (网络性能优化) |
+| FIO 版本 | 3.36 |
+| 挂载点 | /mnt/curvine-nfs |
+| 挂载参数 | vers=4.0,rsize=1048576,wsize=1048576,hard,proto=tcp |
 
-## NFSv4.0 性能测试结果（ReaderPool + StatusCache 优化）
+## 测试结果汇总
 
-### ⚠️ 重要发现：macOS 客户端缓存问题 (2025-12-27 23:45)
+### 写入性能
 
-**之前的测试结果（527 MiB/s）是错误的！** 测试读取的是 macOS 本地缓存，不是真实 NFS 流量。
+| 测试场景 | IO引擎 | 块大小 | IO深度 | Direct | 带宽 (MiB/s) | IOPS | 延迟P99 |
+|---------|--------|--------|--------|--------|-------------|------|---------|
+| 顺序写 (buffered) | psync | 1M | 1 | No | **2223** | 2223 | 611μs |
+| 顺序写 (direct) | psync | 1M | 1 | Yes | **879** | 879 | 4.7ms |
+| 高并发写 | libaio | 512K | 16 | Yes | **1747** | 3512 | 16.5ms |
+| 极高并发写 | libaio | 512K | 64 | Yes | **871** | 1741 | 74ms |
+| 随机写 | psync | 4K | 8 | No | **468** | 120K | 2.9ms |
 
-通过 `nfsstat -c` 验证后，真实性能如下：
+### 读取性能
 
-| 测试场景 | 块大小 | 读取量 | 时间 | 带宽 (MiB/s) | NFS READ 操作 | 每次 READ |
-|---------|--------|--------|------|-------------|--------------|----------|
-| 顺序读（大块） | 1M | 100MB | 7.88s | **12.7** | 3200 | 32KB |
-| 顺序读（小块） | 32K | 32MB | 0.81s | **38.9** | 1008 | 32KB |
-| 随机读 | 4K | 100块 | ~2s | ~0.2 | 75 | 32KB |
+| 测试场景 | IO引擎 | 块大小 | IO深度 | Direct | 带宽 (MiB/s) | IOPS | 延迟P99 | 优化状态 |
+|---------|--------|--------|--------|--------|-------------|------|---------|---------|
+| 顺序读 (direct) - 优化前 | psync | 1M | 1 | Yes | 352 | 352 | 3.2ms | ❌ 基线 |
+| 顺序读 (direct) - 优化后 | psync | 1M | 1 | Yes | **533** | 533 | 3.0ms | ✅ +51% |
+| 随机读 | psync | 4K | 8 | Yes | **8.5** | 2123 | - | - |
 
-**关键发现**:
-1. ❌ **macOS 强制 rsize=32768** - 无法突破 32KB 限制
-2. ❌ **客户端缓存极其激进** - 即使设置 `noac,acregmin=0`，仍然缓存
-3. ✅ **真实 NFS 性能**: 12-39 MiB/s（受限于 32KB 缓冲区）
-4. ✅ **ReaderPool 工作正常** - 每次 READ 操作都复用 Reader
-5. ✅ **StatusCache 工作正常** - 减少了 Master 查询
+### 混合读写性能
 
-**性能瓶颈**:
-- **主要**: macOS 32KB 缓冲区限制（每次 READ 最多 32KB）
-- **次要**: 网络往返延迟（本地回环 ~0.1ms）
-- **理论最大**: 32KB / 0.1ms = 320 MiB/s（实际只达到 39 MiB/s）
+| 测试场景 | 读写比 | 块大小 | IO深度 | 读带宽 | 写带宽 |
+|---------|--------|--------|--------|--------|--------|
+| 混合读写 | 70/30 | 4K | 8 | 9.5 MiB/s | 4 MiB/s |
 
-**验证方法**:
+## 性能优化记录
+
+### 优化 1: 移除 NfsReader Channel 机制 (2025-12-30)
+
+**问题分析：**
+- 每个 NfsReader 内部使用 AsyncChannel 串行化所有读请求
+- 虽然 ReaderPool 有 8 个 NfsReader，但每个 NfsReader 一次只能处理 1 个请求
+- 导致顺序读性能仅为 352 MiB/s
+
+**优化方案：**
+- 移除 NfsReader 的 channel 机制
+- 直接使用 `Arc<Mutex<UnifiedReader>>` 封装
+- 保持 ReaderPool 的 8 个并发读取器
+
+**优化结果：**
+- 顺序读性能：352 MiB/s → 533 MiB/s
+- 性能提升：**+51.4%** 🎉
+- 延迟降低：3.2ms → 3.0ms (P99)
+
+**代码变更：**
+- `curvine-nfs/src/gateway/nfs_reader.rs`: 简化为直接封装 UnifiedReader
+- `curvine-nfs/src/gateway/io_cache.rs`: 移除 Runtime 参数
+- `curvine-nfs/src/nfs4/fs.rs`: 更新 ReaderPool 创建调用
+
+## 详细测试命令
+
+### 场景 1: 顺序写 (buffered)
 ```bash
-# 查看 NFS READ 操作计数
-nfsstat -c | grep -A 2 "Putrootfh"
-
-# 测试前后对比，确认真实 NFS 流量
+fio --name=seq-write --filename=/mnt/curvine-nfs/fio_test \
+    --size=100M --bs=1M --rw=write --direct=0 \
+    --ioengine=psync --iodepth=1 --runtime=30 --time_based
 ```
 
-**下一步**:
-1. 使用 Linux 客户端测试（支持更大 rsize）
-2. 优化服务端 READ 处理延迟
-3. 考虑批量 READ 优化
+### 场景 2: 顺序写 (direct)
+```bash
+fio --name=seq-write-direct --filename=/mnt/curvine-nfs/fio_test \
+    --size=100M --bs=1M --rw=write --direct=1 \
+    --ioengine=psync --iodepth=1 --runtime=30 --time_based
+```
 
-### 历史测试 (2025-12-26 - 网络优化版)
+### 场景 3: 高并发写 (libaio)
+```bash
+fio --name=high-write --filename=/mnt/curvine-nfs/fio_test \
+    --size=200M --bs=512K --rw=write --direct=1 \
+    --ioengine=libaio --iodepth=16 --runtime=30 --time_based
+```
 
-| 测试场景 | 块大小 | IO深度 | 带宽 (MiB/s) | IOPS | 对比 v3 |
-|---------|--------|--------|-------------|------|---------|
-| 顺序读 | 1M | 1 | **1083** | 1,083 | +4.5% |
-| 顺序读 | 1M | 8 | **1746** | 1,746 | +1.6% |
-| 顺序写 | 1M | 1 | **491** | 491 | +62% ✨ |
-| 随机读 | 4K | 8 | **83.2** | 21,299 | -19% |
-| 随机写 | 4K | 8 | **77.3** | 19,789 | -9% |
+### 场景 4: 极高并发写 (libaio)
+```bash
+fio --name=extreme-write --filename=/mnt/curvine-nfs/fio_test \
+    --size=200M --bs=512K --rw=write --direct=1 \
+    --ioengine=libaio --iodepth=64 --runtime=30 --time_based
+```
 
-## NFSv3 性能测试结果（参考）
+### 场景 5: 顺序读 (direct)
+```bash
+# 先创建测试文件
+dd if=/dev/zero of=/mnt/curvine-nfs/fio_read_source bs=1M count=100
 
-| 测试场景 | 块大小 | IO深度 | 带宽 (MiB/s) | IOPS |
-|---------|--------|--------|-------------|------|
-| 顺序读 | 1M | 1 | **1036** | 1036 |
-| 顺序读 | 1M | 8 | **1719** | 1719 |
-| 顺序写 | 1M | 1 | **303** | 303 |
-| 顺序写 | 1M | 8 | **253** | 253 |
-| 随机读 | 4K | 8 | **103** | 26,283 |
-| 随机写 | 4K | 8 | **84.6** | 21,656 |
+fio --name=seq-read --filename=/mnt/curvine-nfs/fio_read_source \
+    --bs=1M --rw=read --direct=1 \
+    --ioengine=psync --iodepth=1 --runtime=30 --time_based
+```
+
+### 场景 6: 随机读
+```bash
+fio --name=rand-read --filename=/mnt/curvine-nfs/fio_read_source \
+    --bs=4K --rw=randread --direct=1 \
+    --ioengine=psync --iodepth=8 --runtime=30 --time_based
+```
+
+### 场景 7: 随机写
+```bash
+fio --name=rand-write --filename=/mnt/curvine-nfs/fio_test \
+    --size=100M --bs=4K --rw=randwrite --direct=0 \
+    --ioengine=psync --iodepth=8 --runtime=30 --time_based
+```
+
+### 场景 8: 混合读写
+```bash
+fio --name=mixed --filename=/mnt/curvine-nfs/fio_test \
+    --size=100M --bs=4K --rw=randrw --rwmixread=70 --direct=0 \
+    --ioengine=psync --iodepth=8 --runtime=30 --time_based
+```
 
 ## 性能分析
 
-```
-带宽对比 (MiB/s) - NFSv4.0 优化版
-================================================================================
+### 写入性能分析
+- **Buffered 写入 (2223 MiB/s)**: 性能优秀，得益于内核页缓存
+- **Direct 写入 (879 MiB/s)**: 绕过缓存直接写入，性能稳定
+- **高并发写入 (1747 MiB/s)**: libaio 异步 IO 表现良好
 
-顺序读 1M d=8   ████████████████████████████████████████████████████ 1,746
-顺序读 1M d=1   ███████████████████████████████████████████ 1,083
-顺序写 1M d=1   ██████████████████████ 491 ⬆️ +62%
-随机读 4K d=8   ███ 83.2
-随机写 4K d=8   ██ 77.3
-```
+### 读取性能分析
+- **顺序读 (533 MiB/s)**: ✅ 优化后性能提升 51%，已达到合理水平
+  - 优化方案：移除 NfsReader 的 channel 串行化机制
+  - 当前瓶颈：单线程 psync，iodepth=1
+  - 进一步优化方向：增加 IO 深度、使用 libaio
+- **随机读 (8.5 MiB/s)**: 小块随机读取，受限于网络延迟
 
-## 关键发现
+## 待优化项
 
-### ✅ 优化成果
+1. **顺序读性能进一步优化** - 当前 533 MiB/s，目标 > 1000 MiB/s
+   - [ ] 测试 libaio + iodepth=16 的性能
+   - [ ] 实现预读取 (readahead)
+   - [ ] 优化网络传输层
 
-1. **顺序写性能大幅提升**: 从 303 MiB/s 提升到 491 MiB/s (+62%)
-   - TCP 缓冲区优化（512KB）
-   - 预分配响应缓冲区
-   - 消除零初始化开销
-
-2. **顺序读性能稳定**: 1.7+ GB/s，与 NFSv3 持平
-   - 网络层优化生效
-   - 数据流路径最优
-
-3. **NFSv4.0 协议成熟**: 挂载稳定，读写正常
-
-### ⚠️ 待优化项
-
-1. **随机 I/O 性能略降**: 4K 随机读写比 NFSv3 慢 10-20%
-   - 可能原因：NFSv4 COMPOUND 操作开销
-   - 影响：小文件场景性能略低
-   - 优先级：中（大文件场景不受影响）
-
-2. **小文件操作**: 未测试（需要补充）
-
-## 网络优化详情
-
-本次测试应用了以下优化：
-
-1. **TCP 层优化**:
-   - 发送/接收缓冲区：512KB（默认）
-   - TCP_NODELAY：启用
-   - TCP_QUICKACK：启用（Linux）
-   - SO_KEEPALIVE：启用
-
-2. **Wire 协议优化**:
-   - 缓冲区：256KB（从 64KB 增加）
-   - 消除零初始化（unsafe 优化）
-   - 预分配响应缓冲区
-
-3. **READ/WRITE 优化**:
-   - 直接使用 DataSlice（零拷贝）
-   - 预分配精确大小缓冲区
-   - 批量读取（fuse_read）
-
-## 配置说明
-
-TCP 调优参数可通过环境变量配置：
-
-```bash
-# 默认值（当前测试使用）
-export NFS_TCP_SEND_BUFFER=512  # KB
-export NFS_TCP_RECV_BUFFER=512  # KB
-export NFS_TCP_NODELAY=true
-export NFS_TCP_QUICKACK=true
-export NFS_TCP_KEEPALIVE=true
-```
-
-## 测试命令参考
-
-```bash
-# 顺序读
-fio --name=seq_read --filename=~/curvine-nfs-mount/test_1g \
-    --bs=1M --rw=read --direct=1 --ioengine=posixaio \
-    --iodepth=1 --runtime=30 --time_based --readonly --size=1g
-
-# 随机读
-fio --name=rand_read --filename=~/curvine-nfs-mount/test_1g \
-    --bs=4K --rw=randread --direct=1 --ioengine=posixaio \
-    --iodepth=8 --runtime=30 --time_based --readonly --size=1g
-
-# 多 Job 测试
-fio --name=test --filename=~/curvine-nfs-mount/test_1g \
-    --bs=256k --rw=read --direct=1 --ioengine=posixaio \
-    --iodepth=1 --numjobs=4 --group_reporting \
-    --runtime=30 --time_based --readonly --size=1g
-```
+2. **随机读性能优化** - 当前 8.5 MiB/s
+   - [ ] 实现读取缓存
+   - [ ] 优化小块读取合并
 
 ---
-
-**文档版本**: 2.0  
-**最后更新**: 2025-12-26 22:55  
-**测试环境**: macOS, Curvine NFS Gateway (本地 short-circuit read)
+*报告生成时间: 2025-12-30 12:15*
+*最后更新: 2025-12-30 12:15 (优化 1: 移除 NfsReader Channel)*

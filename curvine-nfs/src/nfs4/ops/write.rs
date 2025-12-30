@@ -165,7 +165,7 @@ pub async fn op_write(
 
     // Check export limits (NFS-Ganesha line 600-650)
     let adjusted_size = check_write_limits(offset, data.len() as u64)?;
-    
+
     // Truncate data if it exceeds limits
     if adjusted_size < data.len() {
         data.truncate(adjusted_size);
@@ -238,24 +238,12 @@ pub async fn op_write(
 ///
 /// # Returns
 /// Adjusted write size
-fn check_write_limits(offset: u64, size: u64) -> Nfs4Result<usize> {
+fn check_write_limits(_offset: u64, size: u64) -> Nfs4Result<usize> {
     // TODO: Get MaxWrite and MaxOffsetWrite from export config
     // For now, use reasonable defaults
     const MAX_WRITE: u64 = 1024 * 1024; // 1MB (NFS-Ganesha default)
-    const MAX_OFFSET_WRITE: u64 = u64::MAX; // No limit by default
-
-    // Check MaxOffsetWrite (NFS-Ganesha line 610-630)
-    if MAX_OFFSET_WRITE < u64::MAX {
-        if offset + size > MAX_OFFSET_WRITE {
-            tracing::error!(
-                "Write would exceed MaxOffsetWrite: offset={} size={} max={}",
-                offset,
-                size,
-                MAX_OFFSET_WRITE
-            );
-            return Err(Nfs4Status::Fbig.into());
-        }
-    }
+                                        // Note: MAX_OFFSET_WRITE is set to u64::MAX (no limit) by default
+                                        // The offset limit check is disabled when MAX_OFFSET_WRITE == u64::MAX
 
     // Check MaxWrite (NFS-Ganesha line 640-650)
     let adjusted_size = if size > MAX_WRITE {

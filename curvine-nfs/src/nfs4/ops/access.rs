@@ -74,15 +74,15 @@ pub mod access_mode {
     pub const EXTEND: u32 = 0x00000008;
     pub const DELETE: u32 = 0x00000010;
     pub const EXECUTE: u32 = 0x00000020;
-    
+
     // NFSv4.2 extended attributes (RFC 7862)
     pub const XAREAD: u32 = 0x00000040;
     pub const XAWRITE: u32 = 0x00000080;
     pub const XALIST: u32 = 0x00000100;
-    
+
     // All basic access modes
     pub const ALL_BASIC: u32 = READ | LOOKUP | MODIFY | EXTEND | DELETE | EXECUTE;
-    
+
     // All extended modes (NFSv4.2+)
     pub const ALL_EXTENDED: u32 = XAREAD | XAWRITE | XALIST;
 }
@@ -106,7 +106,7 @@ pub async fn op_access(
 ) -> Nfs4Result<Vec<u8>> {
     // Parse ACCESS4args
     let access = input.read_u32::<BigEndian>()?;
-    
+
     info!("ACCESS: access={:#x}", access);
 
     // Determine maximum allowed access based on minor version
@@ -181,10 +181,7 @@ async fn check_access(
         }
         curvine_common::state::FileType::File => {
             // Regular files support: READ, MODIFY, EXTEND, EXECUTE
-            access_mode::READ
-                | access_mode::MODIFY
-                | access_mode::EXTEND
-                | access_mode::EXECUTE
+            access_mode::READ | access_mode::MODIFY | access_mode::EXTEND | access_mode::EXECUTE
         }
         curvine_common::state::FileType::Link => {
             // Symbolic links support: READ (readlink)

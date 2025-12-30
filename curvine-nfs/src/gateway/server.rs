@@ -197,8 +197,7 @@ impl NfsGatewayServer {
         // Load clients
         let persisted_clients = persistence.load_clients().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
-                "Failed to load clients: {:?}",
-                e
+                "Failed to load clients: {e:?}"
             )))
         })?;
 
@@ -207,8 +206,7 @@ impl NfsGatewayServer {
         // Load opens
         let persisted_opens = persistence.load_opens().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
-                "Failed to load opens: {:?}",
-                e
+                "Failed to load opens: {e:?}"
             )))
         })?;
 
@@ -217,8 +215,7 @@ impl NfsGatewayServer {
         // Load locks
         let persisted_locks = persistence.load_locks().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
-                "Failed to load locks: {:?}",
-                e
+                "Failed to load locks: {e:?}"
             )))
         })?;
 

@@ -193,7 +193,11 @@ impl ClientManager {
             .unwrap()
             .insert(owner_id, clientid);
 
-        tracing::info!("Registered new client {} with create_session_sequence={}", clientid, seqid);
+        tracing::info!(
+            "Registered new client {} with create_session_sequence={}",
+            clientid,
+            seqid
+        );
         Ok((clientid, seqid, 0))
     }
 

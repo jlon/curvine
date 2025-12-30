@@ -145,8 +145,7 @@ pub async fn op_read(
     }
 
     // Check export limits (NFS-Ganesha line 750-800)
-    let (adjusted_offset, adjusted_count, early_eof) =
-        check_read_limits(offset, count, &status)?;
+    let (adjusted_offset, adjusted_count, early_eof) = check_read_limits(offset, count, &status)?;
 
     // Early EOF: offset beyond file size
     if early_eof {
@@ -159,7 +158,10 @@ pub async fn op_read(
         // NFS-Ganesha line 900-920: anonymous read with delegation check
         warn!(
             "⚠️  [STATELESS READ] fileid={} offset={} count={} stateid={:02x?}",
-            fileid, adjusted_offset, adjusted_count, &stateid.other[..4]
+            fileid,
+            adjusted_offset,
+            adjusted_count,
+            &stateid.other[..4]
         );
         handler
             .fs
@@ -170,7 +172,10 @@ pub async fn op_read(
         // NFS-Ganesha line 810-890: stateid verification and state handling
         info!(
             "✅ [STATEFUL READ] fileid={} offset={} count={} stateid={:02x?}",
-            fileid, adjusted_offset, adjusted_count, &stateid.other[..4]
+            fileid,
+            adjusted_offset,
+            adjusted_count,
+            &stateid.other[..4]
         );
 
         // Step 1: Get state by stateid.other (NFS-Ganesha: nfs4_Check_Stateid with STATEID_SPECIAL_ANY)
@@ -218,20 +223,8 @@ fn check_read_limits(
     // TODO: Get MaxRead and MaxOffsetRead from export config
     // For now, use reasonable defaults
     const MAX_READ: u64 = 1024 * 1024; // 1MB (NFS-Ganesha default)
-    const MAX_OFFSET_READ: u64 = u64::MAX; // No limit by default
-
-    // Check MaxOffsetRead (NFS-Ganesha line 760-780)
-    if MAX_OFFSET_READ < u64::MAX {
-        if offset >= MAX_OFFSET_READ {
-            // Offset beyond max readable offset - treat as EOF
-            return Ok((offset, 0, true));
-        }
-        // Clamp count if it would exceed MaxOffsetRead
-        if offset + count as u64 > MAX_OFFSET_READ {
-            let adjusted = (MAX_OFFSET_READ - offset) as u32;
-            return Ok((offset, adjusted, false));
-        }
-    }
+                                       // Note: MAX_OFFSET_READ is set to u64::MAX (no limit) by default
+                                       // The offset limit check is disabled when MAX_OFFSET_READ == u64::MAX
 
     // Check MaxRead (NFS-Ganesha line 790-800)
     let adjusted_count = if count as u64 > MAX_READ {

@@ -404,11 +404,10 @@ impl NFSFileSystem for CurvineNfsFileSystem {
             Some(p) => p,
             None => {
                 let pool_size = self.io_cache.reader_pool_size;
-                let rt = self.runtime.clone();
                 let p = path.clone();
                 let ufs = self.ufs.clone();
                 // Use UnifiedReader to create NfsReader (similar to FuseReader)
-                let pool = ReaderPool::new(pool_size, rt, || async {
+                let pool = ReaderPool::new(pool_size, || async {
                     // Create UnifiedReader, which will be wrapped by NfsReader
                     ufs.open(&p).await
                 })
@@ -461,11 +460,10 @@ impl NFSFileSystem for CurvineNfsFileSystem {
 
                 // Re-create reader pool with fresh FileBlocks
                 let pool_size = self.io_cache.reader_pool_size;
-                let rt = self.runtime.clone();
                 let p = path.clone();
                 let ufs = self.ufs.clone();
                 // Use UnifiedReader to create NfsReader (similar to FuseReader)
-                let pool = ReaderPool::new(pool_size, rt, || async { ufs.open(&p).await })
+                let pool = ReaderPool::new(pool_size, || async { ufs.open(&p).await })
                     .await
                     .map_err(Self::fs_error_to_nfs)?;
                 let pool = Arc::new(pool);
@@ -482,7 +480,8 @@ impl NFSFileSystem for CurvineNfsFileSystem {
                 if final_read_count == 0 {
                     return Ok((vec![], true));
                 }
-                entry.reader
+                entry
+                    .reader
                     .fuse_read(offset as i64, final_read_count as usize)
                     .await
                     .map_err(|e| {
@@ -498,7 +497,8 @@ impl NFSFileSystem for CurvineNfsFileSystem {
                 if safe_read_count == 0 {
                     return Ok((vec![], true));
                 }
-                entry.reader
+                entry
+                    .reader
                     .fuse_read(offset as i64, safe_read_count as usize)
                     .await
                     .map_err(|e| {

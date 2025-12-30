@@ -154,7 +154,11 @@ impl NfsWriter {
 
         while let Some(task) = receiver.recv().await {
             match task {
-                WriteTask::Write { offset, data, reply } => {
+                WriteTask::Write {
+                    offset,
+                    data,
+                    reply,
+                } => {
                     let data_len = data.len() as u32;
                     let write_end = offset + data_len as i64;
 

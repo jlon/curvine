@@ -391,7 +391,13 @@ impl OpenManager {
 
         // Create open state with owner_val
         let state = Arc::new(OpenState::new(
-            stateid, clientid, owner_val.clone(), fileid, path, access, deny,
+            stateid,
+            clientid,
+            owner_val.clone(),
+            fileid,
+            path,
+            access,
+            deny,
         ));
 
         // Store state

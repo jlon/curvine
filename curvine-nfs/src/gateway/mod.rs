@@ -50,7 +50,7 @@ mod uid_gid;
 
 pub use curvine_nfs_fs::CurvineNfsFileSystem;
 pub use error::{NfsError, NfsResult};
-pub use io_cache::{IoCache, IoCacheConfig, ReaderPool, ReaderEntry};
+pub use io_cache::{IoCache, IoCacheConfig, ReaderEntry, ReaderPool};
 pub use nfs_reader::NfsReader;
 pub use nfs_writer::NfsWriter;
 pub use server::NfsGatewayServer;

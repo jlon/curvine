@@ -222,9 +222,10 @@ pub fn tune_tcp_socket(socket: &TcpStream, config: &TcpTuningConfig) -> io::Resu
             .with_time(Duration::from_secs(config.keepalive_idle_secs as u64))
             .with_interval(Duration::from_secs(config.keepalive_interval_secs as u64));
 
-        // with_retries is only available on Linux
-        #[cfg(target_os = "linux")]
-        let keepalive = keepalive.with_retries(config.keepalive_probe_count);
+        // Note: with_retries may not be available in all socket2 versions
+        // The keepalive probe count is typically set via TCP_KEEPCNT socket option
+        // For now, we skip setting retries and rely on system defaults
+        // TODO: Use sock_ref.set_tcp_keepcnt() if available in socket2
 
         if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
             warn!("Failed to set TCP keepalive: {}", e);

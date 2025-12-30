@@ -156,35 +156,12 @@ use crate::nfs4::compound::CompoundContext;
 use crate::nfs4::compound::CompoundHandler;
 use crate::nfs4::delegation::encode_open_delegation;
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
+use crate::nfs4::ops::setattr::parse_setattr_attrs;
 use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
 use tracing::info;
-
-/// Skip fattr4 structure in input stream
-///
-/// fattr4 structure:
-/// - attrmask: bitmap4 (array of u32)
-/// - attr_vals: opaque<> (length + data)
-fn skip_fattr4(input: &mut impl Read) -> Nfs4Result<()> {
-    // Read bitmap4 length
-    let bitmap_len = input.read_u32::<BigEndian>()? as usize;
-    
-    // Skip bitmap words
-    for _ in 0..bitmap_len {
-        input.read_u32::<BigEndian>()?;
-    }
-    
-    // Read attr_vals length
-    let attr_vals_len = input.read_u32::<BigEndian>()? as usize;
-    
-    // Skip attr_vals data
-    let mut buf = vec![0u8; attr_vals_len];
-    input.read_exact(&mut buf)?;
-    
-    Ok(())
-}
 
 /// OPEN operation handler
 ///
@@ -217,30 +194,58 @@ pub async fn op_open(
     let opentype = input.read_u32::<BigEndian>()?;
     info!("OPEN: opentype={}", opentype);
 
-    // If CREATE, skip the createhow structure
+    // Parse CREATE attributes if OPEN4_CREATE
+    // NFS-Ganesha: open4_ex_create_args() at line 653-750
+    let mut create_attrs: Option<(
+        Option<u32>,
+        Option<u32>,
+        Option<u32>,
+        Option<u64>,
+        Option<Nfstime4>,
+        Option<Nfstime4>,
+    )> = None;
+
     if opentype == 1 {
         // OPEN4_CREATE
         let createmode = input.read_u32::<BigEndian>()?; // mode: UNCHECKED4, GUARDED4, EXCLUSIVE4, EXCLUSIVE4_1
         info!("OPEN: createmode={}", createmode);
-        
+
         match createmode {
             0 | 1 => {
-                // UNCHECKED4 or GUARDED4: skip fattr4 (createattrs)
-                skip_fattr4(input)?;
-                info!("OPEN: skipped fattr4 for UNCHECKED4/GUARDED4");
+                // UNCHECKED4 or GUARDED4: parse fattr4 (createattrs)
+                // NFS-Ganesha: nfs4_Fattr_To_FSAL_attr() at line 653-700
+                let mut fattr = Fattr4::default();
+                fattr.deserialize(input)?;
+                let attrs = parse_setattr_attrs(&fattr)?;
+                create_attrs = Some(attrs);
+                info!(
+                    "OPEN: parsed fattr4 for UNCHECKED4/GUARDED4: mode={:?} uid={:?} gid={:?}",
+                    attrs.0, attrs.1, attrs.2
+                );
             }
             2 => {
-                // EXCLUSIVE4: skip verifier (8 bytes)
-                let mut verifier = [0u8; 8];
-                input.read_exact(&mut verifier)?;
-                info!("OPEN: skipped verifier for EXCLUSIVE4");
+                // EXCLUSIVE4: read verifier (8 bytes), no attributes
+                // NFS-Ganesha: verifier is used to check if file exists (line 700-750)
+                // TODO: Implement EXCLUSIVE4 verifier check when needed
+                let mut v = [0u8; 8];
+                input.read_exact(&mut v)?;
+                let _verifier = v; // Store for future EXCLUSIVE4 implementation
+                info!("OPEN: read verifier for EXCLUSIVE4 (not yet validated)");
             }
             3 => {
-                // EXCLUSIVE4_1: skip verifier (8 bytes) + fattr4
-                let mut verifier = [0u8; 8];
-                input.read_exact(&mut verifier)?;
-                skip_fattr4(input)?;
-                info!("OPEN: skipped verifier+fattr4 for EXCLUSIVE4_1");
+                // EXCLUSIVE4_1: read verifier (8 bytes) + fattr4
+                // NFS-Ganesha: verifier + attributes (line 700-750)
+                let mut v = [0u8; 8];
+                input.read_exact(&mut v)?;
+                let _verifier = v; // Store for future EXCLUSIVE4_1 implementation
+                let mut fattr = Fattr4::default();
+                fattr.deserialize(input)?;
+                let attrs = parse_setattr_attrs(&fattr)?;
+                create_attrs = Some(attrs);
+                info!(
+                    "OPEN: read verifier+fattr4 for EXCLUSIVE4_1: mode={:?} uid={:?} gid={:?}",
+                    attrs.0, attrs.1, attrs.2
+                );
             }
             _ => {
                 info!("OPEN: invalid createmode={}", createmode);
@@ -268,7 +273,7 @@ pub async fn op_open(
 
     // Step 1: Validate claim (NFS-Ganesha: open4_validate_claim)
     validate_claim(claim_type, ctx)?;
-    
+
     // Track if this is CLAIM_PREVIOUS (needs confirmed=true immediately)
     let is_claim_previous = claim_type == 1;
 
@@ -284,6 +289,28 @@ pub async fn op_open(
             // CREATE
             info!("OPEN: Creating file {} in parent {}", name_str, parent_id);
             let (fid, _status) = handler.fs.create_file(parent_id, &name_str).await?;
+
+            // Apply create attributes after file creation (NFS-Ganesha: line 700-750)
+            // Similar to CREATE operation, attributes are applied after object creation
+            if let Some((mode, uid, gid, size, atime, mtime)) = create_attrs {
+                if mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || size.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    handler
+                        .fs
+                        .setattr(fid, mode, uid, gid, size, atime, mtime)
+                        .await?;
+                    info!(
+                        "OPEN: Applied create attributes to file {}: mode={:?} uid={:?} gid={:?}",
+                        fid, mode, uid, gid
+                    );
+                }
+            }
+
             (fid, true)
         } else {
             // NOCREATE - lookup existing file
@@ -310,11 +337,14 @@ pub async fn op_open(
         is_create,
     )
     .await?;
-    
+
     // NFS-Ganesha line 887: CLAIM_PREVIOUS sets so_confirmed = true
     if is_claim_previous {
         open_state.set_confirmed(true);
-        info!("OPEN: CLAIM_PREVIOUS - set confirmed=true for stateid={:02x?}", &open_state.stateid.other[..4]);
+        info!(
+            "OPEN: CLAIM_PREVIOUS - set confirmed=true for stateid={:02x?}",
+            &open_state.stateid.other[..4]
+        );
     }
 
     // Step 5: Update current FH to opened file
@@ -334,8 +364,9 @@ pub async fn op_open(
     0u64.serialize(&mut result)?; // before
     0u64.serialize(&mut result)?; // after
 
-    // rflags (NFS-Ganesha aligned: line 1522-1523)
-    // Only set OPEN4_RESULT_CONFIRM if state is not yet confirmed
+    // rflags (NFS-Ganesha aligned: line 1522-1525)
+    // Set OPEN4_RESULT_CONFIRM if state is not yet confirmed (NFSv4.0 only)
+    // Set OPEN4_RESULT_LOCKTYPE_POSIX (always set, line 1525)
     let mut rflags = 0u32;
     if ctx.minor_version == 0 {
         // NFSv4.0: Set OPEN4_RESULT_CONFIRM only if state not confirmed
@@ -346,6 +377,9 @@ pub async fn op_open(
         // NFSv4.1+: No OPEN_CONFIRM needed, mark state as confirmed immediately
         open_state.set_confirmed(true);
     }
+    // NFS-Ganesha line 1525: Always set OPEN4_RESULT_LOCKTYPE_POSIX
+    // This indicates the server supports POSIX-style byte-range locking
+    rflags |= 0x00000001; // OPEN4_RESULT_LOCKTYPE_POSIX
     rflags.serialize(&mut result)?;
 
     // attrset (empty for now)
@@ -418,9 +452,14 @@ async fn open_ex(
     // Step 1: Check if state exists (NFS-Ganesha: nfs4_State_Get_Obj at line 975)
     // OpenManager::open() returns (state, new_state) where new_state indicates
     // if this is a newly created state or an existing one being reused
-    let (open_state, new_state) = handler
-        .opens
-        .open(clientid, owner_val.clone(), fileid, path.clone(), access, deny)?;
+    let (open_state, new_state) = handler.opens.open(
+        clientid,
+        owner_val.clone(),
+        fileid,
+        path.clone(),
+        access,
+        deny,
+    )?;
 
     // Step 2: Open or reopen file (NFS-Ganesha: fsal_open2/fsal_reopen2)
     // NFS-Ganesha behavior:

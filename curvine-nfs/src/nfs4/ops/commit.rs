@@ -86,7 +86,7 @@ pub async fn op_commit(
     // Parse COMMIT4args (NFS-Ganesha line 69-70)
     let offset = input.read_u64::<BigEndian>()?;
     let count = input.read_u32::<BigEndian>()?;
-    
+
     info!("COMMIT: offset={} count={}", offset, count);
 
     // Get current filehandle (NFS-Ganesha: nfs4_sanity_check_FH at line 82)

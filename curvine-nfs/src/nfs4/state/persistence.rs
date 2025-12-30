@@ -190,11 +190,11 @@ impl StatePersistenceManager {
         });
 
         // Build instance-specific paths (like NFS-Ganesha: recov_root/recov_dir/node{id})
-        let state_dir = format!("{}/{}", STATE_BASE_DIR, instance_id);
-        let clients_dir = format!("{}/clients", state_dir);
-        let opens_dir = format!("{}/opens", state_dir);
-        let locks_dir = format!("{}/locks", state_dir);
-        let recovery_meta = format!("{}/recovery.meta", state_dir);
+        let state_dir = format!("{STATE_BASE_DIR}/{instance_id}");
+        let clients_dir = format!("{state_dir}/clients");
+        let opens_dir = format!("{state_dir}/opens");
+        let locks_dir = format!("{state_dir}/locks");
+        let recovery_meta = format!("{state_dir}/recovery.meta");
 
         tracing::info!(
             "State persistence initialized for instance '{}' at {}",
@@ -569,8 +569,8 @@ impl StatePersistenceManager {
                 Nfs4Status::Serverfault
             })?;
 
-            let stateid_hex = hex::encode(&open.stateid.other);
-            let path = format!("{}/{}.json", self.opens_dir, stateid_hex);
+            let stateid_hex = hex::encode(open.stateid.other);
+            let path = format!("{}/{stateid_hex}.json", self.opens_dir);
             self.write_state_file(&path, &data).await?;
         }
 
@@ -601,9 +601,9 @@ impl StatePersistenceManager {
                 })?;
 
                 // Use stateid + entry index for unique filename
-                let stateid_hex = hex::encode(&state.stateid.other);
+                let stateid_hex = hex::encode(state.stateid.other);
                 let entry_idx = lock_count;
-                let path = format!("{}/{}_{}.json", self.locks_dir, stateid_hex, entry_idx);
+                let path = format!("{}/{stateid_hex}_{entry_idx}.json", self.locks_dir);
                 self.write_state_file(&path, &data).await?;
                 lock_count += 1;
             }
@@ -750,9 +750,9 @@ impl StatePersistenceManager {
         for dir in dirs {
             if let Ok(files) = self.list_dir(dir).await {
                 for filename in files {
-                    let path = format!("{}/{}", dir, filename);
+                    let path = format!("{dir}/{filename}");
                     if let Err(e) = self.delete_state_file(&path).await {
-                        warn!("Failed to delete unclaimed state file {}: {:?}", path, e);
+                        warn!("Failed to delete unclaimed state file {path}: {e:?}");
                     }
                 }
             }
@@ -760,7 +760,7 @@ impl StatePersistenceManager {
 
         // Delete recovery metadata
         if let Err(e) = self.delete_state_file(&self.recovery_meta).await {
-            debug!("Failed to delete recovery metadata: {:?}", e);
+            debug!("Failed to delete recovery metadata: {e:?}");
         }
 
         info!("Cleanup completed");

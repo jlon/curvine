@@ -43,7 +43,7 @@ impl XDR for Nfs4FileHandle {
         if len > Self::MAX_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("File handle too large: {}", len),
+                format!("File handle too large: {len}"),
             ));
         }
         self.data.resize(len, 0);

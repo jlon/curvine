@@ -18,7 +18,6 @@ use curvine_common::conf::NfsGatewayConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::Writer;
 use curvine_common::state::{FileBlocks, FileStatus};
-use orpc::runtime::Runtime;
 use orpc::sync::FastSyncCache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,11 +88,12 @@ pub struct ReaderPool {
 }
 
 impl ReaderPool {
-    pub async fn new<F, Fut>(
-        pool_size: usize,
-        rt: Arc<Runtime>,
-        mut factory: F,
-    ) -> Result<Self, FsError>
+    /// Create a new ReaderPool with specified size
+    ///
+    /// # Performance Optimization (2025-12-30)
+    /// Removed Runtime parameter as NfsReader no longer needs background tasks.
+    /// Each NfsReader now directly wraps UnifiedReader for better performance.
+    pub async fn new<F, Fut>(pool_size: usize, mut factory: F) -> Result<Self, FsError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<UnifiedReader, FsError>>,
@@ -101,7 +101,7 @@ impl ReaderPool {
         let mut readers = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             let unified_reader = factory().await?;
-            let nfs_reader = NfsReader::new(rt.clone(), unified_reader);
+            let nfs_reader = NfsReader::new(unified_reader);
             readers.push(Arc::new(ReaderEntry::new(nfs_reader)));
         }
         Ok(Self {

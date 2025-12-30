@@ -134,7 +134,7 @@ pub enum Nfs4Status {
 
 impl fmt::Display for Nfs4Status {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -229,7 +229,7 @@ impl From<Nfs4Status> for Nfs4Error {
 impl From<FsError> for Nfs4Error {
     fn from(e: FsError) -> Self {
         let status = Nfs4Status::from(&e);
-        let msg = format!("[Curvine] {}", e);
+        let msg = format!("[Curvine] {e}");
 
         // Log detailed error for server-side troubleshooting
         match status {

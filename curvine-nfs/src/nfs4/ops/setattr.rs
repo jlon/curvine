@@ -110,8 +110,7 @@ pub async fn op_setattr(
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
     // Check if size is being set (NFS-Ganesha line 100)
-    let setting_size = !fattr.attrmask.is_empty()
-        && fattr.attrmask[0] & (1 << 4) != 0; // FATTR4_SIZE is bit 4
+    let setting_size = !fattr.attrmask.is_empty() && fattr.attrmask[0] & (1 << 4) != 0; // FATTR4_SIZE is bit 4
 
     // Verify stateid if setting size or if not special stateid (NFS-Ganesha line 110)
     if setting_size && !stateid.is_special() {
@@ -161,7 +160,9 @@ pub async fn op_setattr(
 ///
 /// Extracts attribute values from the XDR-encoded fattr4 structure.
 /// Returns tuple of (mode, uid, gid, size, atime, mtime).
-fn parse_setattr_attrs(
+///
+/// This function is also used by CREATE and OPEN operations for parsing createattrs.
+pub(crate) fn parse_setattr_attrs(
     fattr: &Fattr4,
 ) -> Nfs4Result<(
     Option<u32>,

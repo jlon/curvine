@@ -31,21 +31,19 @@ pub async fn handle_nfs4(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // Verify version
     if call.vers != NFS4_VERSION {
         warn!("Invalid NFS version {} != {}", call.vers, NFS4_VERSION);
         prog_mismatch_reply_message(xid, NFS4_VERSION).serialize(output)?;
         return Ok(());
     }
 
-    // NFSv4 only has procedure 0 (NULL) and 1 (COMPOUND)
     match call.proc {
         0 => {
-            info!("NFSv4 NULL({}) - ping request", xid);
+            debug!("NFSv4 NULL({}) - ping request", xid);
             handle_null(xid, output)?;
         }
         1 => {
-            info!("NFSv4 COMPOUND({}) - starting compound request", xid);
+            debug!("NFSv4 COMPOUND({}) - starting compound request", xid);
             handle_compound(xid, input, output, context).await?;
         }
         _ => {
@@ -59,7 +57,7 @@ pub async fn handle_nfs4(
 
 /// Handle NULL procedure
 fn handle_null(xid: u32, output: &mut impl Write) -> Result<(), anyhow::Error> {
-    info!("NFSv4 NULL({}) - responding to ping", xid);
+    debug!("NFSv4 NULL({}) - responding to ping", xid);
     make_success_reply(xid).serialize(output)?;
     Ok(())
 }
@@ -71,14 +69,13 @@ async fn handle_compound(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // Read COMPOUND4args
     let mut tag: Vec<u8> = Vec::new();
     tag.deserialize(input)?;
 
     let minor_version = input.read_u32::<BigEndian>()?;
     let op_count = input.read_u32::<BigEndian>()? as usize;
 
-    info!(
+    debug!(
         "NFSv4 COMPOUND({}) tag={:?} minor={} ops={}",
         xid,
         String::from_utf8_lossy(&tag),
@@ -86,7 +83,6 @@ async fn handle_compound(
         op_count
     );
 
-    // Verify minor version - support both NFSv4.0 (0) and NFSv4.1 (1)
     if minor_version > NFS4_MINOR_VERSION {
         warn!(
             "Unsupported NFSv4 minor version: {}, max supported: {}",
@@ -95,11 +91,10 @@ async fn handle_compound(
         make_success_reply(xid).serialize(output)?;
         Nfs4Status::MinorVersMismatch.serialize(output)?;
         tag.serialize(output)?;
-        0u32.serialize(output)?; // resarray count
+        0u32.serialize(output)?;
         return Ok(());
     }
 
-    // Check operation count
     if op_count > crate::nfs4::MAX_COMPOUND_OPS {
         make_success_reply(xid).serialize(output)?;
         Nfs4Status::TooManyOps.serialize(output)?;
@@ -108,21 +103,17 @@ async fn handle_compound(
         return Ok(());
     }
 
-    // Create compound context with minor version
     let mut ctx = CompoundContext::with_minor_version(minor_version);
 
-    // Collect results
     let mut results: Vec<(Nfs4Op, Nfs4Status, Vec<u8>)> = Vec::with_capacity(op_count);
     let mut overall_status = Nfs4Status::Ok;
 
-    // Process each operation
     for i in 0..op_count {
         let op_code = input.read_u32::<BigEndian>()?;
         let op = Nfs4Op::from(op_code);
 
-        info!("  Op[{}]: {:?} ({})", i, op, op_code);
+        debug!("  Op[{}]: {:?} ({})", i, op, op_code);
 
-        // Execute operation
         let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
             Ok(data) => (Nfs4Status::Ok, data),
             Err(e) => {
@@ -133,17 +124,14 @@ async fn handle_compound(
 
         results.push((op, status, result_data));
 
-        // Stop on first error
         if status != Nfs4Status::Ok {
             overall_status = status;
-            // Skip remaining operations
             skip_remaining_ops(input, op_count - i - 1)?;
             break;
         }
     }
 
-    // Write response
-    info!(
+    debug!(
         "COMPOUND response: xid={} status={:?} tag_len={} results_count={}",
         xid,
         overall_status,
@@ -157,7 +145,7 @@ async fn handle_compound(
     (results.len() as u32).serialize(output)?;
 
     for (op, status, data) in results {
-        info!(
+        debug!(
             "  Result: op={:?}({}) status={:?} data_len={}",
             op,
             op as u32,
@@ -171,10 +159,7 @@ async fn handle_compound(
         }
     }
 
-    // Cache reply for replay detection
     if let (Some(sessionid), Some(slot_id)) = (ctx.sessionid, ctx.slot_id) {
-        // In a real implementation, we'd cache the entire response
-        // For now, we just release the slot
         if let Some(handler) = context.nfs4_handler.as_ref() {
             handler
                 .sessions
@@ -197,7 +182,7 @@ fn skip_remaining_ops(input: &mut impl Read, count: usize) -> Result<(), anyhow:
 
 /// Skip operation arguments (for error recovery)
 fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::Error> {
-    info!("Skipping arguments for operation {:?}", op);
+    debug!("Skipping arguments for operation {:?}", op);
 
     match op {
         Nfs4Op::Sequence => {
@@ -265,13 +250,178 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             input.read_exact(&mut verifier)?;
             info!("Skipped SETCLIENTID_CONFIRM args: clientid + verifier");
         }
+        Nfs4Op::Close => {
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            info!("Skipped CLOSE args: seqid + stateid");
+        }
+        Nfs4Op::Write => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _offset = input.read_u64::<BigEndian>()?;
+            let _stable = input.read_u32::<BigEndian>()?;
+            let mut data: Vec<u8> = Vec::new();
+            data.deserialize(input)?;
+            info!(
+                "Skipped WRITE args: stateid + offset + stable + data ({} bytes)",
+                data.len()
+            );
+        }
+        Nfs4Op::Commit => {
+            let _offset = input.read_u64::<BigEndian>()?;
+            let _count = input.read_u32::<BigEndian>()?;
+            info!("Skipped COMMIT args: offset + count");
+        }
+        Nfs4Op::Access => {
+            let _access = input.read_u32::<BigEndian>()?;
+            info!("Skipped ACCESS args: access");
+        }
+        Nfs4Op::OpenDowngrade => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let _access = input.read_u32::<BigEndian>()?;
+            let _deny = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPEN_DOWNGRADE args: stateid + seqid + access + deny");
+        }
+        Nfs4Op::Setattr => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped SETATTR args: stateid + fattr4");
+        }
+        Nfs4Op::Readdir => {
+            let _cookie = input.read_u64::<BigEndian>()?;
+            let mut cookieverf = [0u8; 8];
+            input.read_exact(&mut cookieverf)?;
+            let _dircount = input.read_u32::<BigEndian>()?;
+            let _maxcount = input.read_u32::<BigEndian>()?;
+            let mut bitmap: Vec<u32> = Vec::new();
+            bitmap.deserialize(input)?;
+            info!("Skipped READDIR args: cookie + cookieverf + dircount + maxcount + bitmap");
+        }
+        Nfs4Op::Create => {
+            let obj_type = input.read_u32::<BigEndian>()?;
+            match obj_type {
+                5 => {
+                    let mut link: Vec<u8> = Vec::new();
+                    link.deserialize(input)?;
+                }
+                3 | 4 => {
+                    let _spec1 = input.read_u32::<BigEndian>()?;
+                    let _spec2 = input.read_u32::<BigEndian>()?;
+                }
+                _ => {}
+            }
+            let mut name: Vec<u8> = Vec::new();
+            name.deserialize(input)?;
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped CREATE args: objtype + [link/spec] + name + fattr4");
+        }
+        Nfs4Op::Remove => {
+            let mut name: Vec<u8> = Vec::new();
+            name.deserialize(input)?;
+            info!("Skipped REMOVE args: name");
+        }
+        Nfs4Op::Rename => {
+            let mut oldname: Vec<u8> = Vec::new();
+            oldname.deserialize(input)?;
+            let mut newname: Vec<u8> = Vec::new();
+            newname.deserialize(input)?;
+            info!("Skipped RENAME args: oldname + newname");
+        }
+        Nfs4Op::Link => {
+            let mut newname: Vec<u8> = Vec::new();
+            newname.deserialize(input)?;
+            info!("Skipped LINK args: newname");
+        }
+        Nfs4Op::Readlink => {
+            info!("Skipped READLINK args: no arguments");
+        }
+        Nfs4Op::Open => {
+            let _seqid = input.read_u32::<BigEndian>()?;
+            let _share_access = input.read_u32::<BigEndian>()?;
+            let _share_deny = input.read_u32::<BigEndian>()?;
+            let mut owner: Vec<u8> = Vec::new();
+            owner.deserialize(input)?;
+            let opentype = input.read_u32::<BigEndian>()?;
+            if opentype == 1 {
+                let createmode = input.read_u32::<BigEndian>()?;
+                match createmode {
+                    0 => {
+                        let mut verifier = [0u8; 8];
+                        input.read_exact(&mut verifier)?;
+                    }
+                    1 => {
+                        let mut name: Vec<u8> = Vec::new();
+                        name.deserialize(input)?;
+                    }
+                    _ => {}
+                }
+                let mut createattrs: Vec<u32> = Vec::new();
+                createattrs.deserialize(input)?;
+                let mut fattr = Fattr4::default();
+                fattr.deserialize(input)?;
+            }
+            info!("Skipped OPEN args: seqid + share_access + share_deny + owner + [create]");
+        }
+        Nfs4Op::OpenConfirm => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            let _seqid = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPEN_CONFIRM args: stateid + seqid");
+        }
+        Nfs4Op::Renew => {
+            let _clientid = input.read_u64::<BigEndian>()?;
+            info!("Skipped RENEW args: clientid");
+        }
+        Nfs4Op::ReclaimComplete => {
+            let _one_fs = input.read_u32::<BigEndian>()?;
+            info!("Skipped RECLAIM_COMPLETE args: one_fs");
+        }
+        Nfs4Op::Delegreturn => {
+            let mut stateid = Stateid4::default();
+            stateid.deserialize(input)?;
+            info!("Skipped DELEGRETURN args: stateid");
+        }
+        Nfs4Op::Nverify | Nfs4Op::Verify => {
+            let mut fattr = Fattr4::default();
+            fattr.deserialize(input)?;
+            info!("Skipped {:?} args: fattr4", op);
+        }
+        Nfs4Op::Lock | Nfs4Op::Lockt | Nfs4Op::Locku => {
+            warn!(
+                "Skipping {:?} args: complex structure, may cause issues",
+                op
+            );
+        }
+        Nfs4Op::ReleaseLockowner => {
+            let _clientid = input.read_u64::<BigEndian>()?;
+            let mut owner: Vec<u8> = Vec::new();
+            owner.deserialize(input)?;
+            info!("Skipped RELEASE_LOCKOWNER args: clientid + owner");
+        }
+        Nfs4Op::ExchangeId | Nfs4Op::CreateSession | Nfs4Op::DestroySession => {
+            warn!(
+                "Skipping {:?} args: complex structure, may cause issues",
+                op
+            );
+        }
+        Nfs4Op::Lookupp => {
+            info!("Skipped LOOKUPP args: no arguments");
+        }
+        Nfs4Op::Openattr => {
+            let _attr_type = input.read_u32::<BigEndian>()?;
+            info!("Skipped OPENATTR args: attr_type");
+        }
         _ => {
             warn!(
                 "Cannot skip arguments for operation {:?} - not implemented",
                 op
             );
-            // For safety, try to read a small amount and hope for the best
-            // This is a limitation that should be addressed for production
         }
     }
     Ok(())
@@ -294,7 +444,9 @@ async fn execute_operation(
         Nfs4Op::Setclientid => op_setclientid(input, ctx, handler).await,
         Nfs4Op::SetclientidConfirm => op_setclientid_confirm(input, ctx, handler).await,
         Nfs4Op::Renew => op_renew(input, ctx, handler).await,
-        Nfs4Op::OpenConfirm => crate::nfs4::ops::open_confirm::op_open_confirm(input, ctx, handler).await,
+        Nfs4Op::OpenConfirm => {
+            crate::nfs4::ops::open_confirm::op_open_confirm(input, ctx, handler).await
+        }
         // NFSv4.1 operations
         Nfs4Op::Sequence => op_sequence(input, ctx, handler).await,
         Nfs4Op::ExchangeId => op_exchange_id(input, ctx, handler).await,
@@ -311,7 +463,9 @@ async fn execute_operation(
         Nfs4Op::Lookup => op_lookup(input, ctx, handler).await,
         Nfs4Op::Lookupp => op_lookupp(ctx, handler).await,
         Nfs4Op::Open => op_open(input, ctx, handler).await,
-        Nfs4Op::OpenDowngrade => crate::nfs4::ops::open_downgrade::op_open_downgrade(input, ctx, handler).await,
+        Nfs4Op::OpenDowngrade => {
+            crate::nfs4::ops::open_downgrade::op_open_downgrade(input, ctx, handler).await
+        }
         Nfs4Op::Close => op_close(input, ctx, handler).await,
         Nfs4Op::Read => op_read(input, ctx, handler).await,
         Nfs4Op::Write => op_write(input, ctx, handler).await,
@@ -367,20 +521,16 @@ async fn op_sequence(
     let (session, cached, highest, target_highest, flags) =
         handler.sessions.sequence(&sessionid, slotid, sequenceid)?;
 
-    // Check for cached reply
     if let Some(cached_reply) = cached {
         return Ok(cached_reply.reply);
     }
 
-    // Update context
     ctx.sessionid = Some(sessionid);
     ctx.slot_id = Some(slotid);
     ctx.clientid = Some(session.clientid);
 
-    // Renew lease
     handler.clients.renew_lease(session.clientid)?;
 
-    // Build response
     let mut result = Vec::new();
     sessionid.serialize(&mut result)?;
     sequenceid.serialize(&mut result)?;
@@ -404,7 +554,6 @@ async fn op_exchange_id(
     let flags = input.read_u32::<BigEndian>()?;
     let _state_protect = input.read_u32::<BigEndian>()?;
 
-    // Skip impl_id array
     let impl_count = input.read_u32::<BigEndian>()?;
     for _ in 0..impl_count {
         let mut domain: Vec<u8> = Vec::new();
@@ -419,24 +568,20 @@ async fn op_exchange_id(
 
     let (clientid, seqid, result_flags) = handler.clients.exchange_id(client_owner)?;
 
-    // Build response
     let mut result = Vec::new();
     clientid.serialize(&mut result)?;
     seqid.serialize(&mut result)?;
     result_flags.serialize(&mut result)?;
-    0u32.serialize(&mut result)?; // state_protect
+    0u32.serialize(&mut result)?;
 
-    // Server owner
     let server_owner_major: Vec<u8> = b"curvine".to_vec();
     let server_owner_minor: Vec<u8> = Vec::new();
     server_owner_major.serialize(&mut result)?;
     server_owner_minor.serialize(&mut result)?;
 
-    // Server scope
     let server_scope: Vec<u8> = b"curvine.local".to_vec();
     server_scope.serialize(&mut result)?;
 
-    // Server impl_id (empty)
     0u32.serialize(&mut result)?;
 
     Ok(result)
@@ -452,7 +597,6 @@ async fn op_create_session(
     let seqid = input.read_u32::<BigEndian>()?;
     let flags = input.read_u32::<BigEndian>()?;
 
-    // Skip channel attrs (fore and back)
     for _ in 0..2 {
         let _headerpadsize = input.read_u32::<BigEndian>()?;
         let _maxrequestsize = input.read_u32::<BigEndian>()?;
@@ -466,14 +610,11 @@ async fn op_create_session(
         }
     }
 
-    // Skip callback program
     let _cb_program = input.read_u32::<BigEndian>()?;
-    // Skip sec_parms
     let sec_count = input.read_u32::<BigEndian>()?;
     for _ in 0..sec_count {
         let flavor = input.read_u32::<BigEndian>()?;
         if flavor == 1 {
-            // AUTH_SYS
             let _stamp = input.read_u32::<BigEndian>()?;
             let mut machine: Vec<u8> = Vec::new();
             machine.deserialize(input)?;
@@ -491,13 +632,11 @@ async fn op_create_session(
         clientid, seqid, flags
     );
 
-    // Verify client exists
     let client = handler
         .clients
         .get_client(clientid)
         .ok_or(Nfs4Status::StaleClientid)?;
 
-    // Get current expected sequence ID
     let expected_seqid = client.get_create_session_sequence();
 
     debug!(
@@ -505,9 +644,7 @@ async fn op_create_session(
         seqid, expected_seqid
     );
 
-    // Check for replay (seqid + 1 == expected means this is a replay of the last request)
     if seqid.wrapping_add(1) == expected_seqid {
-        // This is a replay - return cached response
         let cached = client.get_cached_create_session_response();
         if !cached.response.is_empty() {
             info!(
@@ -516,7 +653,6 @@ async fn op_create_session(
             );
             return Ok(cached.response);
         }
-        // No cached response, treat as SEQ_MISORDERED
         warn!(
             "CREATE_SESSION: replay detected but no cached response for client={}",
             clientid
@@ -524,7 +660,6 @@ async fn op_create_session(
         return Err(Nfs4Status::SeqMisordered.into());
     }
 
-    // Validate sequence ID matches expected
     if seqid != expected_seqid {
         warn!(
             "CREATE_SESSION: sequence mismatch for client={}, got={} expected={}",
@@ -533,28 +668,15 @@ async fn op_create_session(
         return Err(Nfs4Status::SeqMisordered.into());
     }
 
-    // Create session
     let session = handler.sessions.create_session(clientid)?;
 
-    // Confirm client
     handler.clients.confirm_client(clientid)?;
 
-    // Build response
     let mut result = Vec::new();
     session.sessionid.serialize(&mut result)?;
     seqid.serialize(&mut result)?;
     flags.serialize(&mut result)?;
 
-    // Fore channel attrs
-    0u32.serialize(&mut result)?; // headerpadsize
-    (1024 * 1024u32).serialize(&mut result)?; // maxrequestsize
-    (1024 * 1024u32).serialize(&mut result)?; // maxresponsesize
-    (64 * 1024u32).serialize(&mut result)?; // maxresponsesize_cached
-    64u32.serialize(&mut result)?; // maxoperations
-    session.slot_count().serialize(&mut result)?; // maxrequests
-    0u32.serialize(&mut result)?; // rdma_ird (empty)
-
-    // Back channel attrs (same as fore)
     0u32.serialize(&mut result)?;
     (1024 * 1024u32).serialize(&mut result)?;
     (1024 * 1024u32).serialize(&mut result)?;
@@ -563,10 +685,16 @@ async fn op_create_session(
     session.slot_count().serialize(&mut result)?;
     0u32.serialize(&mut result)?;
 
-    // Cache response for replay detection
+    0u32.serialize(&mut result)?;
+    (1024 * 1024u32).serialize(&mut result)?;
+    (1024 * 1024u32).serialize(&mut result)?;
+    (64 * 1024u32).serialize(&mut result)?;
+    64u32.serialize(&mut result)?;
+    session.slot_count().serialize(&mut result)?;
+    0u32.serialize(&mut result)?;
+
     client.cache_create_session_response(result.clone(), 0);
 
-    // Increment sequence ID for next CREATE_SESSION
     client.increment_create_session_sequence();
 
     info!(
@@ -597,7 +725,7 @@ async fn op_destroy_session(
 /// PUTROOTFH - set current FH to root
 fn op_putrootfh(ctx: &mut CompoundContext, handler: &CompoundHandler) -> Nfs4Result<Vec<u8>> {
     let fh = handler.fs.fileid_to_fh(handler.fs.root_fileid());
-    info!(
+    debug!(
         "PUTROOTFH: root_fileid={} fh_len={} fh_data={:02x?}",
         handler.fs.root_fileid(),
         fh.data.len(),
@@ -616,7 +744,6 @@ fn op_putfh(
     let mut fh = Nfs4FileHandle::default();
     fh.deserialize(input)?;
 
-    // Validate file handle
     handler.fs.fh_to_fileid(&fh)?;
 
     ctx.current_fh = Some(fh);
@@ -629,7 +756,7 @@ fn op_getfh(ctx: &CompoundContext, _handler: &CompoundHandler) -> Nfs4Result<Vec
 
     let mut result = Vec::new();
     fh.serialize(&mut result)?;
-    info!(
+    debug!(
         "GETFH: fh_data_len={} result_len={} fh_data={:02x?} result_hex={:02x?}",
         fh.data.len(),
         result.len(),
@@ -653,28 +780,20 @@ fn op_restorefh(ctx: &mut CompoundContext) -> Nfs4Result<Vec<u8>> {
 }
 
 /// GETATTR - get file attributes
-///
-/// # Architecture
-/// Delegates to ops::getattr::op_getattr() which mirrors NFS-Ganesha's nfs4_op_getattr.c
 async fn op_getattr(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::getattr::op_getattr(input, ctx, handler).await
 }
 
 /// LOOKUP - lookup name in directory
-///
-/// # Architecture
-/// Delegates to ops::lookup::op_lookup() which mirrors NFS-Ganesha's nfs4_op_lookup.c
 async fn op_lookup(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::lookup::op_lookup(input, ctx, handler).await
 }
 
@@ -691,41 +810,29 @@ async fn op_lookupp(ctx: &mut CompoundContext, handler: &CompoundHandler) -> Nfs
 }
 
 /// READ - read file data
-///
-/// # Architecture
-/// Delegates to ops::read::op_read() which mirrors NFS-Ganesha's nfs4_op_read.c
 async fn op_read(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::read::op_read(input, ctx, handler).await
 }
 
 /// WRITE - write file data
-///
-/// # Architecture
-/// Delegates to ops::write::op_write() which mirrors NFS-Ganesha's nfs4_op_write.c
 async fn op_write(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::write::op_write(input, ctx, handler).await
 }
 
 /// READDIR - read directory entries
-///
-/// # Architecture
-/// Delegates to ops::readdir::op_readdir() which mirrors NFS-Ganesha's nfs4_op_readdir.c
 async fn op_readdir(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::readdir::op_readdir(input, ctx, handler).await
 }
 
@@ -823,14 +930,12 @@ pub fn encode_fattr4(
     let mut attr_vals = Vec::new();
     let mut result_mask = vec![0u32; request.len().max(2)];
 
-    // Helper to check if attribute is requested
     let is_requested = |bit: u32| -> bool {
         let word = (bit / 32) as usize;
         let bit_in_word = bit % 32;
         word < request.len() && (request[word] & (1 << bit_in_word)) != 0
     };
 
-    // Helper to set result bit
     let set_result = |mask: &mut Vec<u32>, bit: u32| {
         let word = (bit / 32) as usize;
         let bit_in_word = bit % 32;
@@ -839,7 +944,6 @@ pub fn encode_fattr4(
         }
     };
 
-    // Encode Word 0 attributes in bit order (0-31)
     encode_word0_attrs(
         attrs,
         fh,
@@ -849,7 +953,6 @@ pub fn encode_fattr4(
         &mut result_mask,
     )?;
 
-    // Encode Word 1 attributes in bit order (32-63)
     encode_word1_attrs(
         attrs,
         &is_requested,
@@ -889,142 +992,113 @@ where
     F: Fn(u32) -> bool,
     S: Fn(&mut Vec<u32>, u32),
 {
-    // bit 0: SUPPORTED_ATTRS
     if is_requested(FATTR4_SUPPORTED_ATTRS) {
         encode_supported_attrs(vals)?;
         set_result(mask, FATTR4_SUPPORTED_ATTRS);
     }
-    // bit 1: TYPE
     if is_requested(FATTR4_TYPE) {
         (attrs.file_type as u32).serialize(vals)?;
         set_result(mask, FATTR4_TYPE);
     }
-    // bit 2: FH_EXPIRE_TYPE
     if is_requested(FATTR4_FH_EXPIRE_TYPE) {
-        0u32.serialize(vals)?; // FH4_PERSISTENT
+        0u32.serialize(vals)?;
         set_result(mask, FATTR4_FH_EXPIRE_TYPE);
     }
-    // bit 3: CHANGE
     if is_requested(FATTR4_CHANGE) {
         let change_val = attrs.mtime.to_millis() as u64;
         change_val.serialize(vals)?;
         set_result(mask, FATTR4_CHANGE);
     }
-    // bit 4: SIZE
     if is_requested(FATTR4_SIZE) {
         attrs.size.serialize(vals)?;
         set_result(mask, FATTR4_SIZE);
     }
-    // bit 5: LINK_SUPPORT
     if is_requested(FATTR4_LINK_SUPPORT) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_LINK_SUPPORT);
     }
-    // bit 6: SYMLINK_SUPPORT
     if is_requested(FATTR4_SYMLINK_SUPPORT) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_SYMLINK_SUPPORT);
     }
-    // bit 7: NAMED_ATTR
     if is_requested(FATTR4_NAMED_ATTR) {
         false.serialize(vals)?;
         set_result(mask, FATTR4_NAMED_ATTR);
     }
-    // bit 8: FSID
     if is_requested(FATTR4_FSID) {
         encode_fsid(vals)?;
         set_result(mask, FATTR4_FSID);
     }
-    // bit 9: UNIQUE_HANDLES
     if is_requested(FATTR4_UNIQUE_HANDLES) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_UNIQUE_HANDLES);
     }
-    // bit 10: LEASE_TIME
     if is_requested(FATTR4_LEASE_TIME) {
         90u32.serialize(vals)?;
         set_result(mask, FATTR4_LEASE_TIME);
     }
-    // bit 13: ACLSUPPORT
     if is_requested(FATTR4_ACLSUPPORT) {
-        // ACL4_SUPPORT_ALLOW_ACL (0x00000001) | ACL4_SUPPORT_DENY_ACL (0x00000002)
-        // Indicate basic ACL support to satisfy macOS NFS client requirements
         3u32.serialize(vals)?;
         set_result(mask, FATTR4_ACLSUPPORT);
     }
-    // bit 15: CANSETTIME
     if is_requested(FATTR4_CANSETTIME) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_CANSETTIME);
     }
-    // bit 16: CASE_INSENSITIVE
     if is_requested(FATTR4_CASE_INSENSITIVE) {
         false.serialize(vals)?;
         set_result(mask, FATTR4_CASE_INSENSITIVE);
     }
-    // bit 17: CASE_PRESERVING
     if is_requested(FATTR4_CASE_PRESERVING) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_CASE_PRESERVING);
     }
-    // bit 18: CHOWN_RESTRICTED
     if is_requested(FATTR4_CHOWN_RESTRICTED) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_CHOWN_RESTRICTED);
     }
-    // bit 19: FILEHANDLE
     if is_requested(FATTR4_FILEHANDLE) {
         if let Some(handle) = fh {
             handle.serialize(vals)?;
             set_result(mask, FATTR4_FILEHANDLE);
         }
     }
-    // bit 20: FILEID
     if is_requested(FATTR4_FILEID) {
         attrs.fileid.serialize(vals)?;
         set_result(mask, FATTR4_FILEID);
     }
-    // bit 21: FILES_AVAIL
     if is_requested(FATTR4_FILES_AVAIL) {
         (u64::MAX / 2).serialize(vals)?;
         set_result(mask, FATTR4_FILES_AVAIL);
     }
-    // bit 22: FILES_FREE
     if is_requested(FATTR4_FILES_FREE) {
         (u64::MAX / 2).serialize(vals)?;
         set_result(mask, FATTR4_FILES_FREE);
     }
-    // bit 23: FILES_TOTAL
     if is_requested(FATTR4_FILES_TOTAL) {
         u64::MAX.serialize(vals)?;
         set_result(mask, FATTR4_FILES_TOTAL);
     }
-    // bit 26: HOMOGENEOUS
     if is_requested(FATTR4_HOMOGENEOUS) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_HOMOGENEOUS);
     }
-    // bit 27: MAXFILESIZE
     if is_requested(FATTR4_MAXFILESIZE) {
         (i64::MAX as u64).serialize(vals)?;
         set_result(mask, FATTR4_MAXFILESIZE);
     }
-    // bit 28: MAXLINK
     if is_requested(FATTR4_MAXLINK) {
         u32::MAX.serialize(vals)?;
         set_result(mask, FATTR4_MAXLINK);
     }
-    // bit 29: MAXNAME
     if is_requested(FATTR4_MAXNAME) {
         255u32.serialize(vals)?;
         set_result(mask, FATTR4_MAXNAME);
     }
-    // bit 30: MAXREAD
     if is_requested(FATTR4_MAXREAD) {
         (1024 * 1024u64).serialize(vals)?;
         set_result(mask, FATTR4_MAXREAD);
     }
-    // bit 31: MAXWRITE
     if is_requested(FATTR4_MAXWRITE) {
         (1024 * 1024u64).serialize(vals)?;
         set_result(mask, FATTR4_MAXWRITE);
@@ -1044,22 +1118,18 @@ where
     F: Fn(u32) -> bool,
     S: Fn(&mut Vec<u32>, u32),
 {
-    // bit 33: MODE
     if is_requested(FATTR4_MODE) {
         attrs.mode.serialize(vals)?;
         set_result(mask, FATTR4_MODE);
     }
-    // bit 34: NO_TRUNC
     if is_requested(FATTR4_NO_TRUNC) {
         true.serialize(vals)?;
         set_result(mask, FATTR4_NO_TRUNC);
     }
-    // bit 35: NUMLINKS
     if is_requested(FATTR4_NUMLINKS) {
         attrs.nlink.serialize(vals)?;
         set_result(mask, FATTR4_NUMLINKS);
     }
-    // bit 36: OWNER
     if is_requested(FATTR4_OWNER) {
         let owner = if attrs.owner.is_empty() {
             "nobody"
@@ -1069,7 +1139,6 @@ where
         owner.as_bytes().to_vec().serialize(vals)?;
         set_result(mask, FATTR4_OWNER);
     }
-    // bit 37: OWNER_GROUP
     if is_requested(FATTR4_OWNER_GROUP) {
         let group = if attrs.group.is_empty() {
             "nobody"
@@ -1079,55 +1148,44 @@ where
         group.as_bytes().to_vec().serialize(vals)?;
         set_result(mask, FATTR4_OWNER_GROUP);
     }
-    // bit 41: RAWDEV
     if is_requested(FATTR4_RAWDEV) {
-        0u32.serialize(vals)?; // specdata1
-        0u32.serialize(vals)?; // specdata2
+        0u32.serialize(vals)?;
+        0u32.serialize(vals)?;
         set_result(mask, FATTR4_RAWDEV);
     }
-    // bit 42: SPACE_AVAIL
     if is_requested(FATTR4_SPACE_AVAIL) {
-        (1024u64 * 1024 * 1024 * 1024).serialize(vals)?; // 1TB
+        (1024u64 * 1024 * 1024 * 1024).serialize(vals)?;
         set_result(mask, FATTR4_SPACE_AVAIL);
     }
-    // bit 43: SPACE_FREE
     if is_requested(FATTR4_SPACE_FREE) {
-        (1024u64 * 1024 * 1024 * 1024).serialize(vals)?; // 1TB
+        (1024u64 * 1024 * 1024 * 1024).serialize(vals)?;
         set_result(mask, FATTR4_SPACE_FREE);
     }
-    // bit 44: SPACE_TOTAL
     if is_requested(FATTR4_SPACE_TOTAL) {
-        (10u64 * 1024 * 1024 * 1024 * 1024).serialize(vals)?; // 10TB
+        (10u64 * 1024 * 1024 * 1024 * 1024).serialize(vals)?;
         set_result(mask, FATTR4_SPACE_TOTAL);
     }
-    // bit 45: SPACE_USED
     if is_requested(FATTR4_SPACE_USED) {
         attrs.used.serialize(vals)?;
         set_result(mask, FATTR4_SPACE_USED);
     }
-    // bit 47: TIME_ACCESS
     if is_requested(FATTR4_TIME_ACCESS) {
         attrs.atime.serialize(vals)?;
         set_result(mask, FATTR4_TIME_ACCESS);
     }
-    // bit 51: TIME_DELTA
     if is_requested(FATTR4_TIME_DELTA) {
-        // nfstime4: 1 second resolution
-        0i64.serialize(vals)?; // seconds
-        1u32.serialize(vals)?; // nseconds (1 nanosecond resolution)
+        0i64.serialize(vals)?;
+        1u32.serialize(vals)?;
         set_result(mask, FATTR4_TIME_DELTA);
     }
-    // bit 52: TIME_METADATA
     if is_requested(FATTR4_TIME_METADATA) {
         attrs.ctime.serialize(vals)?;
         set_result(mask, FATTR4_TIME_METADATA);
     }
-    // bit 53: TIME_MODIFY
     if is_requested(FATTR4_TIME_MODIFY) {
         attrs.mtime.serialize(vals)?;
         set_result(mask, FATTR4_TIME_MODIFY);
     }
-    // bit 55: MOUNTED_ON_FILEID
     if is_requested(FATTR4_MOUNTED_ON_FILEID) {
         attrs.fileid.serialize(vals)?;
         set_result(mask, FATTR4_MOUNTED_ON_FILEID);
@@ -1137,7 +1195,6 @@ where
 
 /// Encode supported attributes bitmap
 fn encode_supported_attrs(output: &mut Vec<u8>) -> Nfs4Result<()> {
-    // Return bitmap of all supported attributes
     let supported: Vec<u32> = vec![
         // Word 0: bits 0-31
         (1 << FATTR4_SUPPORTED_ATTRS)
@@ -1190,9 +1247,8 @@ fn encode_supported_attrs(output: &mut Vec<u8>) -> Nfs4Result<()> {
 
 /// Encode fsid (filesystem identifier)
 fn encode_fsid(output: &mut Vec<u8>) -> Nfs4Result<()> {
-    // fsid4: major (u64), minor (u64)
-    1u64.serialize(output)?; // major
-    0u64.serialize(output)?; // minor
+    1u64.serialize(output)?;
+    0u64.serialize(output)?;
     Ok(())
 }
 
@@ -1201,83 +1257,56 @@ fn encode_fsid(output: &mut Vec<u8>) -> Nfs4Result<()> {
 // ============================================================================
 
 /// OPEN - open a file (creates Reader/Writer)
-///
-/// This is the key difference from NFSv3:
-/// - NFSv3: READ/WRITE directly, io_cache manages Reader/Writer
-/// - NFSv4.1: OPEN first, Reader/Writer bound to OpenState
-/// OPEN - open a file
-///
-/// # Architecture
-/// Delegates to ops::open::op_open() which mirrors NFS-Ganesha's nfs4_op_open.c
 async fn op_open(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::open::op_open(input, ctx, handler).await
 }
 
 /// CLOSE - close a file
-///
-/// # Architecture
-/// Delegates to ops::close::op_close() which mirrors NFS-Ganesha's nfs4_op_close.c
 async fn op_close(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::close::op_close(input, ctx, handler).await
 }
 
-/// COMMIT - commit written data to stable storage
 /// COMMIT - commit written data to stable storage
 async fn op_commit(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops::commit module (NFS-Ganesha aligned)
     crate::nfs4::ops::commit::op_commit(input, ctx, handler).await
 }
 
 /// CREATE - create a non-regular file (directory, symlink, etc.)
-///
-/// # Architecture
-/// Delegates to ops::create::op_create() which mirrors NFS-Ganesha's nfs4_op_create.c
 async fn op_create(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::create::op_create(input, ctx, handler).await
 }
 
 /// REMOVE - remove a file or directory
-///
-/// # Architecture
-/// Delegates to ops::remove::op_remove() which mirrors NFS-Ganesha's nfs4_op_remove.c
 async fn op_remove(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::remove::op_remove(input, ctx, handler).await
 }
 
 /// RENAME - rename a file or directory
-///
-/// # Architecture
-/// Delegates to ops::rename::op_rename() which mirrors NFS-Ganesha's nfs4_op_rename.c
 async fn op_rename(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::rename::op_rename(input, ctx, handler).await
 }
 
@@ -1287,21 +1316,18 @@ async fn op_link(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read newname (the name for the hard link in current directory)
     let mut newname: Vec<u8> = Vec::new();
     newname.deserialize(input)?;
     let newname_str = String::from_utf8_lossy(&newname).to_string();
 
     debug!("LINK: newname={}", newname_str);
 
-    // Source file is saved FH, target directory is current FH
     let src_fh = ctx.saved_fh.as_ref().ok_or(Nfs4Status::Nofilehandle)?;
     let src_fileid = handler.fs.fh_to_fileid(src_fh)?;
 
     let dst_fh = ctx.require_current_fh()?;
     let dst_parent = handler.fs.fh_to_fileid(dst_fh)?;
 
-    // Create hard link
     handler
         .fs
         .link(src_fileid, dst_parent, &newname_str)
@@ -1312,11 +1338,10 @@ async fn op_link(
         newname_str, dst_parent, src_fileid
     );
 
-    // Build response - change_info4
     let mut result = Vec::new();
-    true.serialize(&mut result)?; // atomic
-    0u64.serialize(&mut result)?; // before
-    1u64.serialize(&mut result)?; // after
+    true.serialize(&mut result)?;
+    0u64.serialize(&mut result)?;
+    1u64.serialize(&mut result)?;
 
     Ok(result)
 }
@@ -1330,7 +1355,6 @@ async fn op_readlink(ctx: &CompoundContext, handler: &CompoundHandler) -> Nfs4Re
 
     debug!("READLINK: fileid={} -> {}", fileid, target);
 
-    // Build response
     let mut result = Vec::new();
     target.as_bytes().to_vec().serialize(&mut result)?;
 
@@ -1367,23 +1391,18 @@ async fn op_setclientid(
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read client verifier (8 bytes)
     let mut verifier: [u8; 8] = [0; 8];
     input.read_exact(&mut verifier)?;
 
-    // Read client id (nfs_client_id4)
     let mut client_id: Vec<u8> = Vec::new();
     client_id.deserialize(input)?;
 
-    // Read callback info (cb_client4)
     let cb_program = input.read_u32::<BigEndian>()?;
-    // Read netid and addr
     let mut netid: Vec<u8> = Vec::new();
     netid.deserialize(input)?;
     let mut addr: Vec<u8> = Vec::new();
     addr.deserialize(input)?;
 
-    // Read callback_ident
     let callback_ident = input.read_u32::<BigEndian>()?;
 
     info!(
@@ -1396,7 +1415,6 @@ async fn op_setclientid(
         callback_ident
     );
 
-    // Handle NFSv4.0 SETCLIENTID logic (based on RFC 3530 and NFS-Ganesha)
     let (clientid, confirm_verifier) = handle_setclientid_v40(
         &client_id,
         &verifier,
@@ -1407,7 +1425,6 @@ async fn op_setclientid(
         handler,
     )?;
 
-    // Store clientid in context for subsequent operations
     ctx.clientid = Some(clientid);
 
     info!(
@@ -1416,7 +1433,6 @@ async fn op_setclientid(
         &confirm_verifier[..4]
     );
 
-    // Build response: clientid + setclientid_confirm verifier
     let mut result = Vec::new();
     clientid.serialize(&mut result)?;
     result.extend_from_slice(&confirm_verifier);
@@ -1436,13 +1452,11 @@ fn handle_setclientid_v40(
     _callback_ident: u32,
     handler: &CompoundHandler,
 ) -> Nfs4Result<(Clientid4, [u8; 8])> {
-    // Create client owner for lookup
     let client_owner = ClientOwner4 {
         co_verifier: *verifier,
         co_ownerid: client_id.to_vec(),
     };
 
-    // Check if we already have a client with this owner ID
     if let Some(existing_clientid) = handler
         .clients
         .find_client_by_owner(&client_owner.co_ownerid)
@@ -1452,13 +1466,11 @@ fn handle_setclientid_v40(
             .get_client(existing_clientid)
             .ok_or(Nfs4Status::Serverfault)?;
 
-        // Check if verifier matches (CASE 2: update callback info)
         if existing_client.owner.co_verifier == *verifier && existing_client.is_confirmed() {
             info!(
                 "NFSv4.0 SETCLIENTID: CASE 2 - Update callback for existing confirmed client {}",
                 existing_clientid
             );
-            // Generate new confirm verifier but keep same clientid
             let mut confirm_verifier = [0u8; 8];
             use std::time::{SystemTime, UNIX_EPOCH};
             let timestamp = SystemTime::now()
@@ -1470,17 +1482,13 @@ fn handle_setclientid_v40(
             return Ok((existing_clientid, confirm_verifier));
         } else {
             info!("NFSv4.0 SETCLIENTID: CASE 3/4 - Different verifier, creating new client");
-            // Different verifier, create new client (CASE 3/4)
         }
     }
 
-    // CASE 5: New client or replacing existing unconfirmed client
     info!("NFSv4.0 SETCLIENTID: CASE 5 - New client registration");
 
-    // Register new client (reuse v4.1 logic but mark as unconfirmed)
     let (clientid, _seqid, _flags) = handler.clients.exchange_id(client_owner)?;
 
-    // Generate confirm verifier
     let mut confirm_verifier = [0u8; 8];
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
@@ -1514,7 +1522,6 @@ async fn op_setclientid_confirm(
         &verifier[..4]
     );
 
-    // Verify client exists
     let client = handler.clients.get_client(clientid).ok_or_else(|| {
         error!("SETCLIENTID_CONFIRM: client {} not found", clientid);
         Nfs4Status::StaleClientid
@@ -1526,13 +1533,8 @@ async fn op_setclientid_confirm(
         client.is_confirmed()
     );
 
-    // In a full implementation, we would verify the confirm verifier matches
-    // what we sent in SETCLIENTID response. For now, we'll accept any verifier.
-
-    // Confirm client (equivalent to CREATE_SESSION in v4.1)
     handler.clients.confirm_client(clientid)?;
 
-    // Store clientid in context for subsequent operations
     ctx.clientid = Some(clientid);
 
     info!(
@@ -1540,7 +1542,6 @@ async fn op_setclientid_confirm(
         clientid
     );
 
-    // No response data for SETCLIENTID_CONFIRM
     Ok(Vec::new())
 }
 
@@ -1554,16 +1555,16 @@ async fn op_renew(
 
     debug!("RENEW: clientid={}", clientid);
 
-    // Renew lease
     handler.clients.renew_lease(clientid)?;
 
-    // Store clientid in context
     ctx.clientid = Some(clientid);
 
     Ok(Vec::new())
 }
 
-/// OPEN_CONFIRM - NFSv4.0 open confirmation (not needed in NFSv4.1)
+// OPEN_CONFIRM - NFSv4.0 open confirmation (not needed in NFSv4.1)
+// Implementation is in ops/open_confirm.rs
+
 // ============================================================================
 // Common Operations (NFSv4.0 and NFSv4.1)
 // ============================================================================
@@ -1584,26 +1585,20 @@ const ACCESS4_DELETE: u32 = 0x0010;
 const ACCESS4_EXECUTE: u32 = 0x0020;
 
 /// ACCESS - check access permissions
-/// ACCESS - check access permissions
 async fn op_access(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops::access module (NFS-Ganesha aligned)
     crate::nfs4::ops::access::op_access(input, ctx, handler).await
 }
 
 /// SETATTR - set file attributes
-///
-/// # Architecture
-/// Delegates to ops::setattr::op_setattr() which mirrors NFS-Ganesha's nfs4_op_setattr.c
 async fn op_setattr(
     input: &mut impl Read,
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Delegate to ops module (mirrors NFS-Ganesha structure)
     crate::nfs4::ops::setattr::op_setattr(input, ctx, handler).await
 }
 
@@ -1613,7 +1608,6 @@ async fn op_secinfo(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read the name to query security info for
     let mut name: Vec<u8> = Vec::new();
     name.deserialize(input)?;
 
@@ -1625,7 +1619,6 @@ async fn op_secinfo(
         ctx.current_fh.is_some()
     );
 
-    // Verify we have a current filehandle (should be a directory)
     let fh = ctx.require_current_fh()?;
     let parent_id = handler.fs.fh_to_fileid(fh)?;
 
@@ -1634,7 +1627,6 @@ async fn op_secinfo(
         parent_id, name_str
     );
 
-    // Try to lookup the file to verify it exists (optional check)
     match handler.fs.lookup(parent_id, &name_str).await {
         Ok((fileid, _status)) => {
             info!("SECINFO: found file {} for security query", fileid);
@@ -1644,25 +1636,14 @@ async fn op_secinfo(
                 "SECINFO: file '{}' not found: {:?}, continuing anyway",
                 name_str, e
             );
-            // Continue anyway - SECINFO can be called for non-existent files
         }
     }
 
-    // For simplicity, we support only AUTH_SYS (RPC_AUTH_UNIX)
-    // This is the most basic security mechanism that most clients expect
     let mut result = Vec::new();
 
-    // Return array of secinfo4 structures
-    // Array length = 1 (only AUTH_SYS)
     1u32.serialize(&mut result)?;
 
-    // secinfo4 structure:
-    // - flavor: RPC_AUTH_UNIX (1)
-    // - flavor_info: union based on flavor
-    1u32.serialize(&mut result)?; // RPC_AUTH_UNIX
-
-    // For AUTH_SYS, flavor_info is empty (no additional data needed)
-    // The union discriminant is the flavor itself, no additional data
+    1u32.serialize(&mut result)?;
 
     info!(
         "SECINFO: returning AUTH_SYS support for '{}', result_len={}",
@@ -1679,7 +1660,6 @@ async fn op_nverify(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read fattr4 to compare
     let mut fattr = Fattr4::default();
     fattr.deserialize(input)?;
 
@@ -1688,20 +1668,15 @@ async fn op_nverify(
 
     debug!("NVERIFY: fileid={} checking attributes", fileid);
 
-    // Get current file status
     let status = handler.fs.get_status_cached(fileid).await?;
     let current_attrs = FileAttrs::from_status(&status);
 
-    // Compare attributes - if they match, return NFS4ERR_SAME
-    // If they don't match, return NFS4_OK (success for NVERIFY)
     let attrs_match = compare_fattr4(&fattr, &current_attrs);
 
     if attrs_match {
-        // Attributes are the same - NVERIFY fails
         return Err(Nfs4Status::Same.into());
     }
 
-    // Attributes are different - NVERIFY succeeds
     Ok(Vec::new())
 }
 
@@ -1711,7 +1686,6 @@ async fn op_verify(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read fattr4 to compare
     let mut fattr = Fattr4::default();
     fattr.deserialize(input)?;
 
@@ -1720,35 +1694,25 @@ async fn op_verify(
 
     debug!("VERIFY: fileid={} checking attributes", fileid);
 
-    // Get current file status
     let status = handler.fs.get_status_cached(fileid).await?;
     let current_attrs = FileAttrs::from_status(&status);
 
-    // Compare attributes - if they don't match, return NFS4ERR_NOT_SAME
-    // If they match, return NFS4_OK (success for VERIFY)
     let attrs_match = compare_fattr4(&fattr, &current_attrs);
 
     if !attrs_match {
-        // Attributes are different - VERIFY fails
         return Err(Nfs4Status::NotSame.into());
     }
 
-    // Attributes are the same - VERIFY succeeds
     Ok(Vec::new())
 }
 
 /// Compare fattr4 with current file attributes (simplified comparison)
 fn compare_fattr4(fattr: &Fattr4, _current: &FileAttrs) -> bool {
-    // Simplified comparison - check size and mtime if present in bitmap
-    // In production, should compare all requested attributes
     if fattr.attrmask.is_empty() {
         return true;
     }
 
-    // For now, just check if the change attribute matches
-    // This is the most commonly used attribute for cache validation
-    // A full implementation would decode fattr.attr_vals and compare each attribute
-    true // Simplified: assume match for now
+    true
 }
 
 /// LOCK - request a byte-range lock
@@ -1759,32 +1723,23 @@ async fn op_lock(
 ) -> Nfs4Result<Vec<u8>> {
     use crate::nfs4::state::lock::LockType4;
 
-    // Read LOCK4args
     let locktype = input.read_u32::<BigEndian>()?;
     let reclaim = input.read_u32::<BigEndian>()? != 0;
     let offset = input.read_u64::<BigEndian>()?;
     let length = input.read_u64::<BigEndian>()?;
     let locker_type = input.read_u32::<BigEndian>()?;
 
-    // Smart grace period check (following NFS-Ganesha):
-    // - reclaim=true: requires grace period (want_grace=true)
-    // - reclaim=false: requires NO grace period (want_grace=false)
-    // Only check for NEW lock creation, not for existing locks
     let want_grace = reclaim;
-    let need_check = locker_type == 1 || reclaim; // new_lock_owner or reclaim
+    let need_check = locker_type == 1 || reclaim;
 
-    // Acquire grace status with RAII guard (NFS-Ganesha compatible)
-    // The guard automatically releases the reference when dropped
     let _grace_guard = if need_check {
         Some(handler.grace.acquire_grace_status(want_grace)?)
     } else {
         None
     };
 
-    // Read locker union based on type
     let (new_lock_owner, open_stateid, existing_lock_stateid, lock_seqid, lock_owner) =
         if locker_type == 1 {
-            // new_lock_owner - open_to_lock_owner4
             let _open_seqid = input.read_u32::<BigEndian>()?;
             let mut open_stateid = Stateid4::default();
             open_stateid.deserialize(input)?;
@@ -1800,12 +1755,10 @@ async fn op_lock(
 
             (true, Some(open_stateid), None, lock_seqid, lock_owner)
         } else {
-            // existing_lock_owner - exist_lock_owner4
             let mut lock_stateid = Stateid4::default();
             lock_stateid.deserialize(input)?;
             let lock_seqid = input.read_u32::<BigEndian>()?;
 
-            // Get lock owner from existing lock state
             let lock_state = handler
                 .locks
                 .get_lock_state(&lock_stateid)
@@ -1823,7 +1776,6 @@ async fn op_lock(
     let fh = ctx.require_current_fh()?;
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
-    // Convert lock type
     let lock_type = LockType4::from(locktype);
     let blocking = lock_type.is_blocking();
 
@@ -1832,42 +1784,34 @@ async fn op_lock(
         fileid, lock_type, reclaim, offset, length, lock_seqid, blocking
     );
 
-    // Validate lock parameters
     if length == 0 {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Check for range overflow (offset + length > 2^64-1)
     if length != u64::MAX && offset.checked_add(length).is_none() {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // If new lock owner, verify open stateid
     if new_lock_owner {
         if let Some(ref open_stateid) = open_stateid {
             let open_state = handler.opens.verify_stateid(open_stateid)?;
 
-            // Check if open state allows the lock type
             let share_access = open_state.get_access();
             if lock_type.is_write() && (share_access & 0x02) == 0 {
-                // WRITE lock requires OPEN4_SHARE_ACCESS_WRITE
                 return Err(Nfs4Status::Openmode.into());
             }
             if !lock_type.is_write() && (share_access & 0x01) == 0 {
-                // READ lock requires OPEN4_SHARE_ACCESS_READ
                 return Err(Nfs4Status::Openmode.into());
             }
         }
     }
 
-    // Determine which stateid to use for lock operation
     let existing_stateid = if new_lock_owner {
         None
     } else {
         existing_lock_stateid.as_ref()
     };
 
-    // Try to acquire the lock
     let lock_stateid = handler.locks.lock(
         lock_owner.clientid,
         lock_owner.owner.clone(),
@@ -1887,7 +1831,6 @@ async fn op_lock(
         length
     );
 
-    // Build response - LOCK4resok
     let mut result = Vec::new();
     lock_stateid.serialize(&mut result)?;
 
@@ -1902,7 +1845,6 @@ async fn op_lockt(
 ) -> Nfs4Result<Vec<u8>> {
     use crate::nfs4::state::lock::LockType4;
 
-    // Read LOCKT4args
     let locktype = input.read_u32::<BigEndian>()?;
     let offset = input.read_u64::<BigEndian>()?;
     let length = input.read_u64::<BigEndian>()?;
@@ -1920,29 +1862,24 @@ async fn op_lockt(
         fileid, lock_type, offset, length
     );
 
-    // Validate lock parameters
     if length == 0 {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Check for range overflow
     if length != u64::MAX && offset.checked_add(length).is_none() {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Create lock owner
     let lock_owner = LockOwner4 {
         clientid: owner_clientid,
         owner: owner_data,
     };
 
-    // Test for conflicts
     if let Some(conflict_state) =
         handler
             .locks
             .test_lock(fileid, lock_type, offset, length, &lock_owner)
     {
-        // Find the specific conflicting entry on this file
         let entries = conflict_state.lock_entries.read().unwrap();
         let conflict_entry = entries
             .iter()
@@ -1957,30 +1894,23 @@ async fn op_lockt(
             conflict_offset, conflict_length, conflict_entry.lock_type
         );
 
-        // Build LOCK4denied response
         let mut result = Vec::new();
 
-        // offset
         conflict_offset.serialize(&mut result)?;
-        // length
         conflict_length.serialize(&mut result)?;
-        // locktype
         let denied_type = if conflict_entry.lock_type.is_write() {
             2u32
         } else {
             1u32
         };
         denied_type.serialize(&mut result)?;
-        // owner (LockOwner4 structure)
         conflict_state.owner.serialize(&mut result)?;
 
-        // Return NFS4ERR_DENIED with conflict info
         return Err(Nfs4Error::with_data(Nfs4Status::Denied, result));
     }
 
     info!("LOCKT: no conflicts found");
 
-    // No conflicts - return success with empty response
     Ok(Vec::new())
 }
 
@@ -1992,7 +1922,6 @@ async fn op_locku(
 ) -> Nfs4Result<Vec<u8>> {
     use crate::nfs4::state::lock::LockType4;
 
-    // Read LOCKU4args
     let locktype = input.read_u32::<BigEndian>()?;
     let seqid = input.read_u32::<BigEndian>()?;
     let mut lock_stateid = Stateid4::default();
@@ -2015,24 +1944,19 @@ async fn op_locku(
         length
     );
 
-    // Validate lock parameters
     if length == 0 {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Check for range overflow
     if length != u64::MAX && offset.checked_add(length).is_none() {
         return Err(Nfs4Status::Inval.into());
     }
 
-    // Verify lock state exists
     let lock_state = handler
         .locks
         .get_lock_state(&lock_stateid)
         .ok_or(Nfs4Status::BadStateid)?;
 
-    // Verify the unlock request is for the correct file
-    // (check if any entry in this state is for this file)
     let entries = lock_state.lock_entries.read().unwrap();
     let has_file_lock = entries.iter().any(|e| e.fileid == fileid);
     drop(entries);
@@ -2041,8 +1965,6 @@ async fn op_locku(
         return Err(Nfs4Status::BadStateid.into());
     }
 
-    // Release the lock (supports partial unlock)
-    // This returns updated stateid with incremented seqid
     let new_stateid = handler.locks.unlock(&lock_stateid, offset, length)?;
 
     info!(
@@ -2050,7 +1972,6 @@ async fn op_locku(
         fileid, offset, length, new_stateid.seqid
     );
 
-    // Return updated stateid
     let mut result = Vec::new();
     new_stateid.serialize(&mut result)?;
 
@@ -2063,47 +1984,27 @@ async fn op_release_lockowner(
     _ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Read lock_owner4
     let clientid = input.read_u64::<BigEndian>()?;
     let mut owner_data: Vec<u8> = Vec::new();
     owner_data.deserialize(input)?;
 
-    tracing::info!(
-        "RELEASE_LOCKOWNER: clientid={}, owner={:?}",
-        clientid,
-        String::from_utf8_lossy(&owner_data)
-    );
-
-    // Verify client exists
     handler
         .clients
         .get_client(clientid)
         .ok_or(Nfs4Status::StaleClientid)?;
 
-    // Create lock owner
     let lock_owner = LockOwner4 {
         clientid,
         owner: owner_data,
     };
 
-    // Release all locks held by this lock owner
     handler.locks.release_all_for_owner(&lock_owner);
-
-    tracing::info!("RELEASE_LOCKOWNER: completed for clientid={}", clientid);
     Ok(Vec::new())
 }
 
 /// PUTPUBFH - set current filehandle to public filehandle
-///
-/// Per RFC 7530/RFC 8881, PUTPUBFH sets the current filehandle to the
-/// public filehandle. In most implementations (including NFS-Ganesha),
-/// this is equivalent to PUTROOTFH since there's no separate public
-/// namespace.
 fn op_putpubfh(ctx: &mut CompoundContext, handler: &CompoundHandler) -> Nfs4Result<Vec<u8>> {
-    // PUTPUBFH is functionally equivalent to PUTROOTFH
-    // Set current filehandle to root
     let root_fh = handler.fs.fileid_to_fh(handler.fs.root_fileid());
     ctx.current_fh = Some(root_fh);
     Ok(Vec::new())
 }
-

@@ -190,17 +190,11 @@ impl StatePersistenceManager {
         });
 
         // Build instance-specific paths (like NFS-Ganesha: recov_root/recov_dir/node{id})
-        let state_dir = format!("{}/{}", STATE_BASE_DIR, instance_id);
-        let clients_dir = format!("{}/clients", state_dir);
-        let opens_dir = format!("{}/opens", state_dir);
-        let locks_dir = format!("{}/locks", state_dir);
-        let recovery_meta = format!("{}/recovery.meta", state_dir);
-
-        tracing::info!(
-            "State persistence initialized for instance '{}' at {}",
-            instance_id,
-            state_dir
-        );
+        let state_dir = format!("{STATE_BASE_DIR}/{instance_id}");
+        let clients_dir = format!("{state_dir}/clients");
+        let opens_dir = format!("{state_dir}/opens");
+        let locks_dir = format!("{state_dir}/locks");
+        let recovery_meta = format!("{state_dir}/recovery.meta");
 
         Self {
             fs,
@@ -248,7 +242,7 @@ impl StatePersistenceManager {
         }
 
         info!(
-            "Initializing NFSv4 state persistence for instance '{}'",
+            "    Initializing state persistence (instance: '{}')...",
             self.instance_id
         );
 
@@ -259,7 +253,7 @@ impl StatePersistenceManager {
         self.create_state_dir(&self.locks_dir).await?;
 
         info!(
-            "NFSv4 state persistence initialized at {} (save interval: {}s)",
+            "    ✓ State persistence initialized at {} (save interval: {}s)",
             self.state_dir,
             self.config.save_interval_ms / 1000
         );
@@ -281,7 +275,7 @@ impl StatePersistenceManager {
             Nfs4Status::Serverfault
         })?;
 
-        info!("Created state directory: {}", path);
+        debug!("Created state directory: {}", path);
         Ok(())
     }
 
@@ -300,8 +294,6 @@ impl StatePersistenceManager {
             return Ok(Vec::new());
         }
 
-        info!("Loading persisted client states from {}", self.clients_dir);
-
         let files = match self.list_dir(&self.clients_dir).await {
             Ok(f) => f,
             Err(_) => {
@@ -311,6 +303,7 @@ impl StatePersistenceManager {
         };
 
         let mut clients = Vec::new();
+        let mut errors = 0;
         for filename in files {
             if !filename.ends_with(".json") {
                 continue;
@@ -324,16 +317,21 @@ impl StatePersistenceManager {
                         clients.push(client);
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize client from {}: {}", path, e);
+                        errors += 1;
+                        warn!("Failed to deserialize client from {}: {}", filename, e);
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to read client state file {}: {:?}", path, e);
+                    errors += 1;
+                    warn!("Failed to read client state file {}: {:?}", filename, e);
                 }
             }
         }
 
-        info!("Loaded {} client states", clients.len());
+        if errors > 0 {
+            warn!("    ⚠ {} client state file(s) failed to load", errors);
+        }
+
         Ok(clients)
     }
 
@@ -352,8 +350,6 @@ impl StatePersistenceManager {
             return Ok(Vec::new());
         }
 
-        info!("Loading persisted open states from {}", self.opens_dir);
-
         let files = match self.list_dir(&self.opens_dir).await {
             Ok(f) => f,
             Err(_) => {
@@ -363,6 +359,7 @@ impl StatePersistenceManager {
         };
 
         let mut opens = Vec::new();
+        let mut errors = 0;
         for filename in files {
             if !filename.ends_with(".json") {
                 continue;
@@ -376,16 +373,21 @@ impl StatePersistenceManager {
                         opens.push(open);
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize open from {}: {}", path, e);
+                        errors += 1;
+                        warn!("Failed to deserialize open from {}: {}", filename, e);
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to read open state file {}: {:?}", path, e);
+                    errors += 1;
+                    warn!("Failed to read open state file {}: {:?}", filename, e);
                 }
             }
         }
 
-        info!("Loaded {} open states", opens.len());
+        if errors > 0 {
+            warn!("    ⚠ {} open state file(s) failed to load", errors);
+        }
+
         Ok(opens)
     }
 
@@ -404,8 +406,6 @@ impl StatePersistenceManager {
             return Ok(Vec::new());
         }
 
-        info!("Loading persisted lock states from {}", self.locks_dir);
-
         let files = match self.list_dir(&self.locks_dir).await {
             Ok(f) => f,
             Err(_) => {
@@ -415,6 +415,7 @@ impl StatePersistenceManager {
         };
 
         let mut locks = Vec::new();
+        let mut errors = 0;
         for filename in files {
             if !filename.ends_with(".json") {
                 continue;
@@ -428,16 +429,21 @@ impl StatePersistenceManager {
                         locks.push(lock);
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize lock from {}: {}", path, e);
+                        errors += 1;
+                        warn!("Failed to deserialize lock from {}: {}", filename, e);
                     }
                 },
                 Err(e) => {
-                    warn!("Failed to read lock state file {}: {:?}", path, e);
+                    errors += 1;
+                    warn!("Failed to read lock state file {}: {:?}", filename, e);
                 }
             }
         }
 
-        info!("Loaded {} lock states", locks.len());
+        if errors > 0 {
+            warn!("    ⚠ {} lock state file(s) failed to load", errors);
+        }
+
         Ok(locks)
     }
 
@@ -456,13 +462,13 @@ impl StatePersistenceManager {
             return Ok(None);
         }
 
-        info!("Loading recovery metadata from {}", self.recovery_meta);
+        debug!("Loading recovery metadata from {}", self.recovery_meta);
 
         match self.read_state_file(&self.recovery_meta).await {
             Ok(data) => {
                 match serde_json::from_slice::<RecoveryMetadata>(&data) {
                     Ok(meta) => {
-                        info!(
+                        debug!(
                             "Loaded recovery metadata: server_instance={}, epoch={}",
                             meta.server_instance_id, meta.recovery_epoch
                         );
@@ -569,8 +575,8 @@ impl StatePersistenceManager {
                 Nfs4Status::Serverfault
             })?;
 
-            let stateid_hex = hex::encode(&open.stateid.other);
-            let path = format!("{}/{}.json", self.opens_dir, stateid_hex);
+            let stateid_hex = hex::encode(open.stateid.other);
+            let path = format!("{}/{stateid_hex}.json", self.opens_dir);
             self.write_state_file(&path, &data).await?;
         }
 
@@ -579,38 +585,53 @@ impl StatePersistenceManager {
         let mut lock_count = 0;
         for state in lock_states {
             // Export each lock entry in this state
-            let entries = state.lock_entries.read().unwrap();
-            for entry in entries.iter() {
+            // Collect entries data before await to avoid holding lock across await
+            let entries_data: Vec<_> = {
+                let entries_guard = state.lock_entries.read().unwrap();
+                entries_guard
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.fileid,
+                            entry.lock_type as u32,
+                            entry.get_offset(),
+                            entry.get_length(),
+                        )
+                    })
+                    .collect()
+            };
+            let stateid = state.stateid.other;
+            let clientid = state.owner.clientid;
+            let owner = state.owner.owner.clone();
+
+            for entry_data in entries_data {
+                let (fileid, lock_type, offset, length) = entry_data;
                 let persisted = PersistedLock {
-                    stateid: state.stateid.other,
-                    clientid: state.owner.clientid,
-                    fileid: entry.fileid,
-                    lock_type: entry.lock_type as u32,
-                    offset: entry.get_offset(),
-                    length: entry.get_length(),
-                    owner: state.owner.owner.clone(),
+                    stateid,
+                    clientid,
+                    fileid,
+                    lock_type,
+                    offset,
+                    length,
+                    owner: owner.clone(),
                 };
 
                 let data = serde_json::to_vec(&persisted).map_err(|e| {
-                    error!(
-                        "Failed to serialize lock {:02x?}: {}",
-                        &state.stateid.other[..4],
-                        e
-                    );
+                    error!("Failed to serialize lock {:02x?}: {}", &stateid[..4], e);
                     Nfs4Status::Serverfault
                 })?;
 
                 // Use stateid + entry index for unique filename
-                let stateid_hex = hex::encode(&state.stateid.other);
+                let stateid_hex = hex::encode(stateid);
                 let entry_idx = lock_count;
-                let path = format!("{}/{}_{}.json", self.locks_dir, stateid_hex, entry_idx);
+                let path = format!("{}/{stateid_hex}_{entry_idx}.json", self.locks_dir);
                 self.write_state_file(&path, &data).await?;
                 lock_count += 1;
             }
         }
 
         let elapsed = start.elapsed();
-        info!(
+        debug!(
             "State snapshot saved: {} clients, {} opens, {} locks (epoch: {}, took: {:?})",
             client_count, open_count, lock_count, epoch, elapsed
         );
@@ -731,6 +752,11 @@ impl StatePersistenceManager {
             Nfs4Status::Serverfault
         })?;
 
+        writer.complete().await.map_err(|e| {
+            error!("Failed to complete state file {}: {:?}", path, e);
+            Nfs4Status::Serverfault
+        })?;
+
         debug!("Wrote {} bytes to {}", data.len(), path);
         Ok(())
     }
@@ -750,9 +776,9 @@ impl StatePersistenceManager {
         for dir in dirs {
             if let Ok(files) = self.list_dir(dir).await {
                 for filename in files {
-                    let path = format!("{}/{}", dir, filename);
+                    let path = format!("{dir}/{filename}");
                     if let Err(e) = self.delete_state_file(&path).await {
-                        warn!("Failed to delete unclaimed state file {}: {:?}", path, e);
+                        warn!("Failed to delete unclaimed state file {path}: {e:?}");
                     }
                 }
             }
@@ -760,7 +786,7 @@ impl StatePersistenceManager {
 
         // Delete recovery metadata
         if let Err(e) = self.delete_state_file(&self.recovery_meta).await {
-            debug!("Failed to delete recovery metadata: {:?}", e);
+            debug!("Failed to delete recovery metadata: {e:?}");
         }
 
         info!("Cleanup completed");

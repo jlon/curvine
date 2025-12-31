@@ -47,7 +47,6 @@ use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
-use tracing::info;
 
 /// CLOSE operation handler
 ///
@@ -72,19 +71,12 @@ pub async fn op_close(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // Parse CLOSE4args
-    let seqid = input.read_u32::<BigEndian>()?;
+    let _seqid = input.read_u32::<BigEndian>()?;
     let mut stateid = Stateid4::default();
     stateid.deserialize(input)?;
 
-    info!(
-        "CLOSE: seqid={} stateid={:02x?}",
-        seqid,
-        &stateid.other[..4]
-    );
+    tracing::debug!("CLOSE: stateid={:?}", stateid);
 
-    // Step 1: Get state by stateid.other (NFS-Ganesha: nfs4_Check_Stateid with STATEID_SPECIAL_FOR_CLOSE)
-    // For CLOSE, we accept any seqid - only check stateid.other
     let open_state = handler
         .opens
         .get_state(&stateid)
@@ -92,30 +84,25 @@ pub async fn op_close(
 
     let fileid = open_state.fileid;
 
-    info!(
-        "CLOSE: Verified stateid for fileid={} owner={:02x?}",
+    tracing::info!(
+        "CLOSE: fileid={} path={} stateid={:?}",
         fileid,
-        &open_state.owner_val[..open_state.owner_val.len().min(8)]
+        open_state.path.path(),
+        stateid
     );
 
-    // Step 2: Delete state (NFS-Ganesha: state_del_locked)
-    // This removes the state from all HashMaps
     let closed_state = handler.opens.close(&stateid)?;
 
-    // Step 3: Close file (NFS-Ganesha: fsal_close2)
-    // This decrements OpenFile ref_count and calls complete() if last reference
+    tracing::debug!("CLOSE: fileid={} calling close_file", fileid);
     handler.fs.close_file(closed_state.fileid).await?;
+    tracing::debug!("CLOSE: fileid={} completed successfully", fileid);
 
-    // Step 4: Build response
     let mut result = Vec::new();
 
-    // Return special stateid for NFSv4.1+ (NFS-Ganesha line 264)
     if ctx.minor_version > 0 {
-        // Special invalid stateid (all zeros with seqid=0xFFFFFFFF)
         let invalid_stateid = Stateid4::new(0xFFFFFFFF, [0u8; 12]);
         invalid_stateid.serialize(&mut result)?;
     } else {
-        // NFSv4.0: increment seqid
         let mut response_stateid = stateid;
         response_stateid.seqid = response_stateid.seqid.wrapping_add(1);
         if response_stateid.seqid == 0 {
@@ -123,12 +110,6 @@ pub async fn op_close(
         }
         response_stateid.serialize(&mut result)?;
     }
-
-    info!(
-        "CLOSE SUCCESS: fileid={} stateid={:02x?}",
-        fileid,
-        &stateid.other[..4]
-    );
 
     Ok(result)
 }

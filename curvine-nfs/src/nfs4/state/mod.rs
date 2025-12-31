@@ -18,10 +18,12 @@
 //! - Client state (registration, lease)
 //! - Open state (file opens, share reservations)
 //! - Lock state (byte-range locks)
+//! - Lease state (lease reservation and expiration)
 
 pub mod client;
 pub mod deleg_reaper;
 pub mod grace;
+pub mod lease;
 pub mod lock;
 pub mod open;
 pub mod persistence;
@@ -30,6 +32,7 @@ pub mod saver;
 pub use client::ClientManager;
 pub use deleg_reaper::DelegationReaperTask;
 pub use grace::{GracePeriodConfig, GracePeriodManager, GracePeriodReaper};
+pub use lease::{LeaseManager, LeaseReservation, LeaseState, DEFAULT_LEASE_TIME_SECS};
 pub use lock::{LockEntry, LockManager, LockState, LockType4};
 pub use open::{OpenManager, OpenState};
 pub use persistence::{

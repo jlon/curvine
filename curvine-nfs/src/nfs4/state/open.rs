@@ -465,6 +465,25 @@ impl OpenManager {
         Ok(state)
     }
 
+    /// Get all open states for a client (for cleanup)
+    ///
+    /// Returns a list of OpenState references for the client.
+    /// Used by cleanup_client to close all OpenFiles before removing states.
+    pub fn get_client_opens(&self, clientid: Clientid4) -> Vec<Arc<OpenState>> {
+        let client_opens = self.client_opens.read().unwrap();
+        let states = self.states.read().unwrap();
+
+        client_opens
+            .get(&clientid)
+            .map(|stateids| {
+                stateids
+                    .iter()
+                    .filter_map(|sid| states.get(sid).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Close all opens for a client
     pub fn close_all_for_client(&self, clientid: Clientid4) {
         let stateids: Vec<[u8; 12]> = self

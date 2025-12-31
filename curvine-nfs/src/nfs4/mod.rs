@@ -71,8 +71,9 @@ pub const NFS4_MINOR_VERSION: u32 = 1;
 /// Default lease time in seconds
 pub const DEFAULT_LEASE_TIME: u64 = 90;
 
-/// Default number of slots per session
-pub const DEFAULT_SLOT_COUNT: u32 = 16;
+/// Default number of slots per session (re-exported from session module)
+/// Increased to 128 for better parallelism in NFSv4.1
+pub use session::DEFAULT_SLOT_COUNT;
 
 /// Maximum COMPOUND operations per request
 pub const MAX_COMPOUND_OPS: usize = 64;

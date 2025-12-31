@@ -55,10 +55,22 @@ enum WriteTask {
 }
 
 /// NFS Writer with sequential write processing via message queue
+///
+/// # Resource Safety
+/// NfsWriter uses a background task for sequential write processing.
+/// When all clones are dropped, the background task will automatically
+/// exit due to channel closure. However, for proper data commit,
+/// you should call `complete()` explicitly before dropping.
+///
+/// # Clone Behavior
+/// NfsWriter is Clone, but all clones share the same background task.
+/// The `completed` flag is shared via Arc to track completion status.
 #[derive(Clone)]
 pub struct NfsWriter {
     path: Path,
     sender: mpsc::Sender<WriteTask>,
+    /// Track if complete() has been called (shared across clones)
+    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NfsWriter {
@@ -71,7 +83,11 @@ impl NfsWriter {
         // Spawn background task
         tokio::spawn(Self::writer_task(writer, receiver));
 
-        Self { path, sender }
+        Self {
+            path,
+            sender,
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     #[inline]
@@ -135,8 +151,22 @@ impl NfsWriter {
     }
 
     /// Complete and close writer
+    ///
+    /// # Important
+    /// This method should be called explicitly to ensure data is committed.
+    /// If not called, the background task will exit when the channel is closed,
+    /// but data may not be properly committed.
     #[inline]
     pub async fn complete(&self) -> FsResult<()> {
+        // Mark as completed to prevent double-complete
+        if self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            // Already completed, return Ok
+            return Ok(());
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(WriteTask::Complete { reply: tx })
@@ -145,6 +175,12 @@ impl NfsWriter {
 
         rx.await
             .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?
+    }
+
+    /// Check if complete() has been called
+    #[inline]
+    pub fn is_completed(&self) -> bool {
+        self.completed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Background task that processes writes sequentially

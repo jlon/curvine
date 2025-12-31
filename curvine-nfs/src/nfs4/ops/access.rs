@@ -122,7 +122,7 @@ pub async fn op_access(
         &fh.data[..fh.data.len().min(16)],
         access
     );
-    
+
     let fileid = handler.fs.fh_to_fileid(fh)?;
     tracing::info!("ACCESS: fileid={}", fileid);
 

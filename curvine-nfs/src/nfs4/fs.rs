@@ -64,11 +64,11 @@ pub const ROOT_FILEID: Fileid4 = 1000;
 fn generate_fileid_from_path(path: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     let hash = hasher.finish();
-    
+
     // Ensure fileid > 0 by using high bit as 0 and adding 1
     // This gives us range [1, 2^63]
     (hash & 0x7FFF_FFFF_FFFF_FFFF) + 1
@@ -966,7 +966,10 @@ impl Nfs4FileSystem {
         );
 
         if is_last {
-            tracing::info!("CLOSE: Last reference, calling complete() for fileid={}", fileid);
+            tracing::info!(
+                "CLOSE: Last reference, calling complete() for fileid={}",
+                fileid
+            );
             // Call complete() to commit data
             open_file.complete().await?;
 
@@ -1088,7 +1091,7 @@ impl Nfs4FileSystem {
                     format!("{}/{}", path.path(), s.name)
                 };
                 let fileid = get_fileid_from_status(s, &child_path);
-                
+
                 fileid > cookie
             })
             .take(max_entries)
@@ -1100,13 +1103,13 @@ impl Nfs4FileSystem {
                     format!("{}/{}", path.path(), status.name)
                 };
                 let fileid = get_fileid_from_status(status, &child_path);
-                
+
                 self.cache_path(fileid, child_path);
-                
+
                 // Create a modified status with the generated fileid
                 let mut modified_status = status.clone();
                 modified_status.id = fileid as i64;
-                
+
                 (fileid, status.name.clone(), modified_status)
             })
             .collect();

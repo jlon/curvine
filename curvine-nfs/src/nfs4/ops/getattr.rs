@@ -48,7 +48,7 @@ pub async fn op_getattr(
     let status = handler.fs.get_status_cached(fileid).await?;
 
     let mut attrs = crate::nfs4::types::FileAttrs::from_status(&status);
-    
+
     // If file has an active writer, use its current position as file size
     // This ensures GETATTR returns the correct size for files being written
     // (NFS-Ganesha: fsal_getattrs checks fd->buffer for uncommitted data)
@@ -58,7 +58,7 @@ pub async fn op_getattr(
             attrs.used = ((writer_pos + 511) / 512 * 512) as u64;
         }
     }
-    
+
     let fattr = crate::nfs4::handlers::encode_fattr4(&attrs, &requested_attrs, Some(fh))?;
 
     let mut result = Vec::new();

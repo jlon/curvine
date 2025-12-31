@@ -353,4 +353,62 @@ impl CompoundHandler {
         }
         Ok(())
     }
+
+    /// Cleanup all state for a client (NFS-Ganesha: nfs41_single_client_cleanup)
+    ///
+    /// This method coordinates cleanup across all managers to prevent resource leaks.
+    /// Called when:
+    /// - Client lease expires
+    /// - DESTROY_CLIENTID is received
+    /// - Client reconnects with different verifier
+    ///
+    /// # Cleanup Order (following NFS-Ganesha)
+    /// 1. Revoke delegations (CB_RECALL not needed, just revoke)
+    /// 2. Close all open files (release OpenFile resources)
+    /// 3. Release all locks
+    /// 4. Destroy all sessions
+    /// 5. Remove client state
+    pub async fn cleanup_client(&self, clientid: Clientid4) {
+        tracing::info!("CLEANUP_CLIENT: Starting cleanup for client {}", clientid);
+
+        // Step 1: Revoke all delegations for this client
+        self.delegations.revoke_all_for_client(clientid);
+        tracing::info!(
+            "CLEANUP_CLIENT: Revoked delegations for client {}",
+            clientid
+        );
+
+        // Step 2: Close all open files for this client
+        // First get all fileids that need to be closed
+        let open_states = self.opens.get_client_opens(clientid);
+        for state in &open_states {
+            // Close the OpenFile (decrement ref_count, complete if last)
+            if let Err(e) = self.fs.close_file(state.fileid).await {
+                tracing::warn!(
+                    "CLEANUP_CLIENT: Failed to close file {} for client {}: {:?}",
+                    state.fileid,
+                    clientid,
+                    e
+                );
+            }
+        }
+        // Then remove all open states from OpenManager
+        self.opens.close_all_for_client(clientid);
+        tracing::info!(
+            "CLEANUP_CLIENT: Closed {} opens for client {}",
+            open_states.len(),
+            clientid
+        );
+
+        // Step 3: Release all locks for this client
+        self.locks.release_all_for_client(clientid);
+        tracing::info!("CLEANUP_CLIENT: Released locks for client {}", clientid);
+
+        // Step 4: Destroy all sessions for this client
+        self.sessions.destroy_client_sessions(clientid);
+        tracing::info!("CLEANUP_CLIENT: Destroyed sessions for client {}", clientid);
+
+        // Step 5: Remove client state (done by caller or ClientManager)
+        tracing::info!("CLEANUP_CLIENT: Completed cleanup for client {}", clientid);
+    }
 }

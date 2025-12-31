@@ -114,16 +114,26 @@ async fn handle_compound(
 
         // Debug: log current_fh state before each operation
         let fh_state = if let Some(ref fh) = ctx.current_fh {
-            format!("fh_len={} fh_data={:02x?}", fh.data.len(), &fh.data[..fh.data.len().min(8)])
+            format!(
+                "fh_len={} fh_data={:02x?}",
+                fh.data.len(),
+                &fh.data[..fh.data.len().min(8)]
+            )
         } else {
             "None".to_string()
         };
-        info!("  Op[{}]: {:?} ({}) current_fh={}", i, op, op_code, fh_state);
+        info!(
+            "  Op[{}]: {:?} ({}) current_fh={}",
+            i, op, op_code, fh_state
+        );
 
         let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
             Ok(data) => (Nfs4Status::Ok, data),
             Err(e) => {
-                error!("  Op[{}] {:?} failed: {:?} current_fh={}", i, op, e.status, fh_state);
+                error!(
+                    "  Op[{}] {:?} failed: {:?} current_fh={}",
+                    i, op, e.status, fh_state
+                );
                 (e.status, Vec::new())
             }
         };
@@ -598,16 +608,16 @@ async fn op_exchange_id(
     );
 
     let mut result = Vec::new();
-    
+
     // eir_clientid (8 bytes)
     clientid.serialize(&mut result)?;
-    
+
     // eir_sequenceid (4 bytes)
     seqid.serialize(&mut result)?;
-    
+
     // eir_flags (4 bytes)
     result_flags.serialize(&mut result)?;
-    
+
     // eir_state_protect: state_protect4_r
     // spr_how = SP4_NONE (0) - no state protection
     0u32.serialize(&mut result)?;
@@ -734,13 +744,13 @@ async fn op_create_session(
     //   ca_rdma_ird<1> (array: 4 bytes len + data)
 
     let mut result = Vec::new();
-    
+
     // csr_sessionid (16 bytes)
     session.sessionid.serialize(&mut result)?;
-    
+
     // csr_sequence (4 bytes) - echo back the sequence from request
     seqid.serialize(&mut result)?;
-    
+
     // csr_flags (4 bytes) - we don't support any flags currently
     // CREATE_SESSION4_FLAG_PERSIST = 0x00000001
     // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
@@ -748,22 +758,22 @@ async fn op_create_session(
     0u32.serialize(&mut result)?;
 
     // csr_fore_chan_attrs (channel_attrs4)
-    0u32.serialize(&mut result)?;           // ca_headerpadsize
+    0u32.serialize(&mut result)?; // ca_headerpadsize
     (1024 * 1024u32).serialize(&mut result)?; // ca_maxrequestsize (1MB)
     (1024 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize (1MB)
-    (64 * 1024u32).serialize(&mut result)?;   // ca_maxresponsesize_cached (64KB)
-    64u32.serialize(&mut result)?;            // ca_maxoperations
+    (64 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize_cached (64KB)
+    64u32.serialize(&mut result)?; // ca_maxoperations
     session.slot_count().serialize(&mut result)?; // ca_maxrequests (slot count)
-    0u32.serialize(&mut result)?;             // ca_rdma_ird<1> array length = 0
+    0u32.serialize(&mut result)?; // ca_rdma_ird<1> array length = 0
 
     // csr_back_chan_attrs (channel_attrs4)
-    0u32.serialize(&mut result)?;           // ca_headerpadsize
+    0u32.serialize(&mut result)?; // ca_headerpadsize
     (1024 * 1024u32).serialize(&mut result)?; // ca_maxrequestsize (1MB)
     (1024 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize (1MB)
-    (64 * 1024u32).serialize(&mut result)?;   // ca_maxresponsesize_cached (64KB)
-    64u32.serialize(&mut result)?;            // ca_maxoperations
+    (64 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize_cached (64KB)
+    64u32.serialize(&mut result)?; // ca_maxoperations
     session.slot_count().serialize(&mut result)?; // ca_maxrequests (slot count)
-    0u32.serialize(&mut result)?;             // ca_rdma_ird<1> array length = 0
+    0u32.serialize(&mut result)?; // ca_rdma_ird<1> array length = 0
 
     info!(
         "CREATE_SESSION: response len={} sessionid={:02x?}",
@@ -1755,10 +1765,7 @@ async fn op_secinfo_no_name(
     // Read style argument: SECINFO_STYLE4_CURRENT_FH (0) or SECINFO_STYLE4_PARENT (1)
     let style = input.read_u32::<BigEndian>()?;
 
-    info!(
-        "SECINFO_NO_NAME: style={} (0=current_fh, 1=parent)",
-        style
-    );
+    info!("SECINFO_NO_NAME: style={} (0=current_fh, 1=parent)", style);
 
     // Validate current file handle exists
     let _fh = ctx.require_current_fh()?;

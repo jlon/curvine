@@ -143,6 +143,18 @@ pub async fn op_open(
     )
     .await?;
 
+    let path = handler.fs.get_path(fileid).ok();
+    tracing::info!(
+        "OPEN: fileid={} path={} stateid={:?} seqid={} access={:#x} deny={:#x} is_create={}",
+        fileid,
+        path.as_ref().map(|p| p.path()).unwrap_or("unknown"),
+        open_state.stateid,
+        open_state.seqid(),
+        share_access,
+        share_deny,
+        is_create
+    );
+
     if is_claim_previous {
         open_state.set_confirmed(true);
     }
@@ -206,6 +218,16 @@ async fn open_ex(
 ) -> Nfs4Result<std::sync::Arc<crate::nfs4::state::open::OpenState>> {
     let path = handler.fs.get_path(fileid)?;
 
+    tracing::debug!(
+        "OPEN: fileid={} path={} access={:#x} deny={:#x} clientid={} owner={:02x?}",
+        fileid,
+        path.path(),
+        access,
+        deny,
+        clientid,
+        &owner_val[..owner_val.len().min(8)]
+    );
+
     let (open_state, new_state) = handler.opens.open(
         clientid,
         owner_val.clone(),
@@ -215,11 +237,30 @@ async fn open_ex(
         deny,
     )?;
 
+    tracing::debug!(
+        "OPEN: fileid={} new_state={} stateid={:?}",
+        fileid,
+        new_state,
+        open_state.stateid
+    );
+
     if new_state {
+        // New state: create OpenFile with ref_count = 1
+        // NFS-Ganesha: fsal_open2() for new state
+        tracing::debug!("OPEN: fileid={} calling open_file (new state)", fileid);
         handler.fs.open_file(fileid, access).await?;
     } else {
-        handler.fs.reopen_file_ex(fileid, access, false).await?;
+        // Existing state reused: increment ref_count
+        // NFS-Ganesha: fsal_reopen2() for existing state, increments fd_work
+        // Each OPEN (new or reused state) represents a file handle that will be CLOSEd
+        tracing::debug!(
+            "OPEN: fileid={} calling reopen_file_ex with add_ref=true (reused state)",
+            fileid
+        );
+        handler.fs.reopen_file_ex(fileid, access, true).await?;
     }
+
+    tracing::debug!("OPEN: fileid={} completed successfully", fileid);
 
     Ok(open_state)
 }

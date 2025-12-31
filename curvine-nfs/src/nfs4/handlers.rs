@@ -263,7 +263,10 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             let _stable = input.read_u32::<BigEndian>()?;
             let mut data: Vec<u8> = Vec::new();
             data.deserialize(input)?;
-            info!("Skipped WRITE args: stateid + offset + stable + data ({} bytes)", data.len());
+            info!(
+                "Skipped WRITE args: stateid + offset + stable + data ({} bytes)",
+                data.len()
+            );
         }
         Nfs4Op::Commit => {
             let _offset = input.read_u64::<BigEndian>()?;
@@ -390,7 +393,10 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             info!("Skipped {:?} args: fattr4", op);
         }
         Nfs4Op::Lock | Nfs4Op::Lockt | Nfs4Op::Locku => {
-            warn!("Skipping {:?} args: complex structure, may cause issues", op);
+            warn!(
+                "Skipping {:?} args: complex structure, may cause issues",
+                op
+            );
         }
         Nfs4Op::ReleaseLockowner => {
             let _clientid = input.read_u64::<BigEndian>()?;
@@ -399,7 +405,10 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             info!("Skipped RELEASE_LOCKOWNER args: clientid + owner");
         }
         Nfs4Op::ExchangeId | Nfs4Op::CreateSession | Nfs4Op::DestroySession => {
-            warn!("Skipping {:?} args: complex structure, may cause issues", op);
+            warn!(
+                "Skipping {:?} args: complex structure, may cause issues",
+                op
+            );
         }
         Nfs4Op::Lookupp => {
             info!("Skipped LOOKUPP args: no arguments");

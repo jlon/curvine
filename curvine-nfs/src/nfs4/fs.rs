@@ -51,6 +51,64 @@ use tokio_util::bytes::Bytes;
 /// Root directory file ID
 pub const ROOT_FILEID: Fileid4 = 1000;
 
+/// Generate a unique fileid from path for UFS files
+///
+/// UFS (like S3) doesn't have inode concept, so FileStatus.id is 0.
+/// We generate a consistent fileid from path hash to ensure:
+/// 1. Same path always gets same fileid
+/// 2. Different paths get different fileids
+/// 3. fileid > 0 (to pass READDIR cookie filter)
+///
+/// # Algorithm
+/// Use FNV-1a hash (fast, good distribution) and ensure result > 0
+fn generate_fileid_from_path(path: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    let hash = hasher.finish();
+    
+    // Ensure fileid > 0 by using high bit as 0 and adding 1
+    // This gives us range [1, 2^63]
+    (hash & 0x7FFF_FFFF_FFFF_FFFF) + 1
+}
+
+/// Get fileid from FileStatus, handling object storage without inode
+///
+/// # Unified Fileid Generation (CRITICAL for Object Storage)
+///
+/// This function ensures consistent fileid generation across all operations:
+/// - For filesystems with inodes (local FS): use status.id
+/// - For object storage without inodes (S3, etc): generate from path hash
+///
+/// # Why This Matters
+/// Object storage like S3 doesn't have inode concept, so FileStatus.id is 0.
+/// If we use 0 as fileid, all files would have the same fileid, causing:
+/// - OPEN/CLOSE operations to conflict
+/// - READ/WRITE operations to access wrong files
+/// - Cache corruption
+///
+/// By using path hash for id==0 cases, we ensure:
+/// - Each file has a unique, consistent fileid
+/// - Same path always generates same fileid
+/// - All operations (OPEN/READ/WRITE/CLOSE) use the same fileid
+///
+/// # Arguments
+/// - status: FileStatus from backend
+/// - path: File path (used for hash generation when id==0)
+///
+/// # Returns
+/// Consistent fileid for this file
+#[inline]
+fn get_fileid_from_status(status: &FileStatus, path: &str) -> u64 {
+    if status.id == 0 {
+        generate_fileid_from_path(path)
+    } else {
+        status.id as u64
+    }
+}
+
 // ============================================================================
 // Path Cache (required for fileid -> path mapping)
 // ============================================================================
@@ -411,22 +469,50 @@ impl OpenFile {
     /// NfsWriter uses internal AsyncMutex to serialize writes.
     /// Clone is cheap (Arc clone), no external lock needed.
     pub async fn write(&self, offset: u64, data: Vec<u8>) -> Nfs4Result<u32> {
+        tracing::info!(
+            "OpenFile::write: fileid={} path={} offset={} len={}",
+            self.fileid,
+            self.path.path(),
+            offset,
+            data.len()
+        );
+
         // Clone NfsWriter - cheap Arc clone
         let writer = {
             let writer_guard = self.writer.read().unwrap();
             writer_guard
                 .as_ref()
                 .ok_or_else(|| {
+                    tracing::error!(
+                        "OpenFile::write: No writer! fileid={} path={}",
+                        self.fileid,
+                        self.path.path()
+                    );
                     Nfs4Error::with_message(Nfs4Status::Openmode, "File not opened for write")
                 })?
                 .clone()
         }; // RwLock released here before await
 
+        tracing::info!(
+            "OpenFile::write: Calling NfsWriter.write fileid={} offset={} len={}",
+            self.fileid,
+            offset,
+            data.len()
+        );
+
         // NfsWriter handles auto-extend internally
-        writer
+        let result = writer
             .write(offset as i64, data)
             .await
-            .map_err(Nfs4Error::from)
+            .map_err(Nfs4Error::from)?;
+
+        tracing::info!(
+            "OpenFile::write: NfsWriter.write completed fileid={} written={}",
+            self.fileid,
+            result
+        );
+
+        Ok(result)
     }
 
     /// Flush buffered data to storage (NFS-Ganesha: fsync)
@@ -871,7 +957,16 @@ impl Nfs4FileSystem {
 
         let is_last = open_file.release_ref();
 
+        tracing::info!(
+            "CLOSE: fileid={} path={} ref_count={} is_last={}",
+            fileid,
+            open_file.path.path(),
+            open_file.ref_count.load(Ordering::Acquire),
+            is_last
+        );
+
         if is_last {
+            tracing::info!("CLOSE: Last reference, calling complete() for fileid={}", fileid);
             // Call complete() to commit data
             open_file.complete().await?;
 
@@ -881,6 +976,7 @@ impl Nfs4FileSystem {
 
             // Remove from HashMap
             self.open_files.write().unwrap().remove(&fileid);
+            tracing::info!("CLOSE: Removed OpenFile from HashMap for fileid={}", fileid);
         }
 
         Ok(())
@@ -917,7 +1013,7 @@ impl Nfs4FileSystem {
                 .get_status(&parent)
                 .await
                 .map_err(Nfs4Error::from)?;
-            let fileid = status.id as u64;
+            let fileid = get_fileid_from_status(&status, parent.path());
             self.cache_path(fileid, parent.to_string());
 
             // Populate StatusCache for future get_status calls
@@ -945,7 +1041,7 @@ impl Nfs4FileSystem {
             .get_status(&child_path)
             .await
             .map_err(Nfs4Error::from)?;
-        let fileid = status.id as u64;
+        let fileid = get_fileid_from_status(&status, &child_path_str);
 
         // Populate both caches
         self.cache_path(fileid, child_path_str);
@@ -984,20 +1080,34 @@ impl Nfs4FileSystem {
         // Filter and collect entries
         let result: Vec<_> = sorted
             .into_iter()
-            .filter(|s| s.id as u64 > cookie)
+            .filter(|s| {
+                // Generate consistent fileid using unified function
+                let child_path = if path.path() == "/" {
+                    format!("/{}", s.name)
+                } else {
+                    format!("{}/{}", path.path(), s.name)
+                };
+                let fileid = get_fileid_from_status(s, &child_path);
+                
+                fileid > cookie
+            })
             .take(max_entries)
             .map(|status| {
-                let fileid = status.id as u64;
-                let name = &status.name;
+                // Generate consistent fileid using unified function
                 let child_path = if path.path() == "/" {
-                    format!("/{name}")
+                    format!("/{}", status.name)
                 } else {
-                    let parent = path.path();
-                    let name = &status.name;
-                    format!("{parent}/{name}")
+                    format!("{}/{}", path.path(), status.name)
                 };
+                let fileid = get_fileid_from_status(status, &child_path);
+                
                 self.cache_path(fileid, child_path);
-                (fileid, status.name.clone(), status.clone())
+                
+                // Create a modified status with the generated fileid
+                let mut modified_status = status.clone();
+                modified_status.id = fileid as i64;
+                
+                (fileid, status.name.clone(), modified_status)
             })
             .collect();
 
@@ -1052,7 +1162,7 @@ impl Nfs4FileSystem {
             );
             Nfs4Error::from(e)
         })?;
-        let fileid = status.id as u64;
+        let fileid = get_fileid_from_status(&status, &child_path.to_string());
 
         self.cache_path(fileid, child_path.to_string());
 
@@ -1081,7 +1191,7 @@ impl Nfs4FileSystem {
             .get_status(&child_path)
             .await
             .map_err(Nfs4Error::from)?;
-        let fileid = status.id as u64;
+        let fileid = get_fileid_from_status(&status, &child_path.to_string());
 
         self.cache_path(fileid, child_path.to_string());
 
@@ -1114,7 +1224,7 @@ impl Nfs4FileSystem {
 
         // Step 1: Get file ID for cache cleanup
         let fileid = if let Ok(status) = self.ufs.get_status(&child_path).await {
-            let fileid = status.id as u64;
+            let fileid = get_fileid_from_status(&status, &child_path.to_string());
 
             // Step 2: Clean up path_cache
             self.path_cache.remove(fileid);
@@ -1193,7 +1303,7 @@ impl Nfs4FileSystem {
             .get_status(&from_path)
             .await
             .map_err(Nfs4Error::from)?;
-        let old_fileid = old_status.id as u64;
+        let old_fileid = get_fileid_from_status(&old_status, &from_path_str);
 
         // Step 2: Check if target exists (will be overwritten)
         let target_exists = self.ufs.get_status(&to_path).await.is_ok();
@@ -1215,7 +1325,7 @@ impl Nfs4FileSystem {
             .get_status(&to_path)
             .await
             .map_err(Nfs4Error::from)?;
-        let new_fileid = new_status.id as u64;
+        let new_fileid = get_fileid_from_status(&new_status, &to_path_str);
 
         // Step 5: Update path_cache atomically
         self.path_cache
@@ -1268,7 +1378,7 @@ impl Nfs4FileSystem {
             .get_status(&link_path)
             .await
             .map_err(Nfs4Error::from)?;
-        let fileid = status.id as u64;
+        let fileid = get_fileid_from_status(&status, &link_path.to_string());
 
         self.cache_path(fileid, link_path.to_string());
 

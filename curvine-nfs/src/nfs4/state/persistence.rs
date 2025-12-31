@@ -617,11 +617,7 @@ impl StatePersistenceManager {
                 };
 
                 let data = serde_json::to_vec(&persisted).map_err(|e| {
-                    error!(
-                        "Failed to serialize lock {:02x?}: {}",
-                        &stateid[..4],
-                        e
-                    );
+                    error!("Failed to serialize lock {:02x?}: {}", &stateid[..4], e);
                     Nfs4Status::Serverfault
                 })?;
 
@@ -819,6 +815,3 @@ impl StatePersistenceManager {
         Ok(())
     }
 }
-
-
-

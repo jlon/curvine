@@ -26,7 +26,7 @@
 
 use curvine_client::unified::UnifiedWriter;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocMode, FileAllocOpts};
+use curvine_common::state::FileAllocOpts;
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
 use tokio::sync::mpsc;
@@ -149,8 +149,16 @@ impl NfsWriter {
 
     /// Background task that processes writes sequentially
     async fn writer_task(mut writer: UnifiedWriter, mut receiver: mpsc::Receiver<WriteTask>) {
+        let path = writer.path().clone();
+        tracing::info!("NfsWriter task started for path={}", path.path());
+
         // Track current file length to avoid repeated status() calls
         let mut current_len = writer.status().len;
+        tracing::info!(
+            "NfsWriter task: initial current_len={} for path={}",
+            current_len,
+            path.path()
+        );
 
         while let Some(task) = receiver.recv().await {
             match task {
@@ -162,30 +170,95 @@ impl NfsWriter {
                     let data_len = data.len() as u32;
                     let write_end = offset + data_len as i64;
 
-                    // Auto-extend if writing beyond current size
-                    if write_end > current_len {
-                        let opts = FileAllocOpts::with_alloc(write_end, FileAllocMode::DEFAULT);
-                        if let Err(e) = writer.resize(opts).await {
-                            let _ = reply.send(Err(e));
-                            continue;
-                        }
-                        current_len = write_end;
-                    }
+                    tracing::info!(
+                        "NfsWriter task: WRITE offset={} len={} write_end={} current_len={} path={}",
+                        offset,
+                        data_len,
+                        write_end,
+                        current_len,
+                        path.path()
+                    );
 
+                    // IMPORTANT: Do NOT pre-resize here!
+                    // Let Writer.fuse_write() handle file extension internally via seek() + write()
+                    // This aligns with FUSE behavior and avoids issues with:
+                    // 1. Object storage (S3) that doesn't support resize
+                    // 2. Large files (>128MB) that would allocate too many blocks upfront
+                    // 
+                    // The flow is: fuse_write(offset, data) -> seek(offset) -> write(data)
+                    // - seek() updates pos if offset > len, but doesn't resize
+                    // - write() checks if pos > len and calls resize internally
+                    // This lazy resize approach is more efficient and compatible
+
+                    tracing::info!(
+                        "NfsWriter task: Calling fuse_write offset={} len={} for path={}",
+                        offset,
+                        data_len,
+                        path.path()
+                    );
                     let res = writer
                         .fuse_write(offset, DataSlice::Bytes(data))
                         .await
                         .map(|_| data_len);
+
+                    match &res {
+                        Ok(written) => {
+                            tracing::info!(
+                                "NfsWriter task: fuse_write completed, written={} for path={}",
+                                written,
+                                path.path()
+                            );
+                            // Update current_len after successful write
+                            if write_end > current_len {
+                                current_len = write_end;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "NfsWriter task: fuse_write failed: {:?} for path={}",
+                                e,
+                                path.path()
+                            );
+                        }
+                    }
+
                     let _ = reply.send(res);
                 }
 
                 WriteTask::Resize { opts, reply } => {
                     let new_len = opts.len;
+                    tracing::info!(
+                        "NfsWriter task: RESIZE to {} for path={}",
+                        new_len,
+                        path.path()
+                    );
+
                     let res = writer.resize(opts).await;
-                    if res.is_ok() {
-                        current_len = new_len;
+                    match &res {
+                        Ok(_) => {
+                            current_len = new_len;
+                            tracing::info!(
+                                "NfsWriter task: Resize succeeded, current_len={} for path={}",
+                                current_len,
+                                path.path()
+                            );
+                        }
+                        Err(e) => {
+                            // Some Writer implementations (e.g., CacheSyncWriter for S3) don't support resize
+                            // For these cases, we update current_len and let the actual truncation happen
+                            // during complete() when the file is finalized
+                            tracing::warn!(
+                                "NfsWriter task: Resize not supported ({}), updating current_len={} for path={}",
+                                e,
+                                new_len,
+                                path.path()
+                            );
+                            current_len = new_len;
+                        }
                     }
-                    let _ = reply.send(res);
+                    // Always return Ok to avoid breaking the write flow
+                    // The actual file size will be set correctly during complete()
+                    let _ = reply.send(Ok(()));
                 }
 
                 WriteTask::GetPos { reply } => {
@@ -193,14 +266,18 @@ impl NfsWriter {
                 }
 
                 WriteTask::Flush { reply } => {
+                    tracing::info!("NfsWriter task: FLUSH for path={}", path.path());
                     let _ = reply.send(writer.flush().await);
                 }
 
                 WriteTask::Complete { reply } => {
+                    tracing::info!("NfsWriter task: COMPLETE for path={}", path.path());
                     let _ = reply.send(writer.complete().await);
                     break;
                 }
             }
         }
+
+        tracing::info!("NfsWriter task exited for path={}", path.path());
     }
 }

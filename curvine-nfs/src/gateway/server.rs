@@ -216,7 +216,10 @@ impl NfsGatewayServer {
                 "Failed to load clients: {e:?}"
             )))
         })?;
-        info!("         ✓ Loaded {} client state(s)", persisted_clients.len());
+        info!(
+            "         ✓ Loaded {} client state(s)",
+            persisted_clients.len()
+        );
 
         // Load opens
         info!("    [3/4] Loading open states...");
@@ -239,18 +242,14 @@ impl NfsGatewayServer {
         // Summary
         let total = persisted_clients.len() + persisted_opens.len() + persisted_locks.len();
         if total > 0 {
-            info!(
-                "    ────────────────────────────────────────────────────────"
-            );
+            info!("    ────────────────────────────────────────────────────────");
             info!(
                 "    State summary: {} client(s), {} open(s), {} lock(s)",
                 persisted_clients.len(),
                 persisted_opens.len(),
                 persisted_locks.len()
             );
-            info!(
-                "    Note: Clients will reclaim state during grace period"
-            );
+            info!("    Note: Clients will reclaim state during grace period");
         } else {
             info!("    ℹ No persisted state found (fresh start)");
         }

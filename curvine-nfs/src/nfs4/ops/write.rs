@@ -47,6 +47,14 @@ pub async fn op_write(
     let fh = ctx.require_current_fh()?;
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
+    tracing::info!(
+        "WRITE: stateid={:?} offset={} len={} fileid_from_fh={}",
+        stateid,
+        offset,
+        data.len(),
+        fileid
+    );
+
     let status = handler.fs.get_status(fileid).await?;
     if status.file_type != curvine_common::state::FileType::File {
         return Err(Nfs4Status::Inval.into());
@@ -65,16 +73,38 @@ pub async fn op_write(
             .get_state(&stateid)
             .ok_or(Nfs4Status::BadStateid)?;
 
+        tracing::info!(
+            "WRITE: state.fileid={} state.path={} can_write={}",
+            state.fileid,
+            state.path.path(),
+            state.can_write()
+        );
+
         if !state.can_write() {
             return Err(Nfs4Status::Openmode.into());
         }
 
         let open_file = handler.fs.get_open_file(state.fileid).ok_or_else(|| {
-            tracing::error!("WRITE: OpenFile not found for fileid={}", state.fileid);
+            tracing::error!(
+                "WRITE: OpenFile not found! state.fileid={} fileid_from_fh={} stateid={:?}",
+                state.fileid,
+                fileid,
+                stateid
+            );
             Nfs4Error::with_message(Nfs4Status::BadStateid, "OpenFile not found")
         })?;
 
-        open_file.write(offset, data).await?
+        tracing::info!(
+            "WRITE: Found OpenFile, calling write offset={} len={}",
+            offset,
+            data.len()
+        );
+
+        let written = open_file.write(offset, data).await?;
+
+        tracing::info!("WRITE: Successfully wrote {} bytes", written);
+
+        written
     };
 
     build_write_response(count as usize, stable, handler)

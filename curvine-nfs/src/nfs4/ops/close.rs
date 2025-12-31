@@ -75,16 +75,27 @@ pub async fn op_close(
     let mut stateid = Stateid4::default();
     stateid.deserialize(input)?;
 
+    tracing::debug!("CLOSE: stateid={:?}", stateid);
+
     let open_state = handler
         .opens
         .get_state(&stateid)
         .ok_or(Nfs4Status::BadStateid)?;
 
-    let _fileid = open_state.fileid;
+    let fileid = open_state.fileid;
+
+    tracing::info!(
+        "CLOSE: fileid={} path={} stateid={:?}",
+        fileid,
+        open_state.path.path(),
+        stateid
+    );
 
     let closed_state = handler.opens.close(&stateid)?;
 
+    tracing::debug!("CLOSE: fileid={} calling close_file", fileid);
     handler.fs.close_file(closed_state.fileid).await?;
+    tracing::debug!("CLOSE: fileid={} completed successfully", fileid);
 
     let mut result = Vec::new();
 

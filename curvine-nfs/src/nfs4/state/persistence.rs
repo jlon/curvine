@@ -69,6 +69,10 @@ pub struct PersistedOpen {
     pub path: String,
     pub share_access: u32,
     pub share_deny: u32,
+    /// Owner value for CLAIM_PREVIOUS lookup
+    /// Default to empty Vec for backward compatibility with old persisted files
+    #[serde(default)]
+    pub owner_val: Vec<u8>,
 }
 
 /// Persisted lock state
@@ -311,16 +315,34 @@ impl StatePersistenceManager {
 
             let path = format!("{}/{}", self.clients_dir, filename);
             match self.read_state_file(&path).await {
-                Ok(data) => match serde_json::from_slice::<PersistedClient>(&data) {
-                    Ok(client) => {
-                        debug!("Loaded client state: {}", client.clientid);
-                        clients.push(client);
+                Ok(mut data) => {
+                    // Trim trailing whitespace/newlines that might have been added
+                    while !data.is_empty() {
+                        let last = data[data.len() - 1];
+                        if last == b'\n' || last == b'\r' || last == b' ' || last == b'\t' {
+                            data.pop();
+                        } else {
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        errors += 1;
-                        warn!("Failed to deserialize client from {}: {}", filename, e);
+
+                    match serde_json::from_slice::<PersistedClient>(&data) {
+                        Ok(client) => {
+                            debug!("Loaded client state: {}", client.clientid);
+                            clients.push(client);
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            warn!(
+                                "Failed to deserialize client from {}: {} (data len: {}, first 100 bytes: {:?})",
+                                filename,
+                                e,
+                                data.len(),
+                                String::from_utf8_lossy(&data[..data.len().min(100)])
+                            );
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     errors += 1;
                     warn!("Failed to read client state file {}: {:?}", filename, e);
@@ -367,16 +389,33 @@ impl StatePersistenceManager {
 
             let path = format!("{}/{}", self.opens_dir, filename);
             match self.read_state_file(&path).await {
-                Ok(data) => match serde_json::from_slice::<PersistedOpen>(&data) {
-                    Ok(open) => {
-                        debug!("Loaded open state: {:02x?}", &open.stateid[..4]);
-                        opens.push(open);
+                Ok(mut data) => {
+                    // Trim trailing whitespace/newlines that might have been added
+                    while !data.is_empty() {
+                        let last = data[data.len() - 1];
+                        if last == b'\n' || last == b'\r' || last == b' ' || last == b'\t' {
+                            data.pop();
+                        } else {
+                            break;
+                        }
                     }
-                    Err(e) => {
-                        errors += 1;
-                        warn!("Failed to deserialize open from {}: {}", filename, e);
+
+                    match serde_json::from_slice::<PersistedOpen>(&data) {
+                        Ok(open) => {
+                            debug!("Loaded open state: {:02x?}", &open.stateid[..4]);
+                            opens.push(open);
+                        }
+                        Err(e) => {
+                            errors += 1;
+                            warn!(
+                                "Failed to deserialize open from {}: {} (data len: {})",
+                                filename,
+                                e,
+                                data.len()
+                            );
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     errors += 1;
                     warn!("Failed to read open state file {}: {:?}", filename, e);
@@ -530,6 +569,7 @@ impl StatePersistenceManager {
             error!("Failed to serialize recovery metadata: {}", e);
             Nfs4Status::Serverfault
         })?;
+
         self.write_state_file(&self.recovery_meta, &data).await?;
 
         // Save clients
@@ -564,6 +604,7 @@ impl StatePersistenceManager {
                 path: open.path.path().to_string(),
                 share_access: open.get_access(),
                 share_deny: open.get_deny(),
+                owner_val: open.owner_val.clone(),
             };
 
             let data = serde_json::to_vec(&persisted).map_err(|e| {

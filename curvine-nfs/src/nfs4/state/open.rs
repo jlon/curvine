@@ -514,6 +514,104 @@ impl OpenManager {
             .map(Arc::clone)
             .collect()
     }
+
+    /// Restore persisted open state (for recovery after server restart)
+    ///
+    /// This method is called during grace period to restore persisted opens.
+    /// The state is marked as unconfirmed until client reclaims it with CLAIM_PREVIOUS.
+    ///
+    /// # NFS-Ganesha Reference
+    /// From nfs4_recovery.c: state recovery during grace period
+    ///
+    /// # Arguments
+    /// - stateid: Persisted stateid.other (12 bytes)
+    /// - clientid: Client ID
+    /// - fileid: File ID
+    /// - path: File path
+    /// - access: Share access mode
+    /// - deny: Share deny mode
+    /// - owner_val: Owner value (will be looked up from persisted state)
+    pub fn restore_persisted_state(
+        &self,
+        stateid: [u8; 12],
+        clientid: Clientid4,
+        fileid: Fileid4,
+        path: Path,
+        access: u32,
+        deny: u32,
+        owner_val: Vec<u8>,
+    ) -> Nfs4Result<Arc<OpenState>> {
+        // Check if state already exists (should not happen during recovery)
+        if self.states.read().unwrap().contains_key(&stateid) {
+            tracing::warn!(
+                "Restore: stateid {:02x?} already exists, skipping",
+                &stateid[..4]
+            );
+            return Err(Nfs4Status::BadStateid.into());
+        }
+
+        // Create stateid from persisted stateid.other
+        let stateid_obj = Stateid4::new(1, stateid);
+
+        // Create open state (unconfirmed, will be confirmed on CLAIM_PREVIOUS)
+        let state = Arc::new(OpenState::new(
+            stateid_obj,
+            clientid,
+            owner_val.clone(),
+            fileid,
+            path,
+            access,
+            deny,
+        ));
+
+        // Store state
+        self.states.write().unwrap().insert(stateid, state.clone());
+        self.file_opens
+            .write()
+            .unwrap()
+            .entry(fileid)
+            .or_default()
+            .push(stateid);
+        self.client_opens
+            .write()
+            .unwrap()
+            .entry(clientid)
+            .or_default()
+            .push(stateid);
+
+        // Track (file, owner) -> stateid mapping for CLAIM_PREVIOUS lookup
+        self.file_owner_state
+            .write()
+            .unwrap()
+            .insert((fileid, owner_val), stateid);
+
+        tracing::info!(
+            "Restored persisted open state: stateid={:02x?} clientid={} fileid={}",
+            &stateid[..4],
+            clientid,
+            fileid
+        );
+
+        Ok(state)
+    }
+
+    /// Find persisted state by (fileid, owner_val) for CLAIM_PREVIOUS
+    ///
+    /// This is used during CLAIM_PREVIOUS to find the state that was restored from persistence.
+    pub fn find_persisted_state(
+        &self,
+        fileid: Fileid4,
+        owner_val: &[u8],
+    ) -> Option<Arc<OpenState>> {
+        let stateid_key = self
+            .file_owner_state
+            .read()
+            .unwrap()
+            .get(&(fileid, owner_val.to_vec()))
+            .copied()?;
+
+        self.states.read().unwrap().get(&stateid_key).cloned()
+    }
 }
 
 impl Default for OpenManager {

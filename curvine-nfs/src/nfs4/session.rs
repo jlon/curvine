@@ -111,10 +111,15 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// Create a new slot with initial sequence = 0
+    /// Aligned with NFS-Ganesha: gsh_calloc initializes to 0
     pub fn new(slot_id: u32) -> Self {
         Self {
             slot_id,
-            sequence: AtomicU32::new(1),
+            // NFS-Ganesha: slot->sequence starts at 0
+            // First request should have sequenceid = 1
+            // Check: slot->sequence + 1 == sa_sequenceid (0 + 1 == 1)
+            sequence: AtomicU32::new(0),
             state: AtomicU8::new(SLOT_FREE),
             cached_reply: Mutex::new(None),
         }
@@ -128,77 +133,88 @@ impl Slot {
 
     /// Check and acquire slot for a request (lock-free fast path)
     ///
-    /// # Returns
-    /// - Ok(None): Slot acquired, proceed with request
-    /// - Ok(Some(reply)): Replay detected, return cached reply
-    /// - Err(SeqMisordered): Sequence mismatch
+    /// # NFS-Ganesha Reference
+    /// File: nfs4_op_sequence.c, line 209-290
     ///
-    /// # Performance
-    /// Fast path (normal case): single atomic CAS, no mutex
-    /// Slow path (replay): mutex lock to read cached reply
-    pub fn acquire(&self, seq: u32) -> Result<Option<CachedReply>, Nfs4Status> {
+    /// Key logic:
+    /// ```c
+    /// if (slot->sequence + 1 != arg_SEQUENCE4->sa_sequenceid) {
+    ///     // Handle replay or misordered
+    /// }
+    /// slot->sequence += 1;
+    /// res_SEQUENCE4->sr_sequenceid = slot->sequence;
+    /// ```
+    ///
+    /// # Returns
+    /// - Ok(new_sequence): Slot acquired, returns the NEW sequence number to send in response
+    /// - Err(SeqMisordered): Sequence mismatch
+    /// - Err(RetryUncachedRep): Replay but no cached reply
+    pub fn acquire(&self, seq: u32) -> Result<u32, Nfs4Status> {
         let current_seq = self.sequence.load(Ordering::Acquire);
+        let expected_seq = current_seq.wrapping_add(1);
 
-        match seq.cmp(&current_seq) {
-            std::cmp::Ordering::Less => {
-                // Potential replay - check if it's the previous sequence
-                if seq == current_seq.saturating_sub(1) {
-                    // Check if we have a cached reply (slow path)
-                    let cached = self.cached_reply.lock().unwrap();
-                    if let Some(ref reply) = *cached {
-                        if reply.sequence == seq {
-                            return Ok(Some(reply.clone()));
+        if seq == expected_seq {
+            // Correct sequence - try to acquire with CAS (lock-free)
+            match self.state.compare_exchange(
+                SLOT_FREE,
+                SLOT_IN_USE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Successfully acquired - increment sequence
+                    // NFS-Ganesha: slot->sequence += 1
+                    let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
+                    Ok(new_seq)
+                }
+                Err(SLOT_IN_USE) => {
+                    // Slot already in use - concurrent request
+                    Err(Nfs4Status::SeqMisordered)
+                }
+                Err(SLOT_CACHED) => {
+                    // Slot has cached reply - try to transition to IN_USE
+                    match self.state.compare_exchange(
+                        SLOT_CACHED,
+                        SLOT_IN_USE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
+                            Ok(new_seq)
                         }
+                        Err(_) => Err(Nfs4Status::SeqMisordered),
                     }
                 }
-                Err(Nfs4Status::SeqMisordered)
+                Err(_) => Err(Nfs4Status::SeqMisordered),
             }
-            std::cmp::Ordering::Greater => {
-                // Sequence too high
-                Err(Nfs4Status::SeqMisordered)
+        } else if seq == current_seq {
+            // Replay request - NFS-Ganesha: slot->sequence == sa_sequenceid
+            // Check if we have a cached reply
+            let cached = self.cached_reply.lock().unwrap();
+            if cached.is_some() {
+                // Return special status to indicate replay with cached reply
+                // The caller should handle this by returning the cached reply
+                Err(Nfs4Status::RetryUncachedRep) // We'll use this as a signal
+            } else {
+                // No cached reply - NFS-Ganesha returns NFS4ERR_RETRY_UNCACHED_REP
+                Err(Nfs4Status::RetryUncachedRep)
             }
-            std::cmp::Ordering::Equal => {
-                // Correct sequence - try to acquire with CAS (lock-free)
-                match self.state.compare_exchange(
-                    SLOT_FREE,
-                    SLOT_IN_USE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        // Successfully acquired - increment sequence
-                        self.sequence.fetch_add(1, Ordering::Release);
-                        Ok(None)
-                    }
-                    Err(SLOT_IN_USE) => {
-                        // Slot already in use - concurrent request
-                        Err(Nfs4Status::SeqMisordered)
-                    }
-                    Err(SLOT_CACHED) => {
-                        // Slot has cached reply - try to transition to IN_USE
-                        match self.state.compare_exchange(
-                            SLOT_CACHED,
-                            SLOT_IN_USE,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                self.sequence.fetch_add(1, Ordering::Release);
-                                Ok(None)
-                            }
-                            Err(_) => Err(Nfs4Status::SeqMisordered),
-                        }
-                    }
-                    Err(_) => Err(Nfs4Status::SeqMisordered),
-                }
-            }
+        } else {
+            // Sequence mismatch
+            Err(Nfs4Status::SeqMisordered)
         }
+    }
+
+    /// Get cached reply for replay
+    pub fn get_cached_reply(&self) -> Option<CachedReply> {
+        self.cached_reply.lock().unwrap().clone()
     }
 
     /// Release slot and cache reply
     #[inline]
     pub fn release(&self, reply: Vec<u8>) {
-        let seq = self.sequence.load(Ordering::Acquire).saturating_sub(1);
+        let seq = self.sequence.load(Ordering::Acquire);
 
         // Cache the reply (mutex only for write, rare operation)
         *self.cached_reply.lock().unwrap() = Some(CachedReply {
@@ -453,30 +469,100 @@ impl SessionManager {
 
     /// Process SEQUENCE operation (optimized)
     ///
-    /// # Performance
-    /// - Read lock for session lookup (fast path)
-    /// - Lock-free slot acquisition
-    /// - No write lock in normal case
+    /// # NFS-Ganesha Reference
+    /// File: nfs4_op_sequence.c, line 196-260
+    ///
+    /// # Returns
+    /// - Ok((session, new_sequenceid, highest_slot, target_highest_slot, status_flags))
+    /// - new_sequenceid is the value to return in the response (slot->sequence after increment)
     #[allow(clippy::type_complexity)]
     pub fn sequence(
         &self,
         sessionid: &Sessionid4,
         slot_id: u32,
         sequence_id: u32,
-    ) -> Nfs4Result<(Arc<Session>, Option<CachedReply>, u32, u32, u32)> {
+    ) -> Nfs4Result<(Arc<Session>, u32, u32, u32, u32)> {
         // Fast path: read lock for session lookup
-        let session = self.get_session(sessionid).ok_or(Nfs4Status::BadSession)?;
+        // Aligned with NFS-Ganesha: nfs41_Session_Get_Pointer (line 155)
+        let session = match self.get_session(sessionid) {
+            Some(s) => s,
+            None => {
+                // Log all known sessions for debugging
+                let sessions = self.sessions.read().unwrap();
+                tracing::error!(
+                    "SEQUENCE: BadSession - sessionid={:02x?} not found, known sessions: {}",
+                    &sessionid[..8],
+                    sessions
+                        .keys()
+                        .map(|k| format!("{:02x?}", &k[..8]))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Err(Nfs4Status::BadSession.into());
+            }
+        };
 
         // Get slot (no lock)
-        let slot = session.get_slot(slot_id).ok_or(Nfs4Status::BadSlot)?;
+        // Aligned with NFS-Ganesha: slot bounds check (line 186-192)
+        let slot = session.get_slot(slot_id).ok_or_else(|| {
+            tracing::error!(
+                "SEQUENCE: BadSlot - slot_id={} >= max_slots={}",
+                slot_id,
+                session.slot_count()
+            );
+            Nfs4Status::BadSlot
+        })?;
 
         // Lock-free slot acquisition
-        let cached = slot.acquire(sequence_id)?;
+        // Aligned with NFS-Ganesha: sequence validation (line 196-260)
+        let current_seq = slot.sequence();
+        let new_sequenceid = match slot.acquire(sequence_id) {
+            Ok(new_seq) => new_seq,
+            Err(Nfs4Status::RetryUncachedRep) => {
+                // Replay request - check for cached reply
+                if let Some(cached) = slot.get_cached_reply() {
+                    tracing::debug!(
+                        "SEQUENCE: replay detected, returning cached reply for seq={}",
+                        sequence_id
+                    );
+                    // For replay, we need to return the cached reply
+                    // This is handled specially in the caller
+                    return Err(Nfs4Status::RetryUncachedRep.into());
+                }
+                tracing::error!(
+                    "SEQUENCE: RetryUncachedRep - slot={} request_seq={} current_seq={}",
+                    slot_id,
+                    sequence_id,
+                    current_seq
+                );
+                return Err(Nfs4Status::RetryUncachedRep.into());
+            }
+            Err(e) => {
+                tracing::error!(
+                    "SEQUENCE: {:?} - slot={} request_seq={} current_seq={} (expected={})",
+                    e,
+                    slot_id,
+                    sequence_id,
+                    current_seq,
+                    current_seq.wrapping_add(1)
+                );
+                return Err(e.into());
+            }
+        };
 
-        // Return session info
+        tracing::debug!(
+            "SEQUENCE: success sessionid={:02x?} slot={} req_seq={} resp_seq={}",
+            &sessionid[..8],
+            slot_id,
+            sequence_id,
+            new_sequenceid
+        );
+
+        // Return session info with the NEW sequence id for response
+        // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence (after increment)
         Ok((
             session.clone(),
-            cached,
+            new_sequenceid,
             session.highest_slot(),
             session.highest_slot(),
             session.get_flags(),

@@ -1,5 +1,48 @@
 # pNFS 并行读取设计文档
 
+## 0. 项目背景
+
+### 0.1 项目概述
+
+本项目正在模仿 [NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha) 的 `src/Protocols/NFS` 实现，开发 NFSv4.1 协议的适配，底层存储使用 Curvine 分布式存储系统。
+
+### 0.2 开发环境
+
+**参考实现**:
+- NFS-Ganesha: `/home/oppo/Documents/nfs-ganesha/src/Protocols/NFS`
+- 核心参考文件:
+  - `src/FSAL/FSAL_GPFS/fsal_pnfs.c`: pNFS 布局管理
+  - `src/support/ds.c`: Data Server 支持
+
+**底层存储**:
+- Curvine: 高性能分布式缓存系统
+- Worker 节点: 提供 Block 存储和读写接口
+
+**启动命令**:
+
+```bash
+# 1. 启动 Curvine 集群
+/home/oppo/Documents/curvine/build/dist/bin/restart-all.sh
+
+# 2. 编译 Curvine NFS Gateway
+cargo build --release -p curvine-nfs 2>&1 | tail -20
+cp target/release/curvine-nfs-gateway /home/oppo/Documents/curvine/build/dist/lib
+
+# 3. 启动 NFS Gateway
+/home/oppo/Documents/curvine/build/dist/bin/curvine-nfs-gateway.sh
+
+# 4. 挂载 NFSv4.1 文件系统
+sudo umount -f /mnt/curvine-nfs
+sudo mount -t nfs -o vers=4.1,port=2049,tcp,resvport 127.0.0.1:/ /mnt/curvine-nfs41
+```
+
+### 0.3 设计原则
+
+1. **对齐 NFS-Ganesha**: 所有实现细节严格对齐 NFS-Ganesha 的参考实现
+2. **基于真实证据**: 所有设计决策都基于 NFS-Ganesha 源码和 RFC 5661/5663
+3. **复用现有接口**: 充分利用 Curvine Worker 已有的读写接口
+4. **渐进式实现**: 先实现读取，再实现写入
+
 ## 1. 背景与目标
 
 ### 1.1 当前架构的瓶颈
@@ -351,11 +394,15 @@ pub struct DsAddr {
 
 #### 5.3.1 LAYOUTGET 实现
 
+**当前状态**：❌ **未实现**（handlers.rs 中返回 `Notsupp`）
+
+**实现方案**：
+
 ```rust
 /// LAYOUTGET - 获取文件布局
 /// 
 /// # 流程
-/// 1. 从 Curvine Master 获取文件的 Block 信息
+/// 1. 从 Curvine Master 获取文件的 Block 信息（使用现有接口）
 /// 2. 将 Block 信息转换为 pNFS Layout 格式
 /// 3. 返回给客户端
 pub async fn op_layoutget(
@@ -363,7 +410,7 @@ pub async fn op_layoutget(
     ctx: &CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
-    // 解析请求参数
+    // 解析请求参数（RFC 5661 Section 18.43）
     let signal_layout_avail = input.read_u32::<BigEndian>()?;
     let layout_type = input.read_u32::<BigEndian>()?;  // LAYOUT4_NFSV4_1_FILES = 1
     let iomode = input.read_u32::<BigEndian>()?;       // LAYOUTIOMODE4_READ = 1
@@ -378,13 +425,28 @@ pub async fn op_layoutget(
     let fh = ctx.require_current_fh()?;
     let fileid = handler.fs.fh_to_fileid(fh)?;
     
-    // 从 Curvine 获取 Block 位置信息
-    let block_infos = handler.fs.get_block_locations(fileid, offset, length).await?;
+    // 从 Curvine 获取 Block 位置信息（使用现有接口）
+    // 注意：需要实现 get_block_locations_for_pnfs 方法
+    let path = handler.fs.get_path(fileid)?;
+    let file_status = handler.fs.ufs().get_status(&path).await?;
+    
+    // 计算需要哪些 Block
+    let start_block = offset / BLOCK_SIZE;
+    let end_block = (offset + length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    // 从 FileStatus.blocks 中提取相关 Block 信息
+    let block_infos = extract_block_infos(
+        &file_status.blocks,
+        start_block,
+        end_block,
+        offset,
+        length,
+    )?;
     
     // 构建 Layout 响应
     let layout = build_file_layout(&block_infos, handler)?;
     
-    // 序列化响应
+    // 序列化响应（RFC 5661 Section 18.43.2）
     let mut result = Vec::new();
     // ... 序列化 layout
     
@@ -393,35 +455,83 @@ pub async fn op_layoutget(
 
 /// 从 Curvine Block 信息构建 pNFS File Layout
 fn build_file_layout(
-    blocks: &[CurvineBlockInfo],
+    blocks: &[BlockLayoutInfo],
     handler: &CompoundHandler,
 ) -> Nfs4Result<FileLayout4> {
     let mut nfl_fh_list = Vec::new();
     
     for block in blocks {
         // 为每个 Block 创建数据服务器文件句柄
-        // 句柄包含: block_id + worker_addr
-        let ds_fh = create_ds_filehandle(block)?;
+        // 文件句柄编码 Block ID（16 bytes）
+        let ds_fh = encode_block_fh(block.block_id);
         nfl_fh_list.push(ds_fh);
     }
     
+    // 获取或创建 Device ID
+    let deviceid = handler.layout_mgr.get_or_create_deviceid()?;
+    
     Ok(FileLayout4 {
-        nfl_deviceid: handler.layout_mgr.get_deviceid(),
+        nfl_deviceid: deviceid,
         nfl_util: STRIPE_UNIT_SIZE | NFL4_UFLG_DENSE,
         nfl_first_stripe_index: 0,
         nfl_pattern_offset: 0,
         nfl_fh_list,
     })
 }
+
+/// 提取 Block 信息用于 Layout
+fn extract_block_infos(
+    file_blocks: &FileBlocks,
+    start_block: u64,
+    end_block: u64,
+    offset: u64,
+    length: u64,
+) -> Nfs4Result<Vec<BlockLayoutInfo>> {
+    let mut result = Vec::new();
+    
+    for (idx, block) in file_blocks.blocks.iter().enumerate() {
+        let block_idx = idx as u64;
+        if block_idx < start_block || block_idx >= end_block {
+            continue;
+        }
+        
+        // 计算 Block 在文件中的实际偏移和长度
+        let block_file_offset = block_idx * BLOCK_SIZE;
+        let block_start = offset.max(block_file_offset);
+        let block_end = (offset + length).min(block_file_offset + BLOCK_SIZE);
+        
+        if block_start >= block_end {
+            continue;
+        }
+        
+        result.push(BlockLayoutInfo {
+            block_id: block.id,
+            offset: block_file_offset,
+            length: block_end - block_start,
+            ds_addrs: block.workers.iter().map(|w| w.to_string()).collect(),
+        });
+    }
+    
+    Ok(result)
+}
 ```
 
+**依赖的现有接口**：
+- ✅ `handler.fs.ufs().get_status()` - 已存在
+- ✅ `FileStatus.blocks` - 已存在 Block 位置信息
+- ⚠️ 需要添加：`extract_block_infos` 辅助函数
+
 #### 5.3.2 GETDEVICEINFO 实现
+
+**当前状态**：❌ **未实现**（handlers.rs 中返回 `Notsupp`）
+
+**实现方案**：
 
 ```rust
 /// GETDEVICEINFO - 获取数据服务器信息
 ///
 /// 客户端在收到 LAYOUTGET 响应后，需要调用此操作
-/// 获取数据服务器的网络地址
+/// 获取数据服务器的网络地址（RFC 5661 Section 18.40）
 pub async fn op_getdeviceinfo(
     input: &mut impl Read,
     _ctx: &CompoundContext,
@@ -432,10 +542,16 @@ pub async fn op_getdeviceinfo(
     let layout_type = input.read_u32::<BigEndian>()?;
     let maxcount = input.read_u32::<BigEndian>()?;
     
-    // 获取所有 Worker 节点地址
-    let workers = handler.layout_mgr.get_workers().await?;
+    // 验证 layout_type
+    if layout_type != LAYOUT4_NFSV4_1_FILES {
+        return Err(Nfs4Status::Notsupp.into());
+    }
     
-    // 构建 Device Info
+    // 获取所有 Worker 节点地址（从 Curvine Master）
+    // 注意：需要实现 get_worker_addresses 方法
+    let workers = handler.layout_mgr.get_worker_addresses().await?;
+    
+    // 构建 Device Info（RFC 5661 Section 18.40.2）
     let device_info = DeviceInfo {
         deviceid,
         layout_type,
@@ -449,8 +565,8 @@ pub async fn op_getdeviceinfo(
     Ok(result)
 }
 
-/// 构建多路径地址列表
-fn build_multipath_list(workers: &[WorkerInfo]) -> Nfs4Result<Vec<u8>> {
+/// 构建多路径地址列表（RFC 5663 Section 4.1）
+fn build_multipath_list(workers: &[WorkerAddress]) -> Nfs4Result<Vec<u8>> {
     let mut result = Vec::new();
     
     // stripe_indices 数量
@@ -461,31 +577,55 @@ fn build_multipath_list(workers: &[WorkerInfo]) -> Nfs4Result<Vec<u8>> {
         (idx as u32).serialize(&mut result)?;
         
         // multipath_list (每个 stripe 可以有多个地址用于容错)
+        // 当前实现：每个 Worker 一个地址
+        // 未来可以扩展：支持多个网络接口（主备）
         1u32.serialize(&mut result)?;  // 地址数量
         
-        // netaddr4
-        let netid = b"tcp".to_vec();
+        // netaddr4 (RFC 5661 Section 4.2)
+        let netid = b"tcp".to_vec();  // 或 "tcp6" for IPv6
         netid.serialize(&mut result)?;
         
-        // 地址格式: "IP.IP.IP.IP.PORT_HI.PORT_LO"
+        // 地址格式: "IP.IP.IP.IP.PORT_HI.PORT_LO" (RFC 5661 Section 4.2)
+        // 注意: 所有 DS 使用标准端口 2049（与 MDS 相同）
+        // 例如: "192.168.1.10" → "192.168.1.10.0.80" (端口 2049)
         let addr = format_nfs_addr(&worker.addr)?;
         addr.serialize(&mut result)?;
     }
     
     Ok(result)
 }
+
+/// 格式化 Worker 地址为 NFS netaddr4 格式
+fn format_nfs_addr(worker_addr: &WorkerAddress) -> Nfs4Result<Vec<u8>> {
+    // WorkerAddress 格式: "IP:Port" 或 "IP"
+    // pNFS DS 使用标准端口 2049（与 MDS 相同）
+    // 例如: "192.168.1.10" → [192, 168, 1, 10, 0, 80]
+    // Port 2049 = 0x0801 → [0x08, 0x01] → [0, 80] (big-endian)
+    
+    // 实现细节：
+    // 1. 解析 IP 地址
+    // 2. 端口固定为 2049（标准 NFS 端口）
+    // 3. 转换为 6 字节格式: [IP1, IP2, IP3, IP4, PORT_HI, PORT_LO]
+    // ...
+}
 ```
+
+**依赖的现有接口**：
+- ⚠️ 需要添加：`get_worker_addresses()` - 从 Master 获取 Worker 地址列表
+- ✅ Worker 地址信息：Worker 注册时包含地址信息
 
 
 ### 5.4 数据服务器 (DS) 实现
 
-#### 5.4.1 Worker 端 pNFS 服务
+#### 5.4.1 Worker 端架构分析
 
-每个 Curvine Worker 需要运行一个轻量级的 pNFS DS 服务：
+**当前状态**：
+
+Curvine Worker 已经存在读写接口，但这是 **Curvine 内部的 RPC 协议**（基于 protobuf），不是标准的 NFS 协议：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    Worker pNFS DS 服务                                  │
+│                    Curvine Worker 当前架构                               │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
@@ -493,39 +633,276 @@ fn build_multipath_list(workers: &[WorkerInfo]) -> Nfs4Result<Vec<u8>> {
 │  ├─────────────────────────────────────────────────────────────────┤    │
 │  │                                                                  │    │
 │  │  ┌─────────────────┐    ┌─────────────────┐                      │    │
-│  │  │  Block Storage  │    │   pNFS DS       │                      │    │
-│  │  │  (existing)     │◄───│   Service       │◄─── NFS Client       │    │
-│  │  │                 │    │   (new)         │                      │    │
+│  │  │  Block Storage  │◄───│  Curvine RPC    │◄─── Curvine Client  │    │
+│  │  │  (existing)     │    │  (protobuf)     │   (Gateway/FUSE)    │    │
+│  │  │                 │    │                 │                      │    │
+│  │  │                 │    │  - BlockReadRequest                   │    │
+│  │  │                 │    │  - BlockWriteRequest                  │    │
 │  │  └─────────────────┘    └─────────────────┘                      │    │
 │  │                                                                  │    │
-│  │  pNFS DS 只需实现:                                               │    │
-│  │  - READ: 读取指定 Block 的数据                                   │    │
-│  │  - WRITE: 写入指定 Block 的数据 (可选)                           │    │
-│  │  - COMMIT: 提交写入 (可选)                                       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  问题: NFS Client 无法直接使用 Curvine RPC                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**pNFS DS 服务需求**：
+
+pNFS 客户端需要**标准的 NFSv4.1 协议**来直接访问 Worker，因此需要实现一个 NFS DS 服务层：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Worker pNFS DS 服务架构                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                     Curvine Worker                               │    │
+│  ├─────────────────────────────────────────────────────────────────┤    │
+│  │                                                                  │    │
+│  │  ┌─────────────────┐    ┌─────────────────┐    ┌──────────────┐ │    │
+│  │  │  Block Storage  │◄───│  Curvine RPC    │◄───│  pNFS DS     │ │    │
+│  │  │  (existing)     │    │  (existing)     │    │  Service     │ │    │
+│  │  │                 │    │                 │    │  (new)       │ │    │
+│  │  └─────────────────┘    └─────────────────┘    └──────┬───────┘ │    │
+│  │                                                         │         │    │
+│  │                                                         │ NFSv4.1 │    │
+│  │                                                         ▼         │    │
+│  │                                                  ┌──────────────┐ │    │
+│  │                                                  │ NFS Client   │ │    │
+│  │                                                  │ (Linux Kernel)│ │    │
+│  │                                                  └──────────────┘ │    │
+│  │                                                                  │    │
+│  │  pNFS DS 服务需要实现:                                          │    │
+│  │  - NFSv4.1 READ: 标准 NFS 协议，内部调用 Curvine RPC            │    │
+│  │  - NFSv4.1 WRITE: 标准 NFS 协议，内部调用 Curvine RPC (可选)    │    │
+│  │  - NFSv4.1 COMMIT: 标准 NFS 协议 (可选)                         │    │
 │  │                                                                  │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 5.4.2 DS READ 实现
+#### 5.4.2 Worker 现有接口分析
 
-```rust
-/// pNFS DS READ 操作
-/// 
-/// 客户端直接向 Worker 发送 READ 请求
-/// 文件句柄包含 Block ID 信息
-pub async fn ds_read(
-    block_id: u64,
-    offset: u64,      // Block 内偏移
-    count: u32,
-    storage: &BlockStorage,
-) -> Result<Vec<u8>, Error> {
-    // 直接从本地存储读取
-    let data = storage.read_block(block_id, offset, count).await?;
-    Ok(data)
+**Curvine RPC 接口**（已存在）：
+
+```protobuf
+// curvine-common/proto/worker.proto
+
+message BlockReadRequest {
+    required int64 id = 1;           // Block ID
+    required int64 off = 2;          // Block 内偏移
+    required int64 len = 3;          // 读取长度
+    required int32 chunk_size = 4;   // 块大小
+    required bool short_circuit = 5;  // 是否短路读取
+    required bool enable_read_ahead = 8;
+    required int64 read_ahead_len = 9;
+    required int64 drop_cache_len = 10;
+}
+
+message BlockWriteRequest {
+    required ExtendedBlockProto block = 1;
+    required int64 off = 2;
+    required int64 block_size = 3;
+    required bool short_circuit = 4;
+    required string client_name = 5;
+    required int32 chunk_size = 6;
 }
 ```
+
+**接口评估**：
+
+✅ **满足 pNFS DS 需求**：
+- Block ID 标识：`BlockReadRequest.id` 可以标识 Block
+- 偏移和长度：`off` 和 `len` 支持部分读取
+- 读取接口：`ReadHandler` 已实现完整的读取逻辑
+
+⚠️ **需要适配**：
+- **协议转换**：需要将 NFSv4.1 READ 请求转换为 `BlockReadRequest`
+- **文件句柄解析**：NFS 文件句柄需要编码 Block ID 信息
+- **NFS 协议实现**：需要实现标准的 NFSv4.1 READ/WRITE 操作
+
+#### 5.4.3 pNFS DS 服务实现方案
+
+**端口配置**：✅ **复用标准 NFS 端口 2049**
+
+pNFS DS 服务**不需要单独端口**，可以复用标准 NFS 端口 2049：
+
+- **标准做法**：所有 NFS 服务（MDS 和 DS）都使用端口 2049
+- **客户端识别**：客户端通过 GETDEVICEINFO 返回的 IP 地址区分不同的 DS
+- **部署优势**：
+  - 符合 NFS 标准（RFC 5661）
+  - 无需防火墙特殊配置
+  - 客户端无需特殊端口配置
+  - 如果 Worker 和 Gateway 在同一台机器，可通过不同 IP 地址区分
+
+**方案一：独立 NFS DS 服务**（推荐）
+
+在每个 Worker 上运行一个轻量级的 NFS DS 服务，实现标准 NFSv4.1 协议：
+
+```rust
+/// pNFS DS 服务 - 桥接 NFS 协议和 Curvine RPC
+pub struct PnfsDataServer {
+    /// Curvine Worker RPC 客户端
+    curvine_client: Arc<CurvineRpcClient>,
+    /// Block Store（用于直接访问，可选优化）
+    block_store: Option<Arc<BlockStore>>,
+}
+
+impl PnfsDataServer {
+    /// 启动 pNFS DS 服务
+    /// 
+    /// 监听标准 NFS 端口 2049（与 Gateway 相同）
+    /// 客户端通过 IP 地址区分 MDS 和 DS
+    pub async fn start(&self, listen_addr: &str) -> Result<(), Error> {
+        // 复用 curvine-nfs 的 NFS 服务器代码
+        // 监听端口 2049（标准 NFS 端口）
+        let listener = TcpListener::bind(format!("{}:2049", listen_addr)).await?;
+        // ...
+    }
+}
+
+impl PnfsDataServer {
+    /// NFSv4.1 READ 操作
+    /// 
+    /// 1. 解析文件句柄获取 Block ID
+    /// 2. 调用 Curvine RPC 读取数据
+    /// 3. 返回标准 NFS 响应
+    pub async fn nfs_read(
+        &self,
+        fh: &[u8],      // NFS 文件句柄（编码 Block ID）
+        offset: u64,   // 文件偏移（需要转换为 Block 内偏移）
+        count: u32,
+    ) -> Nfs4Result<Vec<u8>> {
+        // 1. 解析文件句柄
+        let block_id = parse_block_id_from_fh(fh)?;
+        let block_offset = offset % BLOCK_SIZE;
+        
+        // 2. 调用 Curvine RPC
+        let req = BlockReadRequest {
+            id: block_id,
+            off: block_offset,
+            len: count as i64,
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            short_circuit: false,
+            enable_read_ahead: true,
+            read_ahead_len: 4 * 1024 * 1024,
+            drop_cache_len: 1024 * 1024,
+        };
+        
+        let data = self.curvine_client.read_block(req).await?;
+        
+        // 3. 返回 NFS 格式数据
+        Ok(data)
+    }
+    
+    /// NFSv4.1 WRITE 操作（可选）
+    pub async fn nfs_write(
+        &self,
+        fh: &[u8],
+        offset: u64,
+        data: &[u8],
+        stable: bool,
+    ) -> Nfs4Result<WriteResult> {
+        // 类似 READ，调用 Curvine RPC
+        // ...
+    }
+}
+```
+
+**文件句柄编码方案**：
+
+```rust
+/// 编码 Block ID 到 NFS 文件句柄
+/// 
+/// 文件句柄格式（16 bytes）:
+/// [0-7]: Block ID (u64, big-endian)
+/// [8-15]: 保留（可用于 Block 偏移或其他元数据）
+fn encode_block_fh(block_id: u64) -> Vec<u8> {
+    let mut fh = vec![0u8; 16];
+    fh[0..8].copy_from_slice(&block_id.to_be_bytes());
+    fh
+}
+
+/// 从 NFS 文件句柄解析 Block ID
+fn parse_block_id_from_fh(fh: &[u8]) -> Nfs4Result<u64> {
+    if fh.len() < 8 {
+        return Err(Nfs4Status::BadHandle.into());
+    }
+    let block_id = u64::from_be_bytes([
+        fh[0], fh[1], fh[2], fh[3],
+        fh[4], fh[5], fh[6], fh[7],
+    ]);
+    Ok(block_id)
+}
+```
+
+**方案二：复用现有 NFS Gateway 代码**（简化实现，推荐）
+
+如果 Worker 和 Gateway 在同一代码库，可以**完全复用** NFS Gateway 的代码：
+
+```rust
+// Worker 端启动 pNFS DS 服务
+pub async fn start_pnfs_ds_service(worker: &Worker) -> Result<(), Error> {
+    // 复用 curvine-nfs 的 NFS 服务器代码
+    // 使用标准端口 2049（与 Gateway 相同）
+    let ds_fs = PnfsDsFileSystem::new(worker.block_store.clone());
+    
+    // 复用相同的 NfsServer 实现
+    let nfs_server = NfsServer::new(ds_fs);
+    
+    // 监听标准 NFS 端口 2049
+    // 注意：如果 Worker 和 Gateway 在同一台机器，需要：
+    // 1. 使用不同的 IP 地址（推荐）
+    // 2. 或者使用 SO_REUSEPORT（Linux 3.9+）
+    nfs_server.listen("0.0.0.0:2049").await?;
+    
+    Ok(())
+}
+```
+
+**端口复用说明**：
+
+1. **标准做法**：MDS 和 DS 都使用端口 2049
+   - Gateway (MDS): `192.168.1.100:2049`
+   - Worker 1 (DS): `192.168.1.10:2049`
+   - Worker 2 (DS): `192.168.1.11:2049`
+   - Worker 3 (DS): `192.168.1.12:2049`
+
+2. **客户端识别**：
+   - 客户端通过 GETDEVICEINFO 返回的 IP 地址连接不同的 DS
+   - 所有连接都使用标准端口 2049
+   - 无需特殊端口配置
+
+3. **同机部署**（Worker 和 Gateway 在同一台机器）：
+   - **方案 A**：使用不同 IP 地址（推荐）
+     - Gateway: `192.168.1.100:2049`
+     - DS: `192.168.1.101:2049`（绑定到另一个 IP）
+   - **方案 B**：使用 SO_REUSEPORT（Linux 3.9+）
+     - 多个进程可以绑定同一端口
+     - 内核自动负载均衡连接
+
+4. **优势**：
+   - ✅ 符合 NFS 标准（RFC 5661）
+   - ✅ 简化客户端配置（无需特殊端口）
+   - ✅ 简化防火墙规则（只需开放 2049）
+   - ✅ 代码复用（DS 服务可以复用 Gateway 的 NFS 协议代码）
+
+#### 5.4.4 实现状态
+
+**已具备的基础**：
+- ✅ Worker 有 `BlockReadRequest`/`BlockReadResponse` RPC 接口
+- ✅ Worker 有 `BlockWriteRequest`/`BlockWriteResponse` RPC 接口
+- ✅ Worker 有 `ReadHandler` 和 `WriteHandler` 实现
+- ✅ Gateway 有 `get_block_locations` 接口（可用于 LAYOUTGET）
+
+**待实现**：
+- ❌ pNFS DS 服务：标准 NFSv4.1 协议实现
+- ❌ 文件句柄编码：Block ID → NFS 文件句柄
+- ❌ 协议桥接：NFS READ → Curvine RPC
+- ❌ MDS 端 LAYOUTGET：返回包含 Block 信息的 Layout
+- ❌ MDS 端 GETDEVICEINFO：返回 Worker 地址信息
 
 ### 5.5 完整读取流程
 
@@ -557,9 +934,10 @@ pub async fn ds_read(
 │    │                           │                         │              │
 │    │  5. Device Info Response  │                         │              │
 │    │ ◄─────────────────────────│                         │              │
-│    │  (W1=192.168.1.10:2049,   │                         │              │
-│    │   W2=192.168.1.11:2049,   │                         │              │
+│    │  (W1=192.168.1.10,        │                         │              │
+│    │   W2=192.168.1.11,        │                         │              │
 │    │   ...)                    │                         │              │
+│    │  注意: 所有 DS 使用标准端口 2049                      │              │
 │    │                           │                         │              │
 │    │  6. 并行 READ (直接到 Workers)                      │              │
 │    │ ─────────────────────────────────────────────────►  │ W1           │
@@ -611,24 +989,50 @@ pNFS 架构延迟:
 
 1. **MDS 端实现**
    - [ ] LAYOUTGET 操作
+     - [ ] 实现 `op_layoutget` 处理函数
+     - [ ] 从 `FileStatus.blocks` 提取 Block 信息
+     - [ ] 构建 pNFS File Layout 响应
+     - [ ] 文件句柄编码（Block ID → NFS FH）
    - [ ] GETDEVICEINFO 操作
+     - [ ] 实现 `op_getdeviceinfo` 处理函数
+     - [ ] 从 Master 获取 Worker 地址列表
+     - [ ] 构建 Device Info 响应（multipath_list）
    - [ ] LAYOUTRETURN 操作
+     - [ ] 实现 `op_layoutreturn` 处理函数
+     - [ ] 清理 Layout 状态
    - [ ] Layout Manager
+     - [ ] Layout 状态管理
+     - [ ] Device ID 管理
 
 2. **协议支持**
-   - [ ] pNFS File Layout 编解码
-   - [ ] Device Info 编解码
+   - [ ] pNFS File Layout 编解码（RFC 5663）
+   - [ ] Device Info 编解码（RFC 5661）
+   - [ ] 文件句柄编解码（Block ID ↔ NFS FH）
 
-### 7.2 阶段二：DS 服务 (2 周)
+### 7.2 阶段二：DS 服务 (2-3 周)
 
 1. **Worker 端实现**
    - [ ] pNFS DS 服务框架
+     - [ ] NFSv4.1 协议服务器（复用 curvine-nfs 代码）
+     - [ ] 监听标准 NFS 端口 2049（与 Gateway 相同，通过 IP 区分）
+     - [ ] 最小化 NFS 操作集（READ/WRITE/COMMIT/GETATTR）
+     - [ ] 文件句柄处理（Block ID 编码/解码）
    - [ ] DS READ 操作
-   - [ ] Block 直接访问接口
+     - [ ] 解析 NFS 文件句柄获取 Block ID
+     - [ ] 调用 Curvine RPC `BlockReadRequest`
+     - [ ] 返回标准 NFS READ 响应
+   - [ ] DS WRITE 操作（可选，初期可跳过）
+     - [ ] 解析文件句柄
+     - [ ] 调用 Curvine RPC `BlockWriteRequest`
+     - [ ] 返回标准 NFS WRITE 响应
+   - [ ] 文件句柄处理
+     - [ ] Block ID 编码到 NFS 文件句柄
+     - [ ] 从 NFS 文件句柄解析 Block ID
 
 2. **测试**
    - [ ] 单 Worker 读取测试
    - [ ] 多 Worker 并行读取测试
+   - [ ] 与 Linux pNFS 客户端兼容性测试
 
 ### 7.3 阶段三：优化与完善 (1 周)
 
@@ -656,15 +1060,130 @@ pNFS 架构延迟:
 1. **写入支持**：初期只支持读取，写入仍走 Gateway
 2. **小文件**：小于一个 Block 的文件不受益于 pNFS
 3. **客户端要求**：需要 Linux 内核 pNFS 支持 (2.6.37+)
+4. **DS 服务部署**：需要在每个 Worker 上部署 pNFS DS 服务（复用端口 2049）
+5. **协议转换开销**：NFS → Curvine RPC 的转换会有少量开销
+6. **端口复用**：如果 Worker 和 Gateway 在同一台机器，需要使用不同 IP 或 SO_REUSEPORT
 
-## 9. 参考资料
+### 8.3 实现状态总结
+
+**已具备的基础**：
+- ✅ Curvine Worker 有完整的 Block 读写 RPC 接口
+- ✅ Gateway 有 `get_block_locations` 接口（可用于 LAYOUTGET）
+- ✅ FileStatus.blocks 包含 Block 位置信息
+- ✅ Worker 地址信息可从 Master 获取
+
+**待实现的核心功能**：
+- ❌ MDS 端：LAYOUTGET、GETDEVICEINFO、LAYOUTRETURN
+- ❌ DS 端：NFSv4.1 协议服务器、READ/WRITE 操作
+- ❌ 协议桥接：NFS 协议 ↔ Curvine RPC
+- ❌ 文件句柄编码：Block ID ↔ NFS 文件句柄
+
+**技术难点**：
+1. **文件句柄设计**：需要设计紧凑且可扩展的文件句柄格式
+2. **协议兼容性**：确保与 Linux pNFS 客户端完全兼容
+3. **错误处理**：Worker 故障时的 Layout 失效和恢复
+4. **性能优化**：减少协议转换开销
+
+## 9. 实现状态与依赖分析
+
+### 9.1 当前实现状态
+
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| **MDS 端 (Gateway)** | | |
+| LAYOUTGET | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
+| GETDEVICEINFO | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
+| LAYOUTRETURN | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
+| LAYOUTCOMMIT | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
+| Layout Manager | ❌ 未实现 | 需要新建模块 |
+| Device Manager | ❌ 未实现 | 需要新建模块 |
+| **DS 端 (Worker)** | | |
+| NFS DS 服务 | ❌ 未实现 | 需要新建服务 |
+| DS READ 操作 | ❌ 未实现 | 需要实现 NFS 协议 |
+| DS WRITE 操作 | ❌ 未实现 | 可选，初期可跳过 |
+| **基础接口** | | |
+| get_block_locations | ✅ 已存在 | `curvine_nfs_fs.rs` |
+| FileStatus.blocks | ✅ 已存在 | Curvine 文件状态 |
+| Worker RPC 接口 | ✅ 已存在 | BlockReadRequest/BlockWriteRequest |
+| Worker 地址信息 | ✅ 已存在 | Worker 注册时包含 |
+
+### 9.2 依赖关系分析
+
+```
+实现 pNFS 的依赖链：
+
+LAYOUTGET
+  ├─ get_block_locations() ✅ 已存在
+  ├─ FileStatus.blocks ✅ 已存在
+  └─ Layout Manager ❌ 待实现
+      └─ Device Manager ❌ 待实现
+
+GETDEVICEINFO
+  ├─ Worker 地址列表 ⚠️ 需要从 Master 获取
+  └─ Device Manager ❌ 待实现
+
+DS READ
+  ├─ NFS DS 服务 ❌ 待实现
+  ├─ 文件句柄解析 ❌ 待实现
+  └─ Curvine RPC ✅ 已存在
+      └─ BlockReadRequest ✅ 已存在
+```
+
+### 9.3 Worker 接口满足度评估
+
+**BlockReadRequest 接口分析**：
+
+| pNFS DS 需求 | Curvine RPC | 满足度 | 说明 |
+|-------------|------------|--------|------|
+| Block 标识 | `id: int64` | ✅ 完全满足 | Block ID 唯一标识 |
+| 偏移量 | `off: int64` | ✅ 完全满足 | Block 内偏移 |
+| 读取长度 | `len: int64` | ✅ 完全满足 | 支持部分读取 |
+| 块大小 | `chunk_size: int32` | ✅ 完全满足 | 可配置 |
+| 性能优化 | `enable_read_ahead` | ✅ 完全满足 | 预读支持 |
+| 协议 | protobuf RPC | ⚠️ 需要桥接 | 不是 NFS 协议 |
+
+**结论**：Worker 的 RPC 接口**完全满足** pNFS DS 的功能需求，但需要额外的 NFS 协议层来桥接。
+
+### 9.4 实现建议
+
+**优先级排序**：
+
+1. **P0（核心功能）**：
+   - MDS 端 LAYOUTGET（复用现有 `get_block_locations`）
+   - MDS 端 GETDEVICEINFO（从 Master 获取 Worker 地址）
+   - DS 端 NFS READ（桥接到 Curvine RPC）
+
+2. **P1（完整功能）**：
+   - MDS 端 LAYOUTRETURN
+   - 文件句柄编码/解码
+   - Layout Manager
+
+3. **P2（优化功能）**：
+   - DS 端 NFS WRITE
+   - MDS 端 LAYOUTCOMMIT
+   - Layout 缓存优化
+
+**实现策略**：
+
+1. **复用现有代码**：
+   - 复用 `curvine-nfs` 的 NFS 协议处理代码（用于 DS 服务）
+   - 复用 `get_block_locations` 逻辑（用于 LAYOUTGET）
+   - 复用 Worker RPC 客户端（用于 DS READ）
+
+2. **最小化实现**：
+   - DS 服务只需实现 READ 操作（初期）
+   - Layout Manager 可以简化（无持久化）
+   - Device Manager 可以静态配置（从配置文件读取 Worker 地址）
+
+## 10. 参考资料
 
 - RFC 5661: NFSv4.1 Protocol
 - RFC 5663: pNFS File Layout
-- Linux Kernel pNFS: fs/nfs/pnfs.c, fs/nfs/filelayout/
-- NFS-Ganesha pNFS: src/FSAL/FSAL_GPFS/fsal_pnfs.c
+- Linux Kernel pNFS: `fs/nfs/pnfs.c`, `fs/nfs/filelayout/`
+- NFS-Ganesha pNFS: `src/FSAL/FSAL_GPFS/fsal_pnfs.c`
+- NFS-Ganesha DS: `src/support/ds.c`
 
-## 10. 附录：XDR 定义
+## 11. 附录：XDR 定义
 
 ```xdr
 /* Layout Types */
@@ -689,3 +1208,27 @@ struct da_addr_body {
     multipath_list4 multipath_ds_list<>;
 };
 ```
+
+---
+
+**文档版本**: 1.1  
+**创建日期**: 2025-12-31  
+**更新日期**: 2025-01-01  
+**最后更新**: 审查并更新 DS 服务实现方案，明确 Worker 接口满足度
+
+**参考实现**: 
+- NFS-Ganesha: `/home/oppo/Documents/nfs-ganesha/src/Protocols/NFS`
+- 核心文件:
+  - `src/FSAL/FSAL_GPFS/fsal_pnfs.c`: pNFS 布局管理
+  - `src/support/ds.c`: Data Server 支持
+  - `src/include/pnfs_utils.h`: pNFS 工具函数
+
+**开发环境**:
+- Curvine 集群: `/home/oppo/Documents/curvine/build/dist/bin/restart-all.sh`
+- NFS Gateway: `/home/oppo/Documents/curvine/build/dist/bin/curvine-nfs-gateway.sh`
+- 挂载点: `/mnt/curvine-nfs41` (NFSv4.1)
+
+**关键发现**:
+- ✅ Worker 已有完整的 Block 读写 RPC 接口（`BlockReadRequest`/`BlockWriteRequest`）
+- ⚠️ Worker 接口是 Curvine 内部 RPC，不是标准 NFS 协议
+- ❌ 需要实现 pNFS DS 服务层，桥接 NFS 协议和 Curvine RPC

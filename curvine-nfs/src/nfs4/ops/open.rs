@@ -95,53 +95,100 @@ pub async fn op_open(
         filename = Some(name);
     }
 
-    validate_claim(claim_type, ctx)?;
+    // Validate claim type and check grace period (NFS-Ganesha aligned)
+    validate_claim(claim_type, ctx, handler, clientid)?;
 
     let is_claim_previous = claim_type == 1;
 
     let fh = ctx.require_current_fh()?;
     let parent_id = handler.fs.fh_to_fileid(fh)?;
 
-    let (fileid, is_create) = if let Some(name) = filename {
-        let name_str = String::from_utf8_lossy(&name);
+    // Variables that will be set by either branch
+    let fileid: u64;
+    let is_create: bool;
 
-        if opentype == 1 {
-            let (fid, _status) = handler.fs.create_file(parent_id, &name_str).await?;
+    // Handle CLAIM_PREVIOUS: find and restore persisted state
+    let open_state = if is_claim_previous {
+        // CLAIM_PREVIOUS: use current filehandle (NFS-Ganesha aligned)
+        fileid = parent_id;
+        is_create = false; // CLAIM_PREVIOUS is never a create
 
-            if let Some((mode, uid, gid, size, atime, mtime)) = create_attrs {
-                if mode.is_some()
-                    || uid.is_some()
-                    || gid.is_some()
-                    || size.is_some()
-                    || atime.is_some()
-                    || mtime.is_some()
-                {
-                    handler
-                        .fs
-                        .setattr(fid, mode, uid, gid, size, atime, mtime)
-                        .await?;
-                }
+        // Find persisted state by (fileid, owner_val)
+        match handler.opens.find_persisted_state(fileid, &owner_data) {
+            Some(persisted_state) => {
+                // Found persisted state - confirm it (NFS-Ganesha: so_confirmed = true)
+                persisted_state.set_confirmed(true);
+
+                // Reopen file (NFS-Ganesha: fsal_reopen2 with FSAL_O_RECLAIM)
+                handler
+                    .fs
+                    .reopen_file_ex(fileid, persisted_state.get_access() | share_access, true)
+                    .await?;
+
+                tracing::info!(
+                    "OPEN CLAIM_PREVIOUS: reclaimed stateid={:?} fileid={}",
+                    persisted_state.stateid,
+                    fileid
+                );
+
+                persisted_state
             }
-
-            (fid, true)
-        } else {
-            let (fid, _status) = handler.fs.lookup(parent_id, &name_str).await?;
-            (fid, false)
+            None => {
+                // No persisted state found - return error (NFS-Ganesha: NFS4ERR_RECLAIM_BAD)
+                tracing::warn!(
+                    "OPEN CLAIM_PREVIOUS: no persisted state found for fileid={} owner={:02x?}",
+                    fileid,
+                    &owner_data[..owner_data.len().min(8)]
+                );
+                return Err(Nfs4Status::ReclaimBad.into());
+            }
         }
     } else {
-        (parent_id, false)
-    };
+        // CLAIM_NULL: normal open path
+        let (fid, created) = if let Some(name) = filename {
+            let name_str = String::from_utf8_lossy(&name);
 
-    let open_state = open_ex(
-        handler,
-        clientid,
-        owner_data,
-        fileid,
-        share_access,
-        share_deny,
-        is_create,
-    )
-    .await?;
+            if opentype == 1 {
+                let (fid, _status) = handler.fs.create_file(parent_id, &name_str).await?;
+
+                if let Some((mode, uid, gid, size, atime, mtime)) = create_attrs {
+                    if mode.is_some()
+                        || uid.is_some()
+                        || gid.is_some()
+                        || size.is_some()
+                        || atime.is_some()
+                        || mtime.is_some()
+                    {
+                        handler
+                            .fs
+                            .setattr(fid, mode, uid, gid, size, atime, mtime)
+                            .await?;
+                    }
+                }
+
+                (fid, true)
+            } else {
+                let (fid, _status) = handler.fs.lookup(parent_id, &name_str).await?;
+                (fid, false)
+            }
+        } else {
+            (parent_id, false)
+        };
+
+        fileid = fid;
+        is_create = created;
+
+        open_ex(
+            handler,
+            clientid,
+            owner_data,
+            fileid,
+            share_access,
+            share_deny,
+            is_create,
+        )
+        .await?
+    };
 
     let path = handler.fs.get_path(fileid).ok();
     tracing::info!(
@@ -155,11 +202,10 @@ pub async fn op_open(
         is_create
     );
 
-    if is_claim_previous {
-        open_state.set_confirmed(true);
-    }
+    // CLAIM_PREVIOUS already confirmed the state above
+    // For CLAIM_NULL, confirmation is handled in open_ex
 
-    ctx.current_fh = Some(handler.fs.fileid_to_fh(fileid));
+    ctx.current_fh = Some(handler.fs.fileid_to_fh(open_state.fileid));
 
     let mut result = Vec::new();
 
@@ -167,9 +213,10 @@ pub async fn op_open(
     let response_stateid = Stateid4::new(new_seqid, open_state.stateid.other);
     response_stateid.serialize(&mut result)?;
 
-    1u32.serialize(&mut result)?;
-    0u64.serialize(&mut result)?;
-    0u64.serialize(&mut result)?;
+    // change_info4: atomic=true, before=0, after=0
+    1u32.serialize(&mut result)?;  // atomic
+    0u64.serialize(&mut result)?;  // before
+    0u64.serialize(&mut result)?;  // after
 
     let mut rflags = 0u32;
     if ctx.minor_version == 0 {
@@ -179,12 +226,40 @@ pub async fn op_open(
     } else {
         open_state.set_confirmed(true);
     }
-    rflags |= 0x00000001; // OPEN4_RESULT_LOCKTYPE_POSIX
+    // NFS-Ganesha: OPEN4_RESULT_LOCKTYPE_POSIX = 0x00000004 (nfsv41.h line 1667)
+    rflags |= 0x00000004; // OPEN4_RESULT_LOCKTYPE_POSIX
     rflags.serialize(&mut result)?;
 
+    tracing::info!(
+        "OPEN response: stateid={:?} rflags={:#x} minor_version={}",
+        response_stateid,
+        rflags,
+        ctx.minor_version
+    );
+
+    // attrset bitmap (empty)
     0u32.serialize(&mut result)?;
 
-    if handler.delegations.is_enabled() && !is_create {
+    // Delegation handling (NFS-Ganesha aligned: nfs4_op_open.c line 605-609)
+    // Record open for delegation heuristics (NFS-Ganesha: fds_num_opens tracking)
+    let is_write_open = (share_access & 0x02) != 0;
+    handler.delegations.record_open(fileid, is_write_open);
+
+    // OPEN4_SHARE_ACCESS_WANT_DELEG_MASK = 0x0F00
+    let want_deleg_mask: u32 = 0x0F00;
+    let client_wants_deleg = (share_access & want_deleg_mask) != 0;
+
+    let deleg_enabled = handler.delegations.is_enabled();
+    tracing::info!(
+        "OPEN delegation: enabled={} is_create={} is_write={} want_deleg={} minor_version={}",
+        deleg_enabled,
+        is_create,
+        is_write_open,
+        client_wants_deleg,
+        ctx.minor_version
+    );
+
+    if deleg_enabled && !is_create {
         // Try to grant delegation
         let delegation = handler.delegations.try_grant(
             clientid,
@@ -193,12 +268,33 @@ pub async fn op_open(
             handler.fs.fileid_to_fh(fileid),
         );
 
-        let deleg_bytes =
-            encode_open_delegation(delegation.as_ref(), &handler.fs.fileid_to_fh(fileid))?;
+        tracing::info!(
+            "OPEN delegation result: {:?}",
+            delegation.as_ref().map(|d| d.deleg_type)
+        );
+
+        let deleg_bytes = encode_open_delegation(
+            delegation.as_ref(),
+            &handler.fs.fileid_to_fh(fileid),
+            ctx.minor_version,
+            client_wants_deleg,
+        )?;
+        tracing::info!("OPEN delegation bytes: len={}", deleg_bytes.len());
         result.extend_from_slice(&deleg_bytes);
     } else {
-        0u32.serialize(&mut result)?;
+        // No delegation - encode based on minor version and client request
+        // NFS-Ganesha: nfs4_op_open.c line 605-609
+        let deleg_bytes = encode_open_delegation(
+            None,
+            &handler.fs.fileid_to_fh(fileid),
+            ctx.minor_version,
+            client_wants_deleg,
+        )?;
+        tracing::info!("OPEN delegation: NONE, bytes len={}", deleg_bytes.len());
+        result.extend_from_slice(&deleg_bytes);
     }
+
+    tracing::info!("OPEN response total bytes: len={}", result.len());
 
     Ok(result)
 }
@@ -265,11 +361,53 @@ async fn open_ex(
     Ok(open_state)
 }
 
-/// Validate claim type
-fn validate_claim(claim_type: u32, _ctx: &CompoundContext) -> Nfs4Result<()> {
+/// Validate claim type and check grace period (NFS-Ganesha aligned)
+///
+/// Reference: nfs4_op_open.c:open4_validate_claim()
+fn validate_claim(
+    claim_type: u32,
+    ctx: &CompoundContext,
+    handler: &CompoundHandler,
+    clientid: Clientid4,
+) -> Nfs4Result<()> {
     match claim_type {
-        0 => Ok(()),                          // CLAIM_NULL
-        1 => Ok(()),                          // CLAIM_PREVIOUS
+        0 => {
+            // CLAIM_NULL: normal open - no grace period check needed for NFSv4.1
+            // NFS-Ganesha skips grace check when fsal_grace_support is true
+            Ok(())
+        }
+        1 => {
+            // CLAIM_PREVIOUS: reclaim, must be in grace period
+            // Check grace period (NFS-Ganesha: nfs_get_grace_status(want_grace=true))
+            let _guard = handler
+                .grace
+                .acquire_grace_status(true)
+                .map_err(|_| Nfs4Status::NoGrace)?;
+
+            // Get client state
+            let client = handler
+                .clients
+                .get_client(clientid)
+                .ok_or(Nfs4Status::StaleClientid)?;
+
+            // Check if client allows reclaim (NFS-Ganesha: cid_allow_reclaim)
+            if !client.allow_reclaim() {
+                tracing::warn!("CLAIM_PREVIOUS: client {} does not allow reclaim", clientid);
+                return Err(Nfs4Status::NoGrace.into());
+            }
+
+            // Check if reclaim already complete (NFSv4.1 only)
+            // NFS-Ganesha: nfs4_op_open.c line 155-158
+            if ctx.minor_version > 0 && client.is_reclaim_complete() {
+                tracing::warn!(
+                    "CLAIM_PREVIOUS: client {} already completed reclaim",
+                    clientid
+                );
+                return Err(Nfs4Status::NoGrace.into());
+            }
+
+            Ok(())
+        }
         2 => Err(Nfs4Status::Notsupp.into()), // CLAIM_DELEGATE_CUR
         3 => Err(Nfs4Status::Notsupp.into()), // CLAIM_DELEGATE_PREV
         _ => Err(Nfs4Status::Inval.into()),

@@ -468,8 +468,8 @@ impl Default for NfsGatewayConf {
             cache_cleanup_interval_secs: 10,
             file_status_cache_size: 10000i64,
             file_status_cache_ttl_secs: 30,
-            // NFSv4 Delegation defaults (disabled for performance)
-            delegation_enabled: false,
+            // NFSv4 Delegation defaults (enabled for better read performance)
+            delegation_enabled: true,
             delegation_recall_timeout_secs: 30,
             delegation_max_count: 1000,
         }

@@ -190,14 +190,20 @@ impl NfsGatewayServer {
         Ok(handler)
     }
 
-    /// Load persisted state from filesystem
+    /// Load persisted state from filesystem and restore to state managers
+    ///
+    /// This function loads persisted state and restores it to ClientManager and OpenManager.
+    /// Restored states are marked as unconfirmed and will be confirmed when clients reclaim
+    /// them during grace period using CLAIM_PREVIOUS.
     async fn load_persisted_state(
         persistence: &Arc<StatePersistenceManager>,
-        _clients: &Arc<ClientManager>,
-        _opens: &Arc<OpenManager>,
+        clients: &Arc<ClientManager>,
+        opens: &Arc<OpenManager>,
         _locks: &Arc<LockManager>,
         _fs: &Arc<Nfs4FileSystem>,
     ) -> Result<(), FsError> {
+        use curvine_common::fs::Path as FsPath;
+
         // Load recovery metadata
         info!("    [1/4] Loading recovery metadata...");
         if let Ok(Some(meta)) = persistence.load_recovery_metadata().await {
@@ -209,28 +215,77 @@ impl NfsGatewayServer {
             info!("         ℹ No recovery metadata found (fresh start)");
         }
 
-        // Load clients
-        info!("    [2/4] Loading client states...");
+        // Load and restore clients
+        info!("    [2/4] Loading and restoring client states...");
         let persisted_clients = persistence.load_clients().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
                 "Failed to load clients: {e:?}"
             )))
         })?;
+
+        let mut restored_clients = 0;
+        for persisted_client in &persisted_clients {
+            // Restore client state (NFS-Ganesha aligned: restore during grace period)
+            if let Err(e) = clients.restore_persisted_client(persisted_client) {
+                tracing::warn!(
+                    "Failed to restore client {}: {:?}",
+                    persisted_client.clientid,
+                    e
+                );
+            } else {
+                restored_clients += 1;
+            }
+        }
         info!(
-            "         ✓ Loaded {} client state(s)",
+            "         ✓ Restored {}/{} client state(s)",
+            restored_clients,
             persisted_clients.len()
         );
 
-        // Load opens
-        info!("    [3/4] Loading open states...");
+        // Load and restore opens
+        info!("    [3/4] Loading and restoring open states...");
         let persisted_opens = persistence.load_opens().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
                 "Failed to load opens: {e:?}"
             )))
         })?;
-        info!("         ✓ Loaded {} open state(s)", persisted_opens.len());
 
-        // Load locks
+        let mut restored_opens = 0;
+        for persisted_open in &persisted_opens {
+            // Convert path string to Path (curvine_common::fs::Path)
+            let path = FsPath::new(&persisted_open.path).map_err(|e| {
+                FsError::io(std::io::Error::other(format!(
+                    "Invalid path in persisted open: {}: {:?}",
+                    persisted_open.path, e
+                )))
+            })?;
+
+            // Restore open state (NFS-Ganesha aligned: restore during grace period)
+            if let Err(e) = opens.restore_persisted_state(
+                persisted_open.stateid,
+                persisted_open.clientid,
+                persisted_open.fileid,
+                path,
+                persisted_open.share_access,
+                persisted_open.share_deny,
+                persisted_open.owner_val.clone(),
+            ) {
+                tracing::warn!(
+                    "Failed to restore open state {:02x?}: {:?}",
+                    &persisted_open.stateid[..4],
+                    e
+                );
+            } else {
+                restored_opens += 1;
+            }
+        }
+        info!(
+            "         ✓ Restored {}/{} open state(s)",
+            restored_opens,
+            persisted_opens.len()
+        );
+
+        // Load locks (not restoring yet, will be restored on reclaim)
         info!("    [4/4] Loading lock states...");
         let persisted_locks = persistence.load_locks().await.map_err(|e| {
             FsError::io(std::io::Error::other(format!(
@@ -248,6 +303,10 @@ impl NfsGatewayServer {
                 persisted_clients.len(),
                 persisted_opens.len(),
                 persisted_locks.len()
+            );
+            info!(
+                "    Restored: {} client(s), {} open(s)",
+                restored_clients, restored_opens
             );
             info!("    Note: Clients will reclaim state during grace period");
         } else {

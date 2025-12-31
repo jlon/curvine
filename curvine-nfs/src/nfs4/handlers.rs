@@ -468,6 +468,7 @@ async fn execute_operation(
         Nfs4Op::ExchangeId => op_exchange_id(input, ctx, handler).await,
         Nfs4Op::CreateSession => op_create_session(input, ctx, handler).await,
         Nfs4Op::DestroySession => op_destroy_session(input, ctx, handler).await,
+        Nfs4Op::BindConnToSession => op_bind_conn_to_session(input, ctx, handler).await,
         // Common operations
         Nfs4Op::Putrootfh => op_putrootfh(ctx, handler),
         Nfs4Op::Putpubfh => op_putpubfh(ctx, handler),
@@ -492,7 +493,7 @@ async fn execute_operation(
         Nfs4Op::Rename => op_rename(input, ctx, handler).await,
         Nfs4Op::Link => op_link(input, ctx, handler).await,
         Nfs4Op::Readlink => op_readlink(ctx, handler).await,
-        Nfs4Op::ReclaimComplete => op_reclaim_complete(input, ctx),
+        Nfs4Op::ReclaimComplete => op_reclaim_complete(input, ctx, handler),
         Nfs4Op::Delegreturn => op_delegreturn(input, ctx, handler).await,
         Nfs4Op::Access => op_access(input, ctx, handler).await,
         Nfs4Op::Setattr => op_setattr(input, ctx, handler).await,
@@ -516,6 +517,18 @@ async fn execute_operation(
 // ============================================================================
 
 /// SEQUENCE - must be first operation in most COMPOUNDs
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_sequence.c
+///
+/// Key sequence validation logic (line 196-197):
+/// ```c
+/// if (slot->sequence + 1 != arg_SEQUENCE4->sa_sequenceid) {
+///     // Handle replay or misordered sequence
+/// }
+/// slot->sequence += 1;
+/// res_SEQUENCE4->sr_sequenceid = slot->sequence;  // Return NEW sequence
+/// ```
 async fn op_sequence(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
@@ -525,22 +538,36 @@ async fn op_sequence(
     sessionid.deserialize(input)?;
     let sequenceid = input.read_u32::<BigEndian>()?;
     let slotid = input.read_u32::<BigEndian>()?;
-    let _highest_slotid = input.read_u32::<BigEndian>()?;
-    let _cachethis = input.read_u32::<BigEndian>()?;
+    let highest_slotid = input.read_u32::<BigEndian>()?;
+    let cachethis = input.read_u32::<BigEndian>()?;
 
-    debug!(
-        "SEQUENCE: session={:?} seq={} slot={}",
-        &sessionid[..4],
+    // Enhanced logging aligned with NFS-Ganesha tracepoint
+    info!(
+        "SEQUENCE: sessionid={:02x?} seq={} slot={} highest_slot={} cachethis={}",
+        &sessionid[..8],
         sequenceid,
-        slotid
+        slotid,
+        highest_slotid,
+        cachethis
     );
 
-    let (session, cached, highest, target_highest, flags) =
-        handler.sessions.sequence(&sessionid, slotid, sequenceid)?;
-
-    if let Some(cached_reply) = cached {
-        return Ok(cached_reply.reply);
-    }
+    // Process SEQUENCE - returns the NEW sequence id for response
+    // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence (after increment)
+    let (session, response_sequenceid, highest, target_highest, flags) = match handler
+        .sessions
+        .sequence(&sessionid, slotid, sequenceid)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            error!(
+                "SEQUENCE failed: sessionid={:02x?} req_seq={} error={:?}",
+                &sessionid[..8],
+                sequenceid,
+                e.status
+            );
+            return Err(e);
+        }
+    };
 
     ctx.sessionid = Some(sessionid);
     ctx.slot_id = Some(slotid);
@@ -548,13 +575,38 @@ async fn op_sequence(
 
     handler.clients.renew_lease(session.clientid)?;
 
+    // NFS-Ganesha: sr_status_flags should include SEQ4_STATUS_CB_PATH_DOWN (0x01)
+    // ONLY when client requested backchannel but we don't have one.
+    // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
+    // SEQ4_STATUS_CB_PATH_DOWN = 0x00000001
+    //
+    // If client didn't request backchannel, don't set CB_PATH_DOWN flag.
+    // This avoids the 5-second retry delay in Linux NFS client.
+    let client_requested_backchannel = (session.get_flags() & 0x00000002) != 0;
+    let status_flags = if client_requested_backchannel {
+        // Client requested backchannel but we don't have one
+        flags | 0x00000001
+    } else {
+        // Client didn't request backchannel, no need to set CB_PATH_DOWN
+        flags
+    };
+
+    info!(
+        "SEQUENCE response: resp_seq={} slot={} highest={} target_highest={} status_flags={:#x} (session_flags={:#x})",
+        response_sequenceid, slotid, highest, target_highest, status_flags, session.get_flags()
+    );
+
     let mut result = Vec::new();
     sessionid.serialize(&mut result)?;
-    sequenceid.serialize(&mut result)?;
+    // Return the NEW sequence id (after increment), not the request sequence id
+    // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence
+    response_sequenceid.serialize(&mut result)?;
     slotid.serialize(&mut result)?;
     highest.serialize(&mut result)?;
     target_highest.serialize(&mut result)?;
-    flags.serialize(&mut result)?;
+    status_flags.serialize(&mut result)?;
+
+    info!("SEQUENCE response bytes: len={}", result.len());
 
     Ok(result)
 }
@@ -596,6 +648,18 @@ async fn op_exchange_id(
     info!("EXCHANGE_ID: owner={:?} flags={:#x}", client_owner, flags);
 
     let (clientid, seqid, _result_flags) = handler.clients.exchange_id(client_owner)?;
+
+    // If in grace period and client reconnected, allow reclaim (NFS-Ganesha aligned)
+    // This allows the client to use CLAIM_PREVIOUS during grace period
+    if handler.grace.in_grace() {
+        if let Some(client) = handler.clients.get_client(clientid) {
+            client.set_allow_reclaim(true);
+            info!(
+                "EXCHANGE_ID: client {} reconnected during grace period, allow_reclaim=true",
+                clientid
+            );
+        }
+    }
 
     // Build response flags (NFS-Ganesha: line 381-382)
     // EXCHGID4_FLAG_USE_NON_PNFS = 0x00010000 (we don't support pNFS)
@@ -722,7 +786,10 @@ async fn op_create_session(
         return Err(Nfs4Status::SeqMisordered.into());
     }
 
-    let session = handler.sessions.create_session(clientid)?;
+    // Create session and save client-requested flags
+    // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
+    // We save this to know if client requested backchannel
+    let session = handler.sessions.create_session_with_flags(clientid, flags)?;
 
     handler.clients.confirm_client(clientid)?;
 
@@ -808,6 +875,64 @@ async fn op_destroy_session(
     handler.sessions.destroy_session(&sessionid)?;
 
     Ok(Vec::new())
+}
+
+/// BIND_CONN_TO_SESSION - bind connection to session
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_bind_conn.c
+///
+/// This operation binds the current TCP connection to an existing session.
+/// It's used for session trunking (multiple connections per session).
+///
+/// # Response Structure (RFC 5661)
+/// - bctsr_sessid: Session ID (16 bytes)
+/// - bctsr_dir: Channel direction (CDFS4_FORE=1, CDFS4_BACK=2, CDFS4_BOTH=3)
+/// - bctsr_use_conn_in_rdma_mode: RDMA mode flag
+async fn op_bind_conn_to_session(
+    input: &mut impl Read,
+    _ctx: &mut CompoundContext,
+    handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    // Read arguments
+    let mut sessionid = Sessionid4::default();
+    sessionid.deserialize(input)?;
+    let dir = input.read_u32::<BigEndian>()?; // channel_dir_from_client4
+    let use_rdma = input.read_u32::<BigEndian>()?; // use_conn_in_rdma_mode
+
+    info!(
+        "BIND_CONN_TO_SESSION: sessionid={:02x?} dir={} rdma={}",
+        &sessionid[..8],
+        dir,
+        use_rdma
+    );
+
+    // Validate session exists
+    let session = handler
+        .sessions
+        .get_session(&sessionid)
+        .ok_or(Nfs4Status::BadSession)?;
+
+    // Renew lease
+    handler.clients.renew_lease(session.clientid)?;
+
+    // Build response
+    // CDFC4_FORE = 1, CDFC4_BACK = 2, CDFC4_FORE_OR_BOTH = 3, CDFC4_BACK_OR_BOTH = 4
+    // CDFS4_FORE = 1, CDFS4_BACK = 2, CDFS4_BOTH = 3
+    // We only support fore channel, so always return CDFS4_FORE
+    let server_dir: u32 = 1; // CDFS4_FORE
+
+    let mut result = Vec::new();
+    sessionid.serialize(&mut result)?;
+    server_dir.serialize(&mut result)?;
+    use_rdma.serialize(&mut result)?; // Echo back RDMA mode
+
+    info!(
+        "BIND_CONN_TO_SESSION: success, response dir={} rdma={}",
+        server_dir, use_rdma
+    );
+
+    Ok(result)
 }
 
 /// PUTROOTFH - set current FH to root
@@ -925,9 +1050,57 @@ async fn op_readdir(
 }
 
 /// RECLAIM_COMPLETE - client finished reclaiming state
-fn op_reclaim_complete(input: &mut impl Read, _ctx: &mut CompoundContext) -> Nfs4Result<Vec<u8>> {
-    let _one_fs = input.read_u32::<BigEndian>()?;
-    debug!("RECLAIM_COMPLETE");
+///
+/// NFS-Ganesha Reference: nfs4_op_reclaim_complete.c
+///
+/// This operation indicates that the client has finished reclaiming state
+/// after a server restart. After this, the client cannot use CLAIM_PREVIOUS.
+///
+/// # Arguments
+/// - rca_one_fs: If true, reclaim complete for one filesystem only (not supported)
+///
+/// # Returns
+/// - NFS4_OK: Success
+/// - NFS4ERR_COMPLETE_ALREADY: Client already called RECLAIM_COMPLETE
+/// - NFS4ERR_STALE_CLIENTID: Invalid client ID
+fn op_reclaim_complete(
+    input: &mut impl Read,
+    ctx: &CompoundContext,
+    handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    let rca_one_fs = input.read_u32::<BigEndian>()?;
+
+    // Get clientid from context (set by SEQUENCE operation)
+    let clientid = ctx.clientid.ok_or_else(|| {
+        tracing::warn!("RECLAIM_COMPLETE: no clientid in context");
+        Nfs4Status::OpNotInSession
+    })?;
+
+    // Get client state
+    let client = handler
+        .clients
+        .get_client(clientid)
+        .ok_or(Nfs4Status::StaleClientid)?;
+
+    // Check if already reclaim complete (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete)
+    // For now, we don't handle rca_one_fs, so we won't complain about complete already for it.
+    if client.is_reclaim_complete() && rca_one_fs == 0 {
+        tracing::warn!(
+            "RECLAIM_COMPLETE: client {} already completed reclaim",
+            clientid
+        );
+        return Err(Nfs4Status::CompleteAlready.into());
+    }
+
+    // Set reclaim complete flag (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete = true)
+    if rca_one_fs == 0 {
+        client.set_reclaim_complete(true);
+        info!(
+            "RECLAIM_COMPLETE: client {} marked reclaim complete",
+            clientid
+        );
+    }
+
     Ok(Vec::new())
 }
 

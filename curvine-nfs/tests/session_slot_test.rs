@@ -76,7 +76,6 @@ fn test_concurrent_slot_access() {
     }
 }
 
-
 /// Test 3: Session trunking (multiple connections)
 #[test]
 fn test_session_trunking() {

@@ -112,12 +112,18 @@ async fn handle_compound(
         let op_code = input.read_u32::<BigEndian>()?;
         let op = Nfs4Op::from(op_code);
 
-        debug!("  Op[{}]: {:?} ({})", i, op, op_code);
+        // Debug: log current_fh state before each operation
+        let fh_state = if let Some(ref fh) = ctx.current_fh {
+            format!("fh_len={} fh_data={:02x?}", fh.data.len(), &fh.data[..fh.data.len().min(8)])
+        } else {
+            "None".to_string()
+        };
+        info!("  Op[{}]: {:?} ({}) current_fh={}", i, op, op_code, fh_state);
 
         let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
             Ok(data) => (Nfs4Status::Ok, data),
             Err(e) => {
-                error!("  Op[{}] {:?} failed: {:?}", i, op, e.status);
+                error!("  Op[{}] {:?} failed: {:?} current_fh={}", i, op, e.status, fh_state);
                 (e.status, Vec::new())
             }
         };
@@ -481,6 +487,7 @@ async fn execute_operation(
         Nfs4Op::Access => op_access(input, ctx, handler).await,
         Nfs4Op::Setattr => op_setattr(input, ctx, handler).await,
         Nfs4Op::Secinfo => op_secinfo(input, ctx, handler).await,
+        Nfs4Op::SecinfoNoName => op_secinfo_no_name(input, ctx, handler).await,
         Nfs4Op::Nverify => op_nverify(input, ctx, handler).await,
         Nfs4Op::Verify => op_verify(input, ctx, handler).await,
         Nfs4Op::Lock => op_lock(input, ctx, handler).await,
@@ -543,6 +550,18 @@ async fn op_sequence(
 }
 
 /// EXCHANGE_ID - client registration
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_exchange_id.c
+///
+/// Response structure (RFC 5661):
+/// - eir_clientid: Client ID assigned by server
+/// - eir_sequenceid: Sequence ID for CREATE_SESSION
+/// - eir_flags: Server capability flags (pNFS, etc.)
+/// - eir_state_protect: State protection info (spr_how)
+/// - eir_server_owner: Server owner (so_major_id + so_minor_id)
+/// - eir_server_scope: Server scope
+/// - eir_server_impl_id: Server implementation ID (optional, len=0)
 async fn op_exchange_id(
     input: &mut impl Read,
     _ctx: &mut CompoundContext,
@@ -564,25 +583,50 @@ async fn op_exchange_id(
         time.deserialize(input)?;
     }
 
-    debug!("EXCHANGE_ID: owner={:?} flags={:#x}", client_owner, flags);
+    info!("EXCHANGE_ID: owner={:?} flags={:#x}", client_owner, flags);
 
-    let (clientid, seqid, result_flags) = handler.clients.exchange_id(client_owner)?;
+    let (clientid, seqid, _result_flags) = handler.clients.exchange_id(client_owner)?;
+
+    // Build response flags (NFS-Ganesha: line 381-382)
+    // EXCHGID4_FLAG_USE_NON_PNFS = 0x00010000 (we don't support pNFS)
+    // EXCHGID4_FLAG_SUPP_MOVED_REFER = 0x00000001
+    let result_flags: u32 = 0x00010001; // USE_NON_PNFS | SUPP_MOVED_REFER
+
+    info!(
+        "EXCHANGE_ID: success clientid={} seqid={} result_flags={:#x}",
+        clientid, seqid, result_flags
+    );
 
     let mut result = Vec::new();
+    
+    // eir_clientid (8 bytes)
     clientid.serialize(&mut result)?;
+    
+    // eir_sequenceid (4 bytes)
     seqid.serialize(&mut result)?;
+    
+    // eir_flags (4 bytes)
     result_flags.serialize(&mut result)?;
+    
+    // eir_state_protect: state_protect4_r
+    // spr_how = SP4_NONE (0) - no state protection
     0u32.serialize(&mut result)?;
 
+    // eir_server_owner: server_owner4
+    // so_minor_id (8 bytes)
+    0u64.serialize(&mut result)?;
+    // so_major_id (opaque<NFS4_OPAQUE_LIMIT>)
     let server_owner_major: Vec<u8> = b"curvine".to_vec();
-    let server_owner_minor: Vec<u8> = Vec::new();
     server_owner_major.serialize(&mut result)?;
-    server_owner_minor.serialize(&mut result)?;
 
+    // eir_server_scope (opaque<NFS4_OPAQUE_LIMIT>)
     let server_scope: Vec<u8> = b"curvine.local".to_vec();
     server_scope.serialize(&mut result)?;
 
+    // eir_server_impl_id (nfs_impl_id4<1>) - empty array
     0u32.serialize(&mut result)?;
+
+    info!("EXCHANGE_ID: response len={}", result.len());
 
     Ok(result)
 }
@@ -672,26 +716,60 @@ async fn op_create_session(
 
     handler.clients.confirm_client(clientid)?;
 
+    // Build CREATE_SESSION4resok response per RFC 5661
+    // Response structure:
+    //   csr_sessionid (16 bytes)
+    //   csr_sequence (4 bytes)
+    //   csr_flags (4 bytes)
+    //   csr_fore_chan_attrs (channel_attrs4)
+    //   csr_back_chan_attrs (channel_attrs4)
+    //
+    // channel_attrs4 structure:
+    //   ca_headerpadsize (4 bytes)
+    //   ca_maxrequestsize (4 bytes)
+    //   ca_maxresponsesize (4 bytes)
+    //   ca_maxresponsesize_cached (4 bytes)
+    //   ca_maxoperations (4 bytes)
+    //   ca_maxrequests (4 bytes)
+    //   ca_rdma_ird<1> (array: 4 bytes len + data)
+
     let mut result = Vec::new();
+    
+    // csr_sessionid (16 bytes)
     session.sessionid.serialize(&mut result)?;
+    
+    // csr_sequence (4 bytes) - echo back the sequence from request
     seqid.serialize(&mut result)?;
-    flags.serialize(&mut result)?;
-
-    0u32.serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (64 * 1024u32).serialize(&mut result)?;
-    64u32.serialize(&mut result)?;
-    session.slot_count().serialize(&mut result)?;
+    
+    // csr_flags (4 bytes) - we don't support any flags currently
+    // CREATE_SESSION4_FLAG_PERSIST = 0x00000001
+    // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
+    // CREATE_SESSION4_FLAG_CONN_RDMA = 0x00000004
     0u32.serialize(&mut result)?;
 
-    0u32.serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (64 * 1024u32).serialize(&mut result)?;
-    64u32.serialize(&mut result)?;
-    session.slot_count().serialize(&mut result)?;
-    0u32.serialize(&mut result)?;
+    // csr_fore_chan_attrs (channel_attrs4)
+    0u32.serialize(&mut result)?;           // ca_headerpadsize
+    (1024 * 1024u32).serialize(&mut result)?; // ca_maxrequestsize (1MB)
+    (1024 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize (1MB)
+    (64 * 1024u32).serialize(&mut result)?;   // ca_maxresponsesize_cached (64KB)
+    64u32.serialize(&mut result)?;            // ca_maxoperations
+    session.slot_count().serialize(&mut result)?; // ca_maxrequests (slot count)
+    0u32.serialize(&mut result)?;             // ca_rdma_ird<1> array length = 0
+
+    // csr_back_chan_attrs (channel_attrs4)
+    0u32.serialize(&mut result)?;           // ca_headerpadsize
+    (1024 * 1024u32).serialize(&mut result)?; // ca_maxrequestsize (1MB)
+    (1024 * 1024u32).serialize(&mut result)?; // ca_maxresponsesize (1MB)
+    (64 * 1024u32).serialize(&mut result)?;   // ca_maxresponsesize_cached (64KB)
+    64u32.serialize(&mut result)?;            // ca_maxoperations
+    session.slot_count().serialize(&mut result)?; // ca_maxrequests (slot count)
+    0u32.serialize(&mut result)?;             // ca_rdma_ird<1> array length = 0
+
+    info!(
+        "CREATE_SESSION: response len={} sessionid={:02x?}",
+        result.len(),
+        &session.sessionid[..8]
+    );
 
     client.cache_create_session_response(result.clone(), 0);
 
@@ -1648,6 +1726,60 @@ async fn op_secinfo(
     info!(
         "SECINFO: returning AUTH_SYS support for '{}', result_len={}",
         name_str,
+        result.len()
+    );
+
+    Ok(result)
+}
+
+/// SECINFO_NO_NAME - get security information for current or parent directory
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_secinfo_no_name.c
+///
+/// This operation returns the security mechanisms supported by the server
+/// for the current file handle or its parent (based on style argument).
+///
+/// Response structure (RFC 5661):
+/// - SECINFO4resok: array of secinfo4
+///   - secinfo4: flavor (uint32) + optional rpcsec_gss_info
+///
+/// We only support AUTH_SYS (flavor=1), so response is simple:
+/// - array_len (4 bytes) = 1
+/// - flavor (4 bytes) = AUTH_SYS (1)
+async fn op_secinfo_no_name(
+    input: &mut impl Read,
+    ctx: &mut CompoundContext,
+    _handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    // Read style argument: SECINFO_STYLE4_CURRENT_FH (0) or SECINFO_STYLE4_PARENT (1)
+    let style = input.read_u32::<BigEndian>()?;
+
+    info!(
+        "SECINFO_NO_NAME: style={} (0=current_fh, 1=parent)",
+        style
+    );
+
+    // Validate current file handle exists
+    let _fh = ctx.require_current_fh()?;
+
+    // Build response: array of secinfo4
+    // We only support AUTH_SYS (flavor=1)
+    let mut result = Vec::new();
+
+    // Array length = 1 (we support one security flavor)
+    1u32.serialize(&mut result)?;
+
+    // secinfo4[0]: flavor = AUTH_SYS (1)
+    // For AUTH_SYS, there's no additional data (unlike RPCSEC_GSS)
+    1u32.serialize(&mut result)?;
+
+    // Per RFC 5661, SECINFO_NO_NAME consumes the current filehandle
+    // Clear current_fh after operation
+    ctx.current_fh = None;
+
+    info!(
+        "SECINFO_NO_NAME: returning AUTH_SYS support, result_len={}",
         result.len()
     );
 

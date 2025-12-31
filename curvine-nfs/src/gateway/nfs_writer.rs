@@ -150,7 +150,13 @@ impl NfsWriter {
     /// Background task that processes writes sequentially
     async fn writer_task(mut writer: UnifiedWriter, mut receiver: mpsc::Receiver<WriteTask>) {
         let path = writer.path().clone();
-        tracing::info!("NfsWriter task started for path={}", path.path());
+        // Check if this writer needs pre-resize (only CacheSyncWriter for S3/object storage)
+        let needs_pre_resize = writer.needs_pre_resize();
+        tracing::info!(
+            "NfsWriter task started for path={}, needs_pre_resize={}",
+            path.path(),
+            needs_pre_resize
+        );
 
         // Track current file length to avoid repeated status() calls
         let mut current_len = writer.status().len;
@@ -175,16 +181,35 @@ impl NfsWriter {
                         path.path()
                     );
 
-                    // IMPORTANT: Do NOT pre-resize here!
-                    // Let Writer.fuse_write() handle file extension internally via seek() + write()
-                    // This aligns with FUSE behavior and avoids issues with:
-                    // 1. Object storage (S3) that doesn't support resize
-                    // 2. Large files (>128MB) that would allocate too many blocks upfront
-                    // 
-                    // The flow is: fuse_write(offset, data) -> seek(offset) -> write(data)
-                    // - seek() updates pos if offset > len, but doesn't resize
-                    // - write() checks if pos > len and calls resize internally
-                    // This lazy resize approach is more efficient and compatible
+                    // Pre-resize ONLY for CacheSyncWriter (S3/object storage paths)
+                    // This is REQUIRED for CacheSyncWriter because:
+                    // 1. fuse_write() calls seek() + async_write()
+                    // 2. async_write() calls write_chunk() which does NOT check pos > len
+                    // 3. Only FsWriterBase::write() checks pos > len and calls resize()
+                    // 4. Without resize, FsWriterBase::len stays at 0, causing complete_file
+                    //    to report wrong file size to master
+                    //
+                    // For FsWriter (direct curvine), pre-resize is NOT needed because:
+                    // - FsWriterBase::write() already handles pos > len check and resize
+                    // - Pre-resize would interfere with normal write flow
+                    if needs_pre_resize && write_end > current_len {
+                        let alloc_opts = FileAllocOpts::with_alloc(write_end, Default::default());
+                        tracing::info!(
+                            "NfsWriter task: Pre-resize to {} for path={}",
+                            write_end,
+                            path.path()
+                        );
+                        if let Err(e) = writer.resize(alloc_opts).await {
+                            tracing::error!(
+                                "NfsWriter task: Pre-resize failed: {:?} for path={}",
+                                e,
+                                path.path()
+                            );
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                        current_len = write_end;
+                    }
 
                     tracing::info!(
                         "NfsWriter task: Calling fuse_write offset={} len={} for path={}",
@@ -204,8 +229,8 @@ impl NfsWriter {
                                 written,
                                 path.path()
                             );
-                            // Update current_len after successful write
-                            if write_end > current_len {
+                            // Update current_len for non-pre-resize writers after successful write
+                            if !needs_pre_resize && write_end > current_len {
                                 current_len = write_end;
                             }
                         }

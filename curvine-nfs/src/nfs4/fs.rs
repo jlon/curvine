@@ -1513,6 +1513,13 @@ impl Nfs4FileSystem {
     /// # Auto-Extend
     /// Like NfsWriter, this method auto-extends the file if writing beyond
     /// current size. This is required for correct NFSv4 WRITE semantics.
+    ///
+    /// # Note on resize
+    /// We must explicitly call resize() before fuse_write() because:
+    /// - fuse_write() calls seek() + async_write()
+    /// - async_write() calls write_chunk() which does NOT check pos > len
+    /// - Only FsWriterBase::write() checks pos > len and calls resize()
+    /// This is different from curvine-fuse which uses FsWriterBase::write() directly
     pub async fn write(&self, fileid: Fileid4, offset: u64, data: Vec<u8>) -> Nfs4Result<u32> {
         if self.config.read_only {
             return Err(Nfs4Status::Rofs.into());
@@ -1530,7 +1537,9 @@ impl Nfs4FileSystem {
             .await
             .map_err(Nfs4Error::from)?;
 
-        // Auto-extend if writing beyond current size (aligned with NfsWriter behavior)
+        // Auto-extend if writing beyond current size
+        // This is necessary because fuse_write() -> async_write() -> write_chunk()
+        // does NOT check pos > len like FsWriterBase::write() does
         let current_len = writer.status().len;
         let write_end = offset as i64 + data_len as i64;
         if write_end > current_len {
@@ -1539,7 +1548,7 @@ impl Nfs4FileSystem {
             writer.resize(alloc_opts).await.map_err(Nfs4Error::from)?;
         }
 
-        // Write and complete immediately
+        // Write data
         let chunk = DataSlice::bytes(Bytes::from(data));
         writer
             .fuse_write(offset as i64, chunk)

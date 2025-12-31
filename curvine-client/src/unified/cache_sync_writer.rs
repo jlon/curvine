@@ -195,4 +195,18 @@ impl Writer for CacheSyncWriter {
 
         self.inner.seek(pos).await
     }
+
+    async fn resize(&mut self, opts: curvine_common::state::FileAllocOpts) -> FsResult<()> {
+        // For CacheSync mode (object storage like S3):
+        // - Resize operations are delegated to the inner FsWriter
+        // - FsWriter updates Curvine's metadata (inode) on master
+        // - The actual file content is managed through block system
+        // - Final file size is synced to object storage during complete()
+        //
+        // This delegation allows:
+        // 1. Large file writes (>128MB block size) to work correctly
+        // 2. Random writes with seek to extend file size
+        // 3. Explicit truncate/fallocate operations from NFS SETATTR
+        self.inner.resize(opts).await
+    }
 }

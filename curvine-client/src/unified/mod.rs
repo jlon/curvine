@@ -57,6 +57,27 @@ pub enum UnifiedWriter {
     OssHdfs(OssHdfsWriter),
 }
 
+impl UnifiedWriter {
+    /// Check if this writer needs pre-resize before fuse_write.
+    ///
+    /// CacheSyncWriter (for S3/object storage) needs pre-resize because:
+    /// - fuse_write() calls seek() + async_write() which doesn't check pos > len
+    /// - Without pre-resize, file size won't be updated correctly for large files
+    ///
+    /// FsWriter (direct curvine) does NOT need pre-resize because:
+    /// - FsWriterBase::write() already checks pos > len and calls resize()
+    /// - Pre-resize would interfere with normal write flow
+    #[inline]
+    pub fn needs_pre_resize(&self) -> bool {
+        match self {
+            Self::Cv(_) => false,
+            Self::CacheSync(_) => true,
+            #[cfg(feature = "opendal")]
+            Self::Opendal(_) => false,
+        }
+    }
+}
+
 impl_writer_for_enum! {
     enum UnifiedWriter {
         Cv(FsWriter),

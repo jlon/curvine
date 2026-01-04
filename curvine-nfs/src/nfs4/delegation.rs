@@ -830,7 +830,7 @@ pub fn encode_open_delegation(
                     // open_read_delegation4
                     deleg.stateid.serialize(&mut result)?;
                     false.serialize(&mut result)?; // recall = false
-                    // nfsace4 (simplified - allow all)
+                                                   // nfsace4 (simplified - allow all)
                     0u32.serialize(&mut result)?; // type = ALLOW
                     0u32.serialize(&mut result)?; // flag
                     0u32.serialize(&mut result)?; // access_mask
@@ -843,10 +843,10 @@ pub fn encode_open_delegation(
                     // open_write_delegation4
                     deleg.stateid.serialize(&mut result)?;
                     false.serialize(&mut result)?; // recall = false
-                    // space_limit4 (NFS4_LIMIT_SIZE)
+                                                   // space_limit4 (NFS4_LIMIT_SIZE)
                     1u32.serialize(&mut result)?;
                     u64::MAX.serialize(&mut result)?; // filesize
-                    // nfsace4 (simplified - allow all)
+                                                      // nfsace4 (simplified - allow all)
                     0u32.serialize(&mut result)?;
                     0u32.serialize(&mut result)?;
                     0u32.serialize(&mut result)?;

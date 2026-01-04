@@ -38,6 +38,15 @@ pub async fn op_open(
     let share_access = input.read_u32::<BigEndian>()?;
     let share_deny = input.read_u32::<BigEndian>()?;
 
+    // Debug: log raw share_access to see delegation want flags
+    // OPEN4_SHARE_ACCESS_WANT_DELEG_MASK = 0x0F00
+    tracing::info!(
+        "OPEN request: share_access={:#x} (want_deleg_mask={:#x}) share_deny={:#x}",
+        share_access,
+        share_access & 0x0F00,
+        share_deny
+    );
+
     let clientid = input.read_u64::<BigEndian>()?;
     let mut owner_data: Vec<u8> = Vec::new();
     owner_data.deserialize(input)?;
@@ -102,6 +111,31 @@ pub async fn op_open(
 
     let fh = ctx.require_current_fh()?;
     let parent_id = handler.fs.fh_to_fileid(fh)?;
+
+    // Check delegation conflict BEFORE opening file (NFS-Ganesha aligned)
+    // NFS-Ganesha: state_deleg_conflict_impl() check in open4_ex()
+    let is_write_open = (share_access & 0x02) != 0;
+    if let Some(fileid_to_check) = match filename.as_ref() {
+        Some(name) => {
+            let name_str = String::from_utf8_lossy(name);
+            match handler.fs.lookup(parent_id, &name_str).await {
+                Ok((fid, _)) => Some(fid),
+                Err(_) => None, // File doesn't exist yet
+            }
+        }
+        None => Some(parent_id), // Using current filehandle
+    } {
+        // Check if this access conflicts with existing delegation
+        if handler.delegations.needs_recall(fileid_to_check, clientid, is_write_open) {
+            // Return NFS4ERR_DELAY to tell client to retry later
+            // NFS-Ganesha: state_deleg_conflict_impl() returns NFS4ERR_DELAY
+            tracing::warn!(
+                "OPEN: delegation conflict detected for file {}, client {} retry later",
+                fileid_to_check, clientid
+            );
+            return Err(Nfs4Status::Delay.into());
+        }
+    }
 
     // Variables that will be set by either branch
     let fileid: u64;
@@ -214,9 +248,9 @@ pub async fn op_open(
     response_stateid.serialize(&mut result)?;
 
     // change_info4: atomic=true, before=0, after=0
-    1u32.serialize(&mut result)?;  // atomic
-    0u64.serialize(&mut result)?;  // before
-    0u64.serialize(&mut result)?;  // after
+    1u32.serialize(&mut result)?; // atomic
+    0u64.serialize(&mut result)?; // before
+    0u64.serialize(&mut result)?; // after
 
     let mut rflags = 0u32;
     if ctx.minor_version == 0 {
@@ -372,8 +406,25 @@ fn validate_claim(
 ) -> Nfs4Result<()> {
     match claim_type {
         0 => {
-            // CLAIM_NULL: normal open - no grace period check needed for NFSv4.1
-            // NFS-Ganesha skips grace check when fsal_grace_support is true
+            // CLAIM_NULL: normal open
+            // NFS-Ganesha: nfs4_op_open.c line 137-140
+            // In NFSv4.1, client MUST call RECLAIM_COMPLETE before CLAIM_NULL opens
+            if ctx.minor_version > 0 {
+                // Get client state
+                let client = handler
+                    .clients
+                    .get_client(clientid)
+                    .ok_or(Nfs4Status::StaleClientid)?;
+
+                // Check if reclaim complete (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete)
+                if !client.is_reclaim_complete() {
+                    tracing::debug!(
+                        "CLAIM_NULL: client {} has not completed RECLAIM_COMPLETE, returning GRACE",
+                        clientid
+                    );
+                    return Err(Nfs4Status::Grace.into());
+                }
+            }
             Ok(())
         }
         1 => {

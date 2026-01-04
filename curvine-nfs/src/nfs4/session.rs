@@ -261,6 +261,12 @@ pub struct Session {
     pub created: Instant,
     /// Session flags (e.g., CONN_BACK_CHAN)
     pub flags: AtomicU32,
+    /// Backchannel program number (from CREATE_SESSION)
+    /// NFS-Ganesha: nfs41_session->cb_program
+    pub cb_program: AtomicU32,
+    /// Whether backchannel is established
+    /// NFS-Ganesha: session->flags & session_bc_up
+    pub backchannel_up: AtomicU8,
 }
 
 impl Session {
@@ -274,6 +280,8 @@ impl Session {
             connections: AtomicU32::new(1), // First connection
             created: Instant::now(),
             flags: AtomicU32::new(0),
+            cb_program: AtomicU32::new(0),
+            backchannel_up: AtomicU8::new(0),
         }
     }
 
@@ -323,6 +331,32 @@ impl Session {
     #[inline]
     pub fn get_flags(&self) -> u32 {
         self.flags.load(Ordering::Acquire)
+    }
+
+    /// Set callback program number (from CREATE_SESSION)
+    /// NFS-Ganesha: nfs41_session->cb_program = arg->csa_cb_program
+    #[inline]
+    pub fn set_cb_program(&self, program: u32) {
+        self.cb_program.store(program, Ordering::Release);
+    }
+
+    /// Get callback program number
+    #[inline]
+    pub fn get_cb_program(&self) -> u32 {
+        self.cb_program.load(Ordering::Acquire)
+    }
+
+    /// Mark backchannel as established
+    /// NFS-Ganesha: atomic_set_uint32_t_bits(&session->flags, session_bc_up)
+    #[inline]
+    pub fn set_backchannel_up(&self) {
+        self.backchannel_up.store(1, Ordering::Release);
+    }
+
+    /// Check if backchannel is up
+    #[inline]
+    pub fn is_backchannel_up(&self) -> bool {
+        self.backchannel_up.load(Ordering::Acquire) != 0
     }
 }
 

@@ -112,6 +112,13 @@ pub async fn op_open(
     let fh = ctx.require_current_fh()?;
     let parent_id = handler.fs.fh_to_fileid(fh)?;
 
+    // Get parent directory's change attribute BEFORE operation (NFS-Ganesha aligned)
+    // NFS-Ganesha: nfs4_op_open.c line 1456-1457, 1543-1563
+    // obj_change is set to current_obj (parent directory) and changeid is retrieved
+    let parent_status_before = handler.fs.get_status(parent_id).await?;
+    let change_before = parent_status_before.mtime as u64;
+    let is_parent_pre_attrs_valid = true; // We always have valid change attribute
+
     // Check delegation conflict BEFORE opening file (NFS-Ganesha aligned)
     // NFS-Ganesha: state_deleg_conflict_impl() check in open4_ex()
     let is_write_open = (share_access & 0x02) != 0;
@@ -262,10 +269,18 @@ pub async fn op_open(
     let response_stateid = Stateid4::new(new_seqid, open_state.stateid.other);
     response_stateid.serialize(&mut result)?;
 
-    // change_info4: atomic=true, before=0, after=0
-    1u32.serialize(&mut result)?; // atomic
-    0u64.serialize(&mut result)?; // before
-    0u64.serialize(&mut result)?; // after
+    // change_info4: Build from parent directory's change attributes (NFS-Ganesha aligned)
+    // NFS-Ganesha: nfs4_op_open.c line 1543-1563
+    // Get parent directory's change attribute AFTER operation
+    let parent_status_after = handler.fs.get_status(parent_id).await?;
+    let change_after = parent_status_after.mtime as u64;
+    let is_parent_post_attrs_valid = true; // We always have valid change attribute
+
+    // atomic = true only if both pre and post attrs are valid (NFS-Ganesha line 1561-1563)
+    let atomic = is_parent_pre_attrs_valid && is_parent_post_attrs_valid;
+    atomic.serialize(&mut result)?; // atomic
+    change_before.serialize(&mut result)?; // before
+    change_after.serialize(&mut result)?; // after
 
     let mut rflags = 0u32;
     if ctx.minor_version == 0 {

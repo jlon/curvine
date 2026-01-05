@@ -79,8 +79,9 @@ pub struct DelegationConfig {
 impl Default for DelegationConfig {
     fn default() -> Self {
         Self {
-            // Enabled by default for better read performance
-            enabled: true,
+            // Disabled by default due to NFSv4.1 client compatibility issues
+            // Can be enabled via configuration if needed
+            enabled: false,
             recall_timeout_secs: 30,
             max_delegations: 1000,
             reaper_check_interval_ms: 5000,
@@ -461,10 +462,31 @@ impl DelegationManager {
     /// Check if we SHOULD grant a delegation (policy decision)
     ///
     /// NFS-Ganesha: should_we_grant_deleg()
+    /// - Check backchannel availability (CRITICAL for delegation recall)
     /// - Respect maximum delegations limit
     /// - Check recent recall history (RECALL2DELEG_TIME)
     /// - Check write contention
-    fn should_grant(&self, _clientid: Clientid4, fileid: Fileid4, is_write: bool) -> bool {
+    fn should_grant(&self, clientid: Clientid4, fileid: Fileid4, is_write: bool) -> bool {
+        // CRITICAL: Check backchannel availability first
+        // NFS-Ganesha: get_cb_chan_down(client) check in should_we_grant_deleg()
+        // (state_deleg.c line 354-370)
+        //
+        // Without a working backchannel, server cannot recall delegations when
+        // another client needs access. This can cause:
+        // 1. Client waiting for delegation-related state sync (5s timeout)
+        // 2. Deadlocks when conflicting access is needed
+        //
+        // Per RFC 5661, delegation requires backchannel for CB_RECALL.
+        // If backchannel is down, we should NOT grant delegation.
+        let backchannel_available = self.is_backchannel_available(clientid);
+        if !backchannel_available {
+            debug!(
+                "Backchannel not available for client {}, not granting delegation",
+                clientid
+            );
+            return false;
+        }
+
         // Check maximum delegations limit
         // NFS-Ganesha: g_total_num_files_delegated >= g_max_files_delegatable
         let current_count = self.delegations.read().unwrap().len();
@@ -506,9 +528,19 @@ impl DelegationManager {
         }
 
         // TODO: Check client revoke count (num_revokes > MAX_CLIENT_REVOKES)
-        // TODO: Check backchannel status
 
         true
+    }
+
+    /// Check if backchannel is available for a client
+    ///
+    /// NFS-Ganesha: get_cb_chan_down(client)
+    /// Returns true if backchannel is UP and can receive callbacks.
+    ///
+    /// IMPORTANT: Without backchannel, server cannot recall delegations,
+    /// which can cause client-side delays (5s timeout) when closing files.
+    fn is_backchannel_available(&self, clientid: Clientid4) -> bool {
+        self.backchannel.is_available_for_client(clientid)
     }
 
     /// Update file stats when a file is opened

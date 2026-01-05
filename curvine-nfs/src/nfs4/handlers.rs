@@ -683,19 +683,10 @@ async fn op_sequence(
     // - SEQ4_STATUS_CB_PATH_DOWN (0x01): Backchannel is not available
     // - SEQ4_STATUS_CB_PATH_DOWN_SESSION (0x200): Session's backchannel is down
     //
-    // IMPORTANT: Setting CB_PATH_DOWN causes Linux NFS client to wait 5 seconds
-    // trying to re-establish backchannel. Since we don't support delegation
-    // (delegation_enabled=false by default), we don't need backchannel.
-    //
-    // NFS-Ganesha Reference: sr_status_flags initialization (nfs4_op_sequence.c line 275-279)
-    // NFS-Ganesha only sets CB_PATH_DOWN when backchannel is actually needed
-    // (i.e., when delegations are granted). Since we return OPEN_DELEGATE_NONE,
-    // we can safely set status_flags=0 to avoid the 5-second delay.
-    //
-    // This is consistent with NFS-Ganesha behavior when backchannel is available
-    // (nfs_rpc_get_chan() returns non-NULL). We don't set CB_PATH_DOWN since
-    // we don't promise backchannel in CREATE_SESSION.
-    let status_flags: u32 = 0;
+    // Since we don't have backchannel implementation, we set CB_PATH_DOWN
+    // to inform the client. This is RFC-compliant and matches NFS-Ganesha behavior.
+    const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+    let status_flags: u32 = SEQ4_STATUS_CB_PATH_DOWN;
 
     info!(
         "SEQUENCE response: resp_seq={} slot={} highest={} target_highest={} status_flags={:#x}",
@@ -1024,7 +1015,29 @@ async fn op_create_session(
     if flags & CREATE_SESSION4_FLAG_PERSIST != 0 {
         csr_flags |= CREATE_SESSION4_FLAG_PERSIST;
     }
-    // Do NOT set CONN_BACK_CHAN flag since we don't have backchannel
+    // CONN_BACK_CHAN handling (NFS-Ganesha: nfs4_op_create_session.c line 637-647)
+    //
+    // NFS-Ganesha only sets CONN_BACK_CHAN in response when nfs_rpc_create_chan_v41()
+    // succeeds (i.e., when a real RPC callback channel is established).
+    //
+    // We do NOT have a real backchannel RPC implementation, so we should NOT set
+    // CONN_BACK_CHAN flag. This tells the client:
+    // 1. Backchannel is not available on this connection
+    // 2. Server won't grant delegations (no way to send CB_RECALL)
+    // 3. Client should not wait for backchannel-related operations
+    //
+    // Setting CONN_BACK_CHAN without real backchannel causes Linux NFS client
+    // to wait ~5 seconds for backchannel establishment that never happens.
+    //
+    // FIX: Previously we tried setting CONN_BACK_CHAN, which caused 5s delay.
+    // Now we explicitly do NOT set it, following NFS-Ganesha behavior.
+    if flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN != 0 {
+        // Client requested backchannel, but we don't have real RPC callback support.
+        // Do NOT set CONN_BACK_CHAN in response - this is RFC-compliant behavior.
+        info!(
+            "CREATE_SESSION: client requested CONN_BACK_CHAN but we don't support it, NOT setting flag in response"
+        );
+    }
     info!(
         "CREATE_SESSION: csa_flags={:#x} csr_flags={:#x}",
         flags, csr_flags
@@ -1162,6 +1175,7 @@ async fn op_bind_conn_to_session(
     // (Linux kernel commit dff58530c4ca: closes connection if we return anything except BOTH)
     // (Linux kernel commit 1d15d121cc2a: won't retry on NOTSUPP error)
 
+<<<<<<< HEAD
     let response_dir = if dir == CDFC4_FORE || dir == CDFC4_FORE_OR_BOTH {
         CDFS4_FORE  // We only support fore channel
     } else if dir == CDFC4_BACK || dir == CDFC4_BACK_OR_BOTH {
@@ -1171,6 +1185,42 @@ async fn op_bind_conn_to_session(
     } else {
         warn!("BIND_CONN_TO_SESSION: unknown dir={}", dir);
         return Err(Nfs4Status::Inval.into());
+=======
+            if dir == CDFC4_FORE_OR_BOTH || dir == CDFC4_BACK_OR_BOTH {
+                // Client accepts backchannel if available, or can fall back
+                // NFS-Ganesha: bind_conn_to_session_backchannel() sets session_bc_up on success
+                // Phase 1: Mark backchannel as up (even though we don't have full RPC backchannel yet)
+                session.set_backchannel_up();
+                info!(
+                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir={} returning BOTH",
+                    &sessionid[..8],
+                    dir
+                );
+                // NFS-Ganesha: returns CDFS4_BOTH when backchannel is successfully established
+                CDFS4_BOTH
+            } else if dir == CDFC4_BACK {
+                // CDFC4_BACK: mandatory backchannel
+                // Phase 1: We can mark backchannel as up
+                // NFS-Ganesha: returns error if backchannel creation fails
+                // For Phase 1, we support basic backchannel setup
+                session.set_backchannel_up();
+                info!(
+                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir=CDFC4_BACK returning BACK",
+                    &sessionid[..8]
+                );
+                CDFS4_BACK
+            } else {
+                CDFS4_FORE
+            }
+        }
+        _ => {
+            warn!(
+                "BIND_CONN_TO_SESSION: unknown dir={}, defaulting to FORE",
+                dir
+            );
+            CDFS4_FORE
+        }
+>>>>>>> 514b2ce (Implement backchannel availability checks in `BackchannelManager` and `DelegationManager` to ensure proper delegation handling. Update `DelegationConfig` to disable delegation by default for NFSv4.1 compatibility. Enhance logging in `op_open` and related functions to improve traceability and compliance with NFS-Ganesha specifications. Adjust `op_sequence` and `op_create_session` to reflect backchannel status, preventing unnecessary client delays.)
     };
 
     info!(

@@ -165,6 +165,28 @@ impl BackchannelManager {
         }
     }
 
+    /// Check if backchannel is available for a client
+    ///
+    /// NFS-Ganesha: get_cb_chan_down(client) returns true if DOWN
+    /// This function returns true if backchannel is UP (available).
+    ///
+    /// IMPORTANT: Without backchannel, server cannot recall delegations,
+    /// which can cause client-side delays when closing files.
+    pub fn is_available_for_client(&self, client_id: Clientid4) -> bool {
+        let client_sessions = self.client_sessions.read().unwrap();
+        if let Some(session_ids) = client_sessions.get(&client_id) {
+            let channels = self.channels.read().unwrap();
+            for session_id in session_ids {
+                if let Some(conn) = channels.get(session_id) {
+                    if conn.state == BackchannelState::Up {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Register a backchannel for a session
     pub fn register(
         &self,

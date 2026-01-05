@@ -53,6 +53,8 @@ pub async fn op_open(
 
     let opentype = input.read_u32::<BigEndian>()?;
 
+    tracing::debug!("OPEN: opentype={} (0=NOCREATE, 1=CREATE)", opentype);
+
     #[allow(clippy::type_complexity)]
     let mut create_attrs: Option<(
         Option<u32>,
@@ -68,18 +70,21 @@ pub async fn op_open(
 
         match createmode {
             0 | 1 => {
+                tracing::debug!("OPEN CREATE: createmode={} (UNCHECKED/GUARDED)", createmode);
                 let mut fattr = Fattr4::default();
                 fattr.deserialize(input)?;
                 let attrs = parse_setattr_attrs(&fattr)?;
                 create_attrs = Some(attrs);
             }
             2 => {
+                tracing::debug!("OPEN CREATE: createmode=2 (EXCLUSIVE4)");
                 // TODO: Implement EXCLUSIVE4 verifier check when needed
                 let mut v = [0u8; 8];
                 input.read_exact(&mut v)?;
                 let _verifier = v;
             }
             3 => {
+                tracing::debug!("OPEN CREATE: createmode=3 (EXCLUSIVE4_1)");
                 // TODO: Implement EXCLUSIVE4_1 verifier check when needed
                 let mut v = [0u8; 8];
                 input.read_exact(&mut v)?;
@@ -90,6 +95,7 @@ pub async fn op_open(
                 create_attrs = Some(attrs);
             }
             _ => {
+                tracing::error!("OPEN CREATE: invalid createmode={}", createmode);
                 return Err(Nfs4Status::Inval.into());
             }
         }
@@ -275,6 +281,14 @@ pub async fn op_open(
     let parent_status_after = handler.fs.get_status(parent_id).await?;
     let change_after = parent_status_after.mtime as u64;
     let is_parent_post_attrs_valid = true; // We always have valid change attribute
+
+    // Debug: log change_info values
+    tracing::info!(
+        "OPEN change_info: before={} after={} atomic={}",
+        change_before,
+        change_after,
+        is_parent_pre_attrs_valid && is_parent_post_attrs_valid
+    );
 
     // atomic = true only if both pre and post attrs are valid (NFS-Ganesha line 1561-1563)
     let atomic = is_parent_pre_attrs_valid && is_parent_post_attrs_valid;

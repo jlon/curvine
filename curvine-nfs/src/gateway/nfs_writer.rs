@@ -174,8 +174,9 @@ impl NfsWriter {
             sender,
             completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_pattern: Arc::new(Mutex::new(WritePattern::new())),
-            // Phase 2 Layer 2b: Disabled by default (enabled=false)
-            small_file_config: (20, 10 * 1024 * 1024, false),
+            // Phase 2c: ENABLED to test skip flush behavior
+            // THIS IS THE CRITICAL TEST!
+            small_file_config: (20, 10 * 1024 * 1024, true),  // enabled=true
         }
     }
 
@@ -206,13 +207,19 @@ impl NfsWriter {
             (false, false)
         };
 
+        // 🔧 FIX: 提前获取值,避免在tracing!宏内部调用lock()导致死锁
+        let (write_count, total_bytes) = {
+            let pattern = self.write_pattern.lock().unwrap();
+            (pattern.write_count(), pattern.total_bytes())
+        };
+
         tracing::info!(
             "WritePattern: enabled={} is_small={} should_switch={} count={} bytes={} path={}",
             enabled,
             is_small,
             should_switch,
-            self.write_pattern.lock().unwrap().write_count(),
-            self.write_pattern.lock().unwrap().total_bytes(),
+            write_count,
+            total_bytes,
             self.path.path()
         );
 
@@ -239,10 +246,10 @@ impl NfsWriter {
             tracing::info!("FlushDecision: BRANCH large file - flushing");
             self.flush().await?;
         } else if enabled && is_small {
-            tracing::info!("FlushDecision: BRANCH small file - flushing (FORCED)");
-            // NOTE: In real Phase 2, this would SKIP flush
-            // But in Layer 2b, we force flush to verify logic
-            self.flush().await?;
+            tracing::warn!("FlushDecision: BRANCH small file - SKIPPING flush (Phase 2 REAL)");
+            // Phase 2c: REAL Phase 2 - skip flush for small files
+            // This is the suspected bug source!
+            // DO NOT flush here - data buffered until CLOSE
         } else {
             tracing::info!("FlushDecision: BRANCH disabled - flushing");
             self.flush().await?;

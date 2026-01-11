@@ -169,6 +169,8 @@ impl From<u32> for Nfs4Op {
 // ============================================================================
 
 /// Context maintained during COMPOUND execution
+use crate::protocol::rpc::auth_unix;
+
 pub struct CompoundContext {
     /// Current file handle
     pub current_fh: Option<Nfs4FileHandle>,
@@ -187,6 +189,8 @@ pub struct CompoundContext {
     pub cachethis: bool,
     /// Total number of operations in this COMPOUND (for validation)
     pub op_count: usize,
+    /// RPC authentication info (for uid/gid in CREATE/OPEN/SETATTR)
+    pub auth: auth_unix,
 }
 
 impl CompoundContext {
@@ -201,6 +205,13 @@ impl CompoundContext {
             minor_version: 1, // Default to NFSv4.1
             cachethis: false,
             op_count: 0,
+            auth: auth_unix {
+                stamp: 0,
+                machinename: Vec::new(),
+                uid: 0,
+                gid: 0,
+                gids: Vec::new(),
+            },
         }
     }
 
@@ -216,6 +227,13 @@ impl CompoundContext {
             minor_version,
             cachethis: false,
             op_count: 0,
+            auth: auth_unix {
+                stamp: 0,
+                machinename: Vec::new(),
+                uid: 0,
+                gid: 0,
+                gids: Vec::new(),
+            },
         }
     }
 

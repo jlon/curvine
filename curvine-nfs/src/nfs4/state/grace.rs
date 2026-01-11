@@ -598,7 +598,7 @@ impl GracePeriodManager {
     /// // Reference automatically released when guard drops
     /// ```
     #[inline]
-    pub fn acquire_grace_status(&self, want_grace: bool) -> Result<GraceGuard, Nfs4Status> {
+    pub fn acquire_grace_status(&self, want_grace: bool) -> Result<GraceGuard<'_>, Nfs4Status> {
         if self.get_grace_status(want_grace) {
             Ok(GraceGuard::new(self))
         } else if want_grace {

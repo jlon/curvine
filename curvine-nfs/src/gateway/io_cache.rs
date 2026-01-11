@@ -35,6 +35,9 @@ pub struct IoCacheConfig {
     pub writer_ttl_secs: u64,
     pub file_status_capacity: i64, // -1 means disabled
     pub file_status_ttl_secs: u64,
+    pub file_data_capacity: u64, // 0 means disabled
+    pub file_data_ttl_secs: u64,
+    pub max_cacheable_file_size: u64,
 }
 
 impl Default for IoCacheConfig {
@@ -49,6 +52,9 @@ impl Default for IoCacheConfig {
             writer_ttl_secs: 30,
             file_status_capacity: 10000i64,
             file_status_ttl_secs: 30,
+            file_data_capacity: 1000,
+            file_data_ttl_secs: 10,
+            max_cacheable_file_size: 65536, // 64KB
         }
     }
 }
@@ -65,6 +71,9 @@ impl From<&NfsGatewayConf> for IoCacheConfig {
             writer_ttl_secs: conf.writer_idle_timeout_secs,
             file_status_capacity: conf.file_status_cache_size,
             file_status_ttl_secs: conf.file_status_cache_ttl_secs,
+            file_data_capacity: conf.file_data_cache_size,
+            file_data_ttl_secs: conf.file_data_cache_ttl_secs,
+            max_cacheable_file_size: conf.max_cacheable_file_size,
         }
     }
 }
@@ -148,6 +157,10 @@ pub struct IoCache {
     pub reader_pools: FastSyncCache<u64, Arc<ReaderPool>>,
     pub writers: FastSyncCache<u64, Arc<WriterEntry>>,
     pub file_status: Option<FastSyncCache<u64, FileStatus>>,
+    /// Small file data cache - caches entire file content for small files
+    /// Key: fileid, Value: file data as Vec<u8>
+    pub file_data: Option<FastSyncCache<u64, Vec<u8>>>,
+    pub max_cacheable_file_size: u64,
     pub reader_pool_size: usize,
     writer_creation_lock: Mutex<()>,
 }
@@ -183,6 +196,16 @@ impl IoCache {
             None
         };
 
+        // Create small file data cache only if capacity > 0 (0 means disabled)
+        let file_data = if config.file_data_capacity > 0 {
+            Some(FastSyncCache::new(
+                config.file_data_capacity,
+                Duration::from_secs(config.file_data_ttl_secs),
+            ))
+        } else {
+            None
+        };
+
         Self {
             file_blocks: FastSyncCache::new(
                 config.file_blocks_capacity,
@@ -191,6 +214,8 @@ impl IoCache {
             reader_pools,
             writers,
             file_status,
+            file_data,
+            max_cacheable_file_size: config.max_cacheable_file_size,
             reader_pool_size,
             writer_creation_lock: Mutex::new(()),
         }
@@ -229,9 +254,33 @@ impl IoCache {
     pub fn invalidate(&self, fileid: u64) {
         self.file_blocks.invalidate(&fileid);
         self.reader_pools.invalidate(&fileid);
+        self.invalidate_file_data(&fileid);
     }
 
-    /// Flush writer for a file
+    /// Get small file data from cache (if enabled)
+    #[inline]
+    pub fn get_file_data(&self, fileid: u64) -> Option<Vec<u8>> {
+        self.file_data.as_ref().and_then(|cache| cache.get(&fileid))
+    }
+
+    /// Insert small file data into cache (if enabled and file size <= max_cacheable_file_size)
+    #[inline]
+    pub fn insert_file_data(&self, fileid: u64, data: Vec<u8>, file_size: i64) {
+        if let Some(ref cache) = self.file_data {
+            // Only cache if file size is within limit
+            if file_size as u64 <= self.max_cacheable_file_size {
+                cache.insert(fileid, data);
+            }
+        }
+    }
+
+    /// Invalidate file_data cache (called when file is modified)
+    #[inline]
+    pub fn invalidate_file_data(&self, fileid: &u64) {
+        if let Some(ref cache) = self.file_data {
+            cache.invalidate(fileid);
+        }
+    }
     pub async fn flush_writer(&self, fileid: u64) -> Result<(), FsError> {
         if let Some(entry) = self.writers.get(&fileid) {
             entry.writer.lock().await.flush().await?;

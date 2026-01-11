@@ -30,6 +30,15 @@ use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
 
+/// NFS4 stable write mode: UNSTABLE4
+pub const UNSTABLE4: u32 = 0;
+
+/// NFS4 stable write mode: DATA_SYNC4
+pub const DATA_SYNC4: u32 = 1;
+
+/// NFS4 stable write mode: FILE_SYNC4
+pub const FILE_SYNC4: u32 = 2;
+
 /// WRITE operation handler
 pub async fn op_write(
     input: &mut impl Read,
@@ -48,11 +57,8 @@ pub async fn op_write(
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
     tracing::info!(
-        "WRITE: stateid={:?} offset={} len={} fileid_from_fh={}",
-        stateid,
-        offset,
-        data.len(),
-        fileid
+        "WRITE: stateid={:?} offset={} len={} stable={} fileid={}",
+        stateid, offset, data.len(), stable, fileid
     );
 
     let status = handler.fs.get_status(fileid).await?;
@@ -60,13 +66,19 @@ pub async fn op_write(
         return Err(Nfs4Status::Inval.into());
     }
 
-    let adjusted_size = check_write_limits(offset, data.len() as u64)?;
+    let adjusted_size = check_write_limits(offset, data.len() as u64, handler)?;
     if adjusted_size < data.len() {
         data.truncate(adjusted_size);
     }
 
-    let count = if stateid.is_special() {
-        handler.fs.write(fileid, offset, data).await?
+    // Following nfs-ganesha: need_sync = (stable != UNSTABLE4)
+    let need_sync = stable != UNSTABLE4;
+
+    let (count, actual_synced) = if stateid.is_special() {
+        let written = handler.fs.write(fileid, offset, data).await?;
+        // Invalidate small file data cache since file content has changed
+        handler.fs.invalidate_file_data(fileid);
+        (written, true) // Special stateid always syncs
     } else {
         let state = handler
             .opens
@@ -95,27 +107,35 @@ pub async fn op_write(
         })?;
 
         tracing::info!(
-            "WRITE: Found OpenFile, calling write offset={} len={}",
-            offset,
-            data.len()
+            "WRITE: Found OpenFile, calling write offset={} len={} need_sync={}",
+            offset, data.len(), need_sync
         );
 
-        let written = open_file.write(offset, data).await?;
+        let (written, actual_synced) = open_file.write(offset, data, need_sync).await?;
 
-        tracing::info!("WRITE: Successfully wrote {} bytes", written);
+        // Invalidate small file data cache since file content has changed
+        handler.fs.invalidate_file_data(state.fileid);
 
-        written
+        tracing::info!(
+            "WRITE: Successfully wrote {} bytes, synced={}",
+            written, actual_synced
+        );
+
+        (written, actual_synced)
     };
 
-    build_write_response(count as usize, stable, handler)
+    build_write_response(count as usize, actual_synced, handler)
 }
 
 /// Check write limits and adjust size
-fn check_write_limits(_offset: u64, size: u64) -> Nfs4Result<usize> {
-    const MAX_WRITE: u64 = 1024 * 1024; // 1MB default
+///
+/// Uses max_write_size from NfsGatewayConf instead of hardcoded value.
+fn check_write_limits(_offset: u64, size: u64, handler: &CompoundHandler) -> Nfs4Result<usize> {
+    // Use max_write_size from config
+    let max_write = handler.fs.config().max_write_size as u64;
 
-    let adjusted_size = if size > MAX_WRITE {
-        MAX_WRITE as usize
+    let adjusted_size = if size > max_write {
+        max_write as usize
     } else {
         size as usize
     };
@@ -124,20 +144,19 @@ fn check_write_limits(_offset: u64, size: u64) -> Nfs4Result<usize> {
 }
 
 /// Build WRITE response with count, committed level, and write verifier
+///
+/// Following nfs-ganesha: committed is based on actual sync status, not requested stable
 fn build_write_response(
     count: usize,
-    stable: u32,
+    actual_synced: bool,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
     let mut result = Vec::with_capacity(16);
 
     (count as u32).serialize(&mut result)?;
 
-    let committed = if stable != 0 {
-        2u32 // FILE_SYNC4
-    } else {
-        0u32 // UNSTABLE4
-    };
+    // Following nfs-ganesha: return committed based on actual sync status
+    let committed = if actual_synced { FILE_SYNC4 } else { UNSTABLE4 };
     committed.serialize(&mut result)?;
 
     let verifier = handler.boot_time.to_le_bytes();

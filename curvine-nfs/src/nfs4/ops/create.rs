@@ -73,6 +73,7 @@ use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
+use tracing::info;
 
 // Object type constants (RFC 5661, Section 3.3.13)
 pub mod object_type {
@@ -171,6 +172,16 @@ pub async fn op_create(
         });
     }
 
+    // Use RPC auth credentials if client didn't specify owner/group
+    // This aligns with nfs-ganesha behavior (nfs4_op_create.c:214-217)
+    let effective_uid = uid.or(Some(ctx.auth.uid));
+    let effective_gid = gid.or(Some(ctx.auth.gid));
+
+    info!(
+        "CREATE: name={:?}, client_uid={}, client_gid={}, requested_uid={:?}, requested_gid={:?}, effective_uid={:?}, effective_gid={:?}",
+        name, ctx.auth.uid, ctx.auth.gid, uid, gid, effective_uid, effective_gid
+    );
+
     let (new_fileid, _new_status) = match obj_type {
         object_type::NF4DIR => handler.fs.mkdir(parent_id, &name).await?,
         object_type::NF4LNK => {
@@ -193,15 +204,15 @@ pub async fn op_create(
     };
 
     if mode.is_some()
-        || uid.is_some()
-        || gid.is_some()
+        || effective_uid.is_some()
+        || effective_gid.is_some()
         || size.is_some()
         || atime.is_some()
         || mtime.is_some()
     {
         handler
             .fs
-            .setattr(new_fileid, mode, uid, gid, size, atime, mtime)
+            .setattr(new_fileid, mode, effective_uid, effective_gid, size, atime, mtime)
             .await?;
     }
 

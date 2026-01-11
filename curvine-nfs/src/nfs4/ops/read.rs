@@ -23,9 +23,30 @@ use crate::nfs4::error::{Nfs4Error, Nfs4Result, Nfs4Status};
 use crate::nfs4::types::*;
 use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
+use orpc::sys::DataSlice;
 use std::io::Read;
+use tokio_util::bytes::Bytes;
 
 /// READ operation handler
+///
+/// # Small File Cache (curvine-nfs extension for AI training)
+///
+/// This is NOT part of nfs-ganesha standard implementation. It's a curvine-nfs
+/// extension optimized for AI training scenarios where many small files are
+/// read repeatedly by a single client.
+///
+/// ## Cache Consistency Note
+/// The cache uses TTL-based invalidation (default 10s). Within TTL period,
+/// if another client modifies the file, this client may read stale data.
+/// This is acceptable for AI training where files are typically read-only.
+///
+/// ## When to use
+/// - AI training: reading many small config/metadata files repeatedly
+/// - Single-client workloads where cache consistency is less critical
+///
+/// ## When NOT to use (disable via file_data_cache_size=0)
+/// - Multi-writer workloads requiring strong consistency
+/// - Files that change frequently
 pub async fn op_read(
     input: &mut impl Read,
     ctx: &CompoundContext,
@@ -44,7 +65,23 @@ pub async fn op_read(
         return Err(Nfs4Status::Inval.into());
     }
 
-    let (adjusted_offset, adjusted_count, early_eof) = check_read_limits(offset, count, &status)?;
+    // Get max_cacheable_file_size from config
+    let max_cacheable_size = handler.fs.config().max_cacheable_file_size;
+    let file_size = status.len as u64;
+
+    // Try small file cache first (only for full file reads of small files)
+    // Cache hit: return data directly without backend I/O
+    if offset == 0 && file_size <= max_cacheable_size {
+        if let Some(cached_data) = handler.fs.get_file_data(fileid) {
+            tracing::debug!("READ: Small file cache hit for fileid={} size={}", fileid, cached_data.len());
+            let read_len = (count as usize).min(cached_data.len());
+            let eof = read_len >= cached_data.len();
+            let slice = DataSlice::bytes(Bytes::from(cached_data[..read_len].to_vec()));
+            return build_read_response(vec![slice], eof);
+        }
+    }
+
+    let (adjusted_offset, adjusted_count, early_eof) = check_read_limits(offset, count, &status, handler)?;
 
     if early_eof {
         return build_read_response(vec![], true);
@@ -69,19 +106,37 @@ pub async fn op_read(
         open_file.read(adjusted_offset, adjusted_count).await?
     };
 
+    // Cache small file data after read (only for full file reads starting at offset 0)
+    // This benefits AI training workloads where small files are read repeatedly
+    if offset == 0 && file_size <= max_cacheable_size && eof {
+        let total_len: usize = slices.iter().map(|s| s.len()).sum();
+        if total_len == file_size as usize {
+            // Collect all slices into a single Vec for caching
+            let mut cached_data = Vec::with_capacity(total_len);
+            for slice in &slices {
+                cached_data.extend_from_slice(slice.as_slice());
+            }
+            handler.fs.insert_file_data(fileid, cached_data);
+            tracing::debug!("READ: Cached small file fileid={} size={}", fileid, total_len);
+        }
+    }
+
     build_read_response(slices, eof)
 }
 
 /// Check read limits and adjust parameters based on MaxRead and file size
+///
+/// Uses max_read_size from NfsGatewayConf instead of hardcoded value.
 fn check_read_limits(
     offset: u64,
     count: u32,
     status: &curvine_common::state::FileStatus,
+    handler: &CompoundHandler,
 ) -> Nfs4Result<(u64, u32, bool)> {
-    const MAX_READ: u64 = 1024 * 1024; // 1MB default
-
-    let adjusted_count = if count as u64 > MAX_READ {
-        MAX_READ as u32
+    // Use max_read_size from config
+    let max_read = handler.fs.config().max_read_size as u64;
+    let adjusted_count = if count as u64 > max_read {
+        max_read as u32
     } else {
         count
     };

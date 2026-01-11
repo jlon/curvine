@@ -69,6 +69,11 @@ async fn handle_rpc(
         let mut auth = auth_unix::default();
         auth.deserialize(&mut Cursor::new(&call.cred.body))?;
         context.auth = auth;
+    } else {
+        warn!(
+            "RPC auth flavor: {:?}, using default (uid=0, gid=0)",
+            call.cred.flavor
+        );
     }
 
     // Validate RPC version

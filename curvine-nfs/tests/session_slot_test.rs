@@ -228,10 +228,7 @@ fn test_sequence_replay_detection() {
 
     // Replay same sequence - should return cached
     assert!(manager.sequence(&sid, 0, 1).is_err());
-    assert_eq!(
-        manager.replay_reply(&sid, 0, 1),
-        Some(vec![0xAB, 0xCD])
-    );
+    assert_eq!(manager.replay_reply(&sid, 0, 1), Some(vec![0xAB, 0xCD]));
 
     // Next sequence should work
     manager.sequence(&sid, 0, 2).unwrap();

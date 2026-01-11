@@ -520,27 +520,12 @@ impl SessionManager {
         sequence_id: u32,
     ) -> Nfs4Result<(Arc<Session>, u32, u32, u32, u32)> {
         // Fast path: read lock for session lookup
-        // Aligned with NFS-Ganesha: nfs41_Session_Get_Pointer (line 155)
-        let session = match self.get_session(sessionid) {
-            Some(s) => s,
-            None => {
-                // Log all known sessions for debugging
-                let sessions = self.sessions.read().unwrap();
-                tracing::error!(
-                    "SEQUENCE: BadSession - sessionid={:02x?} not found, known sessions: {}",
-                    &sessionid[..8],
-                    sessions
-                        .keys()
-                        .map(|k| format!("{:02x?}", &k[..8]))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                return Err(Nfs4Status::BadSession.into());
-            }
-        };
+        let session = self.get_session(sessionid).ok_or_else(|| {
+            self.log_session_not_found(sessionid);
+            Nfs4Status::BadSession
+        })?;
 
         // Get slot (no lock)
-        // Aligned with NFS-Ganesha: slot bounds check (line 186-192)
         let slot = session.get_slot(slot_id).ok_or_else(|| {
             tracing::error!(
                 "SEQUENCE: BadSlot - slot_id={} >= max_slots={}",
@@ -551,7 +536,6 @@ impl SessionManager {
         })?;
 
         // Lock-free slot acquisition
-        // Aligned with NFS-Ganesha: sequence validation (line 196-260)
         let current_seq = slot.sequence();
         let new_sequenceid = match slot.acquire(sequence_id) {
             Ok(SlotAcquireResult::Acquired { new_sequenceid }) => new_sequenceid,
@@ -561,11 +545,7 @@ impl SessionManager {
             Err(e) => {
                 tracing::error!(
                     "SEQUENCE: {:?} - slot={} request_seq={} current_seq={} (expected={})",
-                    e,
-                    slot_id,
-                    sequence_id,
-                    current_seq,
-                    current_seq.wrapping_add(1)
+                    e, slot_id, sequence_id, current_seq, current_seq.wrapping_add(1)
                 );
                 return Err(e.into());
             }
@@ -573,14 +553,10 @@ impl SessionManager {
 
         tracing::debug!(
             "SEQUENCE: success sessionid={:02x?} slot={} req_seq={} resp_seq={}",
-            &sessionid[..8],
-            slot_id,
-            sequence_id,
-            new_sequenceid
+            &sessionid[..8], slot_id, sequence_id, new_sequenceid
         );
 
         // Return session info with the NEW sequence id for response
-        // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence (after increment)
         Ok((
             session.clone(),
             new_sequenceid,
@@ -590,7 +566,26 @@ impl SessionManager {
         ))
     }
 
-    pub fn replay_reply(&self, sessionid: &Sessionid4, slot_id: u32, sequence_id: u32) -> Option<Vec<u8>> {
+    /// Log session not found error with known sessions for debugging
+    fn log_session_not_found(&self, sessionid: &Sessionid4) {
+        let sessions = self.sessions.read().unwrap();
+        tracing::error!(
+            "SEQUENCE: BadSession - sessionid={:02x?} not found, known sessions: {}",
+            &sessionid[..8],
+            sessions
+                .keys()
+                .map(|k| format!("{:02x?}", &k[..8]))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    pub fn replay_reply(
+        &self,
+        sessionid: &Sessionid4,
+        slot_id: u32,
+        sequence_id: u32,
+    ) -> Option<Vec<u8>> {
         let session = self.get_session(sessionid)?;
         let slot = session.get_slot(slot_id)?;
         if slot.sequence() != sequence_id {

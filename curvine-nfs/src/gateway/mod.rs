@@ -46,7 +46,7 @@ mod nfs_reader;
 mod nfs_writer;
 mod path_cache;
 mod server;
-mod uid_gid;
+pub mod uid_gid;
 
 pub use curvine_nfs_fs::CurvineNfsFileSystem;
 pub use error::{NfsError, NfsResult};

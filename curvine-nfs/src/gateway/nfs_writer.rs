@@ -161,7 +161,11 @@ pub struct NfsWriter {
 
 impl NfsWriter {
     /// Create new NfsWriter with background processing task
-    pub fn new(writer: UnifiedWriter) -> Self {
+    ///
+    /// # Arguments
+    /// - writer: UnifiedWriter for actual I/O operations
+    /// - small_file_config: (max_writes, max_size, enabled) from NfsGatewayConf
+    pub fn new(writer: UnifiedWriter, small_file_config: (u32, u64, bool)) -> Self {
         let path = writer.path().clone();
         // Use bounded channel to provide backpressure
         let (sender, receiver) = mpsc::channel(1024);
@@ -174,8 +178,7 @@ impl NfsWriter {
             sender,
             completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_pattern: Arc::new(Mutex::new(WritePattern::new())),
-            // Phase 2 ENABLED: Small file async flush optimization
-            small_file_config: (20, 10 * 1024 * 1024, true),  // enabled=true
+            small_file_config,
         }
     }
 
@@ -185,41 +188,46 @@ impl NfsWriter {
     }
 
     /// Write data at offset (queued for sequential processing)
+    ///
+    /// # Arguments
+    /// - need_sync: true if stable != UNSTABLE4 (following nfs-ganesha semantics)
+    ///
+    /// # Returns
+    /// - (written_bytes, actual_synced): written count and whether sync was performed
+    ///
+    /// # Flush Decision (following nfs-ganesha + small file optimization)
+    /// 1. If need_sync=true (FILE_SYNC4/DATA_SYNC4), always flush → synced=true
+    /// 2. If need_sync=false (UNSTABLE4):
+    ///    - Small file: skip flush → synced=false (will flush on COMMIT/CLOSE)
+    ///    - Large file: flush → synced=true (avoid memory pressure)
     #[inline]
-    pub async fn write(&self, offset: i64, data: Vec<u8>) -> FsResult<u32> {
+    pub async fn write(&self, offset: i64, data: Vec<u8>, need_sync: bool) -> FsResult<(u32, bool)> {
         let data_len = data.len();
+        tracing::info!(
+            "NfsWriter.write() ENTRY: offset={} len={} need_sync={} path={}",
+            offset, data_len, need_sync, self.path.path()
+        );
 
-        // Phase 2 Layer 2b: Full conditional logic (but enabled=false)
+        // Phase 2: Track write pattern for small file detection
         let (max_writes, max_size, enabled) = self.small_file_config;
-        let (is_small, should_switch) = if enabled {
+        // Extract pattern info with single lock acquisition to avoid deadlock in tracing! macro
+        let (is_small, should_switch, write_count, total_bytes) = {
             let mut pattern = self.write_pattern.lock().unwrap();
             pattern.record_write(data_len);
 
-            let is_small = pattern.is_small_file(max_writes, max_size);
-            let should_switch = pattern.should_switch_to_large(max_writes, max_size);
-
-            (is_small, should_switch)
-        } else {
-            // Optimization disabled - record write for debugging
-            let mut pattern = self.write_pattern.lock().unwrap();
-            pattern.record_write(data_len);
-            (false, false)
-        };
-
-        // 🔧 FIX: 提前获取值,避免在tracing!宏内部调用lock()导致死锁
-        let (write_count, total_bytes) = {
-            let pattern = self.write_pattern.lock().unwrap();
-            (pattern.write_count(), pattern.total_bytes())
-        };
+            if enabled {
+                let is_small = pattern.is_small_file(max_writes, max_size);
+                let should_switch = pattern.should_switch_to_large(max_writes, max_size);
+                (is_small, should_switch, pattern.write_count(), pattern.total_bytes())
+            } else {
+                // Optimization disabled
+                (false, false, pattern.write_count(), pattern.total_bytes())
+            }
+        }; // Lock released here before tracing
 
         tracing::debug!(
             "WritePattern: enabled={} is_small={} should_switch={} count={} bytes={} path={}",
-            enabled,
-            is_small,
-            should_switch,
-            write_count,
-            total_bytes,
-            self.path.path()
+            enabled, is_small, should_switch, write_count, total_bytes, self.path.path()
         );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -236,25 +244,52 @@ impl NfsWriter {
             .await
             .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?;
 
-        // Phase 2 Layer 2b: Conditional flush logic (all branches flush)
-        if enabled && should_switch {
-            tracing::debug!("FlushDecision: BRANCH should_switch - flushing");
+        // Flush decision: based on both need_sync (stable parameter) and file size
+        // Following nfs-ganesha semantics with small file optimization
+        let actual_synced = if need_sync {
+            // Case 1: Client requested FILE_SYNC4/DATA_SYNC4 - must flush
+            tracing::info!(
+                "FlushDecision: need_sync=true (FILE_SYNC4/DATA_SYNC4) - flushing path={}",
+                self.path.path()
+            );
+            self.flush().await?;
+            true
+        } else if !enabled {
+            // Case 2: Optimization disabled - always flush
+            tracing::info!(
+                "FlushDecision: optimization disabled - flushing path={}",
+                self.path.path()
+            );
+            self.flush().await?;
+            true
+        } else if should_switch {
+            // Case 3: Small file switching to large - flush and mark
+            tracing::info!(
+                "FlushDecision: UNSTABLE4 but should_switch - flushing path={}",
+                self.path.path()
+            );
             self.write_pattern.lock().unwrap().mark_switched();
             self.flush().await?;
-        } else if enabled && !is_small {
-            tracing::debug!("FlushDecision: BRANCH large file - flushing");
+            true
+        } else if !is_small {
+            // Case 4: Large file with UNSTABLE4 - flush to avoid memory pressure
+            tracing::info!(
+                "FlushDecision: UNSTABLE4 but large file - flushing path={}",
+                self.path.path()
+            );
             self.flush().await?;
-        } else if enabled && is_small {
-            tracing::debug!("FlushDecision: BRANCH small file - SKIPPING flush (Phase 2 REAL)");
-            // Phase 2c: REAL Phase 2 - skip flush for small files
-            // This is the suspected bug source!
-            // DO NOT flush here - data buffered until CLOSE
+            true
         } else {
-            tracing::debug!("FlushDecision: BRANCH disabled - flushing");
-            self.flush().await?;
-        }
+            // Case 5: Small file with UNSTABLE4 - SKIP flush (the optimization!)
+            tracing::info!(
+                "FlushDecision: UNSTABLE4 + small file - SKIPPING flush path={}",
+                self.path.path()
+            );
+            // Data will be flushed on COMMIT/CLOSE
+            false
+        };
 
-        result
+        result.map(|written| (written, actual_synced))
     }
 
     /// Resize file

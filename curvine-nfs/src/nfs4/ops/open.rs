@@ -189,19 +189,30 @@ pub async fn op_open(
             if opentype == 1 {
                 let (fid, _status) = handler.fs.create_file(parent_id, &name_str).await?;
 
-                if let Some((mode, uid, gid, size, atime, mtime)) = create_attrs {
-                    if mode.is_some()
-                        || uid.is_some()
-                        || gid.is_some()
-                        || size.is_some()
-                        || atime.is_some()
-                        || mtime.is_some()
-                    {
-                        handler
-                            .fs
-                            .setattr(fid, mode, uid, gid, size, atime, mtime)
-                            .await?;
-                    }
+                // Extract client-provided attributes (if any)
+                let (mode, uid, gid, size, atime, mtime) = if let Some(attrs) = create_attrs {
+                    attrs
+                } else {
+                    (None, None, None, None, None, None)
+                };
+
+                // Use RPC auth credentials if client didn't specify owner/group
+                // This aligns with nfs-ganesha behavior and CREATE operation
+                let effective_uid = uid.or(Some(ctx.auth.uid));
+                let effective_gid = gid.or(Some(ctx.auth.gid));
+
+                // Always call setattr to ensure owner/group are set
+                if mode.is_some()
+                    || effective_uid.is_some()
+                    || effective_gid.is_some()
+                    || size.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    handler
+                        .fs
+                        .setattr(fid, mode, effective_uid, effective_gid, size, atime, mtime)
+                        .await?;
                 }
 
                 (fid, true)
@@ -268,13 +279,6 @@ pub async fn op_open(
     rflags |= 0x00000004; // OPEN4_RESULT_LOCKTYPE_POSIX
     rflags.serialize(&mut result)?;
 
-    tracing::info!(
-        "OPEN response: stateid={:?} rflags={:#x} minor_version={}",
-        response_stateid,
-        rflags,
-        ctx.minor_version
-    );
-
     // attrset bitmap (empty)
     0u32.serialize(&mut result)?;
 
@@ -288,14 +292,6 @@ pub async fn op_open(
     let client_wants_deleg = (share_access & want_deleg_mask) != 0;
 
     let deleg_enabled = handler.delegations.is_enabled();
-    tracing::info!(
-        "OPEN delegation: enabled={} is_create={} is_write={} want_deleg={} minor_version={}",
-        deleg_enabled,
-        is_create,
-        is_write_open,
-        client_wants_deleg,
-        ctx.minor_version
-    );
 
     // FIXED: Disabled forced delegation grant
     // Without real RPC backchannel, forced delegation causes client confusion
@@ -322,18 +318,12 @@ pub async fn op_open(
             )
         };
 
-        tracing::info!(
-            "OPEN delegation result: {:?}",
-            delegation.as_ref().map(|d| d.deleg_type)
-        );
-
         let deleg_bytes = encode_open_delegation(
             delegation.as_ref(),
             &handler.fs.fileid_to_fh(fileid),
             ctx.minor_version,
             client_wants_deleg,
         )?;
-        tracing::info!("OPEN delegation bytes: len={}", deleg_bytes.len());
         result.extend_from_slice(&deleg_bytes);
     } else {
         // No delegation - encode based on minor version and client request
@@ -344,11 +334,8 @@ pub async fn op_open(
             ctx.minor_version,
             client_wants_deleg,
         )?;
-        tracing::info!("OPEN delegation: NONE, bytes len={}", deleg_bytes.len());
         result.extend_from_slice(&deleg_bytes);
     }
-
-    tracing::info!("OPEN response total bytes: len={}", result.len());
 
     Ok(result)
 }

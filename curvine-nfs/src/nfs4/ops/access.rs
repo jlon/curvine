@@ -116,15 +116,8 @@ pub async fn op_access(
     }
 
     let fh = ctx.require_current_fh()?;
-    tracing::info!(
-        "ACCESS: fh_len={} fh_data={:02x?} access={:#x}",
-        fh.data.len(),
-        &fh.data[..fh.data.len().min(16)],
-        access
-    );
 
     let fileid = handler.fs.fh_to_fileid(fh)?;
-    tracing::info!("ACCESS: fileid={}", fileid);
 
     let (supported, allowed) = check_access(handler, fileid, access).await?;
 

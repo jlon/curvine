@@ -503,9 +503,9 @@ impl Default for NfsGatewayConf {
             file_status_cache_size: 10000i64,
             file_status_cache_ttl_secs: 30,
             // Small file data cache defaults
-            file_data_cache_size: 1000,         // 1000 files max
-            file_data_cache_ttl_secs: 10,       // 10 seconds TTL
-            max_cacheable_file_size: 65536,     // 64KB max
+            file_data_cache_size: 1000,     // 1000 files max
+            file_data_cache_ttl_secs: 10,   // 10 seconds TTL
+            max_cacheable_file_size: 65536, // 64KB max
             // NFSv4 Delegation defaults (enabled for better read performance)
             delegation_enabled: true,
             delegation_recall_timeout_secs: 30,

@@ -16,8 +16,27 @@
 //!
 //! Converts between Curvine's string-based owner/group and NFS's numeric UID/GID.
 //! Reuses orpc::sys for system lookups (same as curvine-fuse).
+//!
+//! NFSv4 ID Mapping:
+//! - NFSv4 uses "user@domain" format for owner/owner_group attributes
+//! - Aligns with nfs-ganesha's idmapper implementation
 
 use orpc::sys;
+use std::sync::OnceLock;
+
+/// NFSv4 domain name for ID mapping
+/// Uses hostname as domain (localdomain convention)
+static NFS4_DOMAIN: OnceLock<String> = OnceLock::new();
+
+/// Get NFSv4 domain name (cached)
+fn get_nfs4_domain() -> &'static str {
+    NFS4_DOMAIN.get_or_init(|| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "localdomain".to_string())
+    })
+}
 
 /// Resolve owner string to UID
 ///
@@ -87,5 +106,51 @@ mod tests {
     #[test]
     fn test_resolve_gid_empty() {
         assert_eq!(resolve_gid("", 65534), 65534);
+    }
+}
+
+/// Convert UID to NFSv4 owner string ("user@domain")
+///
+/// Follows nfs-ganesha idmapper logic:
+/// 1. Lookup username by UID
+/// 2. If found, return "username@domain"
+/// 3. If not found, return numeric UID as string (allow_numeric_owners=true behavior)
+///
+/// # Arguments
+/// * `uid` - User ID to convert
+///
+/// # Returns
+/// NFSv4-compliant owner string (e.g., "root@localdomain" or "1000")
+pub fn uid_to_nfs4_owner(uid: u32) -> String {
+    match sys::get_username_by_uid(uid) {
+        Some(username) => format!("{}@{}", username, get_nfs4_domain()),
+        None => {
+            // Fallback to numeric form (compatible with nfs-ganesha's allow_numeric_owners)
+            // This matches nfs-ganesha behavior when idmapper lookup fails
+            uid.to_string()
+        }
+    }
+}
+
+/// Convert GID to NFSv4 group string ("group@domain")
+///
+/// Follows nfs-ganesha idmapper logic:
+/// 1. Lookup group name by GID
+/// 2. If found, return "groupname@domain"
+/// 3. If not found, return numeric GID as string (allow_numeric_owners=true behavior)
+///
+/// # Arguments
+/// * `gid` - Group ID to convert
+///
+/// # Returns
+/// NFSv4-compliant group string (e.g., "wheel@localdomain" or "1000")
+pub fn gid_to_nfs4_group(gid: u32) -> String {
+    match sys::get_groupname_by_gid(gid) {
+        Some(groupname) => format!("{}@{}", groupname, get_nfs4_domain()),
+        None => {
+            // Fallback to numeric form (compatible with nfs-ganesha's allow_numeric_owners)
+            // This matches nfs-ganesha behavior when idmapper lookup fails
+            gid.to_string()
+        }
     }
 }

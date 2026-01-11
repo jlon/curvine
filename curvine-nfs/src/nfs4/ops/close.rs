@@ -107,7 +107,15 @@ pub async fn op_close(
 
     // Step 4: Close file (FSAL closes fd if this is the last reference)
     tracing::debug!("CLOSE: fileid={} calling close_file", fileid);
+    // ⏱️ PERF: Measure close_file time (includes complete/flush)
+    let close_start = std::time::Instant::now();
     handler.fs.close_file(closed_state.fileid).await?;
+    let close_elapsed = close_start.elapsed();
+    tracing::warn!(
+        "⏱️ PERF_CLOSE_FILE: fileid={} elapsed_us={}",
+        fileid,
+        close_elapsed.as_micros()
+    );
     tracing::debug!("CLOSE: fileid={} completed successfully", fileid);
 
     // Build response

@@ -87,6 +87,11 @@ pub struct CachedReply {
     pub reply: Vec<u8>,
 }
 
+pub enum SlotAcquireResult {
+    Acquired { new_sequenceid: u32 },
+    Replay { cached_reply: Vec<u8> },
+}
+
 /// Slot for exactly-once semantics (Lock-free design)
 ///
 /// # Performance Optimization
@@ -146,10 +151,7 @@ impl Slot {
     /// ```
     ///
     /// # Returns
-    /// - Ok(new_sequence): Slot acquired, returns the NEW sequence number to send in response
-    /// - Err(SeqMisordered): Sequence mismatch
-    /// - Err(RetryUncachedRep): Replay but no cached reply
-    pub fn acquire(&self, seq: u32) -> Result<u32, Nfs4Status> {
+    pub fn acquire(&self, seq: u32) -> Result<SlotAcquireResult, Nfs4Status> {
         let current_seq = self.sequence.load(Ordering::Acquire);
         let expected_seq = current_seq.wrapping_add(1);
 
@@ -162,10 +164,11 @@ impl Slot {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    // Successfully acquired - increment sequence
-                    // NFS-Ganesha: slot->sequence += 1
+                    *self.cached_reply.lock().unwrap() = None;
                     let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-                    Ok(new_seq)
+                    Ok(SlotAcquireResult::Acquired {
+                        new_sequenceid: new_seq,
+                    })
                 }
                 Err(SLOT_IN_USE) => {
                     // Slot already in use - concurrent request
@@ -180,8 +183,11 @@ impl Slot {
                         Ordering::Acquire,
                     ) {
                         Ok(_) => {
+                            *self.cached_reply.lock().unwrap() = None;
                             let new_seq = self.sequence.fetch_add(1, Ordering::Release) + 1;
-                            Ok(new_seq)
+                            Ok(SlotAcquireResult::Acquired {
+                                new_sequenceid: new_seq,
+                            })
                         }
                         Err(_) => Err(Nfs4Status::SeqMisordered),
                     }
@@ -189,15 +195,11 @@ impl Slot {
                 Err(_) => Err(Nfs4Status::SeqMisordered),
             }
         } else if seq == current_seq {
-            // Replay request - NFS-Ganesha: slot->sequence == sa_sequenceid
-            // Check if we have a cached reply
-            let cached = self.cached_reply.lock().unwrap();
-            if cached.is_some() {
-                // Return special status to indicate replay with cached reply
-                // The caller should handle this by returning the cached reply
-                Err(Nfs4Status::RetryUncachedRep) // We'll use this as a signal
+            if let Some(cached) = self.cached_reply.lock().unwrap().clone() {
+                Ok(SlotAcquireResult::Replay {
+                    cached_reply: cached.reply,
+                })
             } else {
-                // No cached reply - NFS-Ganesha returns NFS4ERR_RETRY_UNCACHED_REP
                 Err(Nfs4Status::RetryUncachedRep)
             }
         } else {
@@ -229,6 +231,7 @@ impl Slot {
     /// Release slot without caching (for errors)
     #[inline]
     pub fn release_no_cache(&self) {
+        *self.cached_reply.lock().unwrap() = None;
         self.state.store(SLOT_FREE, Ordering::Release);
     }
 }
@@ -551,24 +554,8 @@ impl SessionManager {
         // Aligned with NFS-Ganesha: sequence validation (line 196-260)
         let current_seq = slot.sequence();
         let new_sequenceid = match slot.acquire(sequence_id) {
-            Ok(new_seq) => new_seq,
-            Err(Nfs4Status::RetryUncachedRep) => {
-                // Replay request - check for cached reply
-                if let Some(cached) = slot.get_cached_reply() {
-                    tracing::debug!(
-                        "SEQUENCE: replay detected, returning cached reply for seq={}",
-                        sequence_id
-                    );
-                    // For replay, we need to return the cached reply
-                    // This is handled specially in the caller
-                    return Err(Nfs4Status::RetryUncachedRep.into());
-                }
-                tracing::error!(
-                    "SEQUENCE: RetryUncachedRep - slot={} request_seq={} current_seq={}",
-                    slot_id,
-                    sequence_id,
-                    current_seq
-                );
+            Ok(SlotAcquireResult::Acquired { new_sequenceid }) => new_sequenceid,
+            Ok(SlotAcquireResult::Replay { .. }) => {
                 return Err(Nfs4Status::RetryUncachedRep.into());
             }
             Err(e) => {
@@ -601,6 +588,15 @@ impl SessionManager {
             session.highest_slot(),
             session.get_flags(),
         ))
+    }
+
+    pub fn replay_reply(&self, sessionid: &Sessionid4, slot_id: u32, sequence_id: u32) -> Option<Vec<u8>> {
+        let session = self.get_session(sessionid)?;
+        let slot = session.get_slot(slot_id)?;
+        if slot.sequence() != sequence_id {
+            return None;
+        }
+        slot.get_cached_reply().map(|c| c.reply)
     }
 
     /// Cache reply for a slot
@@ -647,18 +643,25 @@ mod tests {
         let slot = Slot::new(0);
 
         // First acquire should succeed
-        assert!(slot.acquire(1).unwrap().is_none());
+        match slot.acquire(1).unwrap() {
+            SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 1),
+            _ => panic!("unexpected acquire result"),
+        }
 
         // Release with reply
         slot.release(vec![1, 2, 3]);
 
         // Replay should return cached reply
-        let cached = slot.acquire(1).unwrap();
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().reply, vec![1, 2, 3]);
+        match slot.acquire(1).unwrap() {
+            SlotAcquireResult::Replay { cached_reply } => assert_eq!(cached_reply, vec![1, 2, 3]),
+            _ => panic!("unexpected replay result"),
+        }
 
         // Next sequence should succeed
-        assert!(slot.acquire(2).unwrap().is_none());
+        match slot.acquire(2).unwrap() {
+            SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 2),
+            _ => panic!("unexpected acquire result"),
+        }
     }
 
     #[test]

@@ -184,6 +184,9 @@ pub struct CompoundContext {
     pub clientid: Option<Clientid4>,
     /// Minor version (0 = NFSv4.0, 1 = NFSv4.1)
     pub minor_version: u32,
+    pub cachethis: bool,
+    /// Total number of operations in this COMPOUND (for validation)
+    pub op_count: usize,
 }
 
 impl CompoundContext {
@@ -196,6 +199,8 @@ impl CompoundContext {
             slot_id: None,
             clientid: None,
             minor_version: 1, // Default to NFSv4.1
+            cachethis: false,
+            op_count: 0,
         }
     }
 
@@ -209,6 +214,8 @@ impl CompoundContext {
             slot_id: None,
             clientid: None,
             minor_version,
+            cachethis: false,
+            op_count: 0,
         }
     }
 

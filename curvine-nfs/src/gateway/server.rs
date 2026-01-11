@@ -177,14 +177,36 @@ impl NfsGatewayServer {
             }
         }
 
-        // Enter grace period on server startup (90 seconds default)
-        // This allows clients to reclaim their state after server restart
-        info!("  Entering grace period...");
-        if let Err(e) = handler.grace.enter_grace_period() {
-            tracing::warn!("  ⚠ Failed to enter grace period immediately: errno={}", e);
-            tracing::info!("  Grace period will be entered after outstanding operations complete");
+        // Enter grace period ONLY if persisted state exists (NFS-Ganesha aligned)
+        // For fresh server start (no persisted state), skip grace period to avoid
+        // blocking new clients with NFS4ERR_GRACE on their first OPEN
+        let has_persisted_state = persistence
+            .load_recovery_metadata()
+            .await
+            .map_err(|e| {
+                FsError::io(std::io::Error::other(format!(
+                    "Failed to load recovery metadata: {e}"
+                )))
+            })?
+            .is_some();
+
+        if has_persisted_state {
+            // Recovery mode: enter grace period to allow clients to reclaim
+            info!("  Entering grace period (recovery mode)...");
+            if let Err(e) = handler.grace.enter_grace_period() {
+                tracing::warn!("  ⚠ Failed to enter grace period: errno={}", e);
+                tracing::info!(
+                    "  Grace period will be entered after outstanding operations complete"
+                );
+            } else {
+                tracing::info!("  ✓ Grace period entered (90 seconds)");
+            }
         } else {
-            tracing::info!("  ✓ Grace period entered (90 seconds)");
+            // Fresh start: no persisted state, no grace period needed
+            // New clients don't need to reclaim anything
+            info!(
+                "  Fresh server start, skipping grace period (new clients can operate immediately)"
+            );
         }
 
         Ok(handler)

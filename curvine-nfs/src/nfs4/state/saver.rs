@@ -19,7 +19,9 @@
 
 use crate::nfs4::state::{ClientManager, LockManager, OpenManager, StatePersistenceManager};
 use orpc::runtime::{RpcRuntime, Runtime};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error};
 
 /// State saver task (runs periodically)
@@ -29,6 +31,7 @@ pub struct StateSaverTask {
     opens: Arc<OpenManager>,
     locks: Arc<LockManager>,
     runtime: Arc<Runtime>,
+    saving: Arc<AtomicU8>,
 }
 
 // Ensure StateSaverTask is Send (all Arc types are Send)
@@ -49,6 +52,7 @@ impl StateSaverTask {
             opens,
             locks,
             runtime,
+            saving: Arc::new(AtomicU8::new(0)),
         }
     }
 }
@@ -67,18 +71,39 @@ impl orpc::runtime::LoopTask for StateSaverTask {
 
         debug!("Running periodic state save...");
 
-        // Use runtime.block_on() to execute async save operation
-        // This is safe because LoopTask::run() is designed to be blocking
-        let result = self.runtime.block_on(async {
-            self.persistence
-                .save_snapshot(&self.clients, &self.opens, &self.locks)
-                .await
-        });
-
-        if let Err(e) = result {
-            error!("Failed to save state snapshot: {:?}", e);
-            // Don't propagate error to avoid stopping the task
+        if self
+            .saving
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
         }
+
+        let persistence = self.persistence.clone();
+        let clients = self.clients.clone();
+        let opens = self.opens.clone();
+        let locks = self.locks.clone();
+        let saving = self.saving.clone();
+
+        self.runtime.spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                persistence.save_snapshot(&clients, &opens, &locks),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Failed to save state snapshot: {:?}", e);
+                }
+                Err(_) => {
+                    error!("Failed to save state snapshot: timeout");
+                }
+            }
+
+            saving.store(0, Ordering::Release);
+        });
 
         Ok(())
     }

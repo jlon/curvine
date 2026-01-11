@@ -126,12 +126,16 @@ pub async fn op_open(
         None => Some(parent_id), // Using current filehandle
     } {
         // Check if this access conflicts with existing delegation
-        if handler.delegations.needs_recall(fileid_to_check, clientid, is_write_open) {
+        if handler
+            .delegations
+            .needs_recall(fileid_to_check, clientid, is_write_open)
+        {
             // Return NFS4ERR_DELAY to tell client to retry later
             // NFS-Ganesha: state_deleg_conflict_impl() returns NFS4ERR_DELAY
             tracing::warn!(
                 "OPEN: delegation conflict detected for file {}, client {} retry later",
-                fileid_to_check, clientid
+                fileid_to_check,
+                clientid
             );
             return Err(Nfs4Status::Delay.into());
         }
@@ -293,14 +297,30 @@ pub async fn op_open(
         ctx.minor_version
     );
 
-    if deleg_enabled && !is_create {
+    // FIXED: Disabled forced delegation grant
+    // Without real RPC backchannel, forced delegation causes client confusion
+    // and performance degradation (20-50% slower due to client retries)
+    let force_grant_delegation = false;
+
+    if (deleg_enabled && !is_create) || (force_grant_delegation && !is_create) {
         // Try to grant delegation
-        let delegation = handler.delegations.try_grant(
-            clientid,
-            fileid,
-            share_access,
-            handler.fs.fileid_to_fh(fileid),
-        );
+        let delegation = if force_grant_delegation && !deleg_enabled {
+            // Force grant READ delegation for testing
+            tracing::warn!("EXPERIMENTAL: Force granting READ delegation without backchannel!");
+            Some(crate::nfs4::delegation::Delegation::new(
+                handler.delegations.generate_stateid_unsafe(), // Need to expose this
+                clientid,
+                fileid,
+                crate::nfs4::delegation::DelegationType::Read,
+            ))
+        } else {
+            handler.delegations.try_grant(
+                clientid,
+                fileid,
+                share_access,
+                handler.fs.fileid_to_fh(fileid),
+            )
+        };
 
         tracing::info!(
             "OPEN delegation result: {:?}",

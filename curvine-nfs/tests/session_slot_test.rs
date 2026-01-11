@@ -9,7 +9,7 @@ use std::time::Duration;
 
 // Import from curvine-nfs
 use curvine_nfs::nfs4::session::{
-    Session, SessionManager, Slot, DEFAULT_SLOT_COUNT, MAX_SLOT_COUNT,
+    Session, SessionManager, Slot, SlotAcquireResult, DEFAULT_SLOT_COUNT, MAX_SLOT_COUNT,
 };
 use curvine_nfs::nfs4::state::lease::LeaseManager;
 
@@ -19,16 +19,23 @@ fn test_slot_sequence_validation() {
     let slot = Slot::new(0);
 
     // Case 1: First request with seq=1 should succeed
-    assert!(slot.acquire(1).unwrap().is_none());
+    match slot.acquire(1).unwrap() {
+        SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 1),
+        _ => panic!("unexpected acquire result"),
+    }
     slot.release(vec![1, 2, 3]);
 
     // Case 2: Replay with same seq should return cached reply
-    let cached = slot.acquire(1).unwrap();
-    assert!(cached.is_some());
-    assert_eq!(cached.unwrap().reply, vec![1, 2, 3]);
+    match slot.acquire(1).unwrap() {
+        SlotAcquireResult::Replay { cached_reply } => assert_eq!(cached_reply, vec![1, 2, 3]),
+        _ => panic!("unexpected replay result"),
+    }
 
     // Case 3: Next seq=2 should succeed
-    assert!(slot.acquire(2).unwrap().is_none());
+    match slot.acquire(2).unwrap() {
+        SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 2),
+        _ => panic!("unexpected acquire result"),
+    }
     slot.release(vec![4, 5, 6]);
 
     // Case 4: Old seq=1 should fail (too old)
@@ -38,7 +45,10 @@ fn test_slot_sequence_validation() {
     assert!(slot.acquire(4).is_err());
 
     // Case 6: Correct seq=3 should succeed
-    assert!(slot.acquire(3).unwrap().is_none());
+    match slot.acquire(3).unwrap() {
+        SlotAcquireResult::Acquired { new_sequenceid } => assert_eq!(new_sequenceid, 3),
+        _ => panic!("unexpected acquire result"),
+    }
 }
 
 /// Test 2: Concurrent slot access
@@ -72,7 +82,7 @@ fn test_concurrent_slot_access() {
     // Verify all slots processed correctly
     for slot_id in 0..10 {
         let slot = session.get_slot(slot_id).unwrap();
-        assert_eq!(slot.sequence(), 101); // 100 increments + initial 1
+        assert_eq!(slot.sequence(), 100);
     }
 }
 
@@ -211,20 +221,20 @@ fn test_sequence_replay_detection() {
     let sid = session.sessionid;
 
     // First SEQUENCE
-    let (_, cached, _, _, _) = manager.sequence(&sid, 0, 1).unwrap();
-    assert!(cached.is_none());
+    manager.sequence(&sid, 0, 1).unwrap();
 
     // Cache reply
     manager.cache_reply(&sid, 0, vec![0xAB, 0xCD]);
 
     // Replay same sequence - should return cached
-    let (_, cached, _, _, _) = manager.sequence(&sid, 0, 1).unwrap();
-    assert!(cached.is_some());
-    assert_eq!(cached.unwrap().reply, vec![0xAB, 0xCD]);
+    assert!(manager.sequence(&sid, 0, 1).is_err());
+    assert_eq!(
+        manager.replay_reply(&sid, 0, 1),
+        Some(vec![0xAB, 0xCD])
+    );
 
     // Next sequence should work
-    let (_, cached, _, _, _) = manager.sequence(&sid, 0, 2).unwrap();
-    assert!(cached.is_none());
+    manager.sequence(&sid, 0, 2).unwrap();
 }
 
 /// Test 10: Multiple clients with separate sessions

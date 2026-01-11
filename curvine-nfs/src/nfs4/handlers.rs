@@ -104,12 +104,34 @@ async fn handle_compound(
     }
 
     let mut ctx = CompoundContext::with_minor_version(minor_version);
+    ctx.op_count = op_count; // Set for validation in operations like BIND_CONN_TO_SESSION
 
     let mut results: Vec<(Nfs4Op, Nfs4Status, Vec<u8>)> = Vec::with_capacity(op_count);
     let mut overall_status = Nfs4Status::Ok;
 
+    // Log compound request info for debugging NFSv4.1 delay issue
+    info!(
+        "COMPOUND: xid={} minor_version={} op_count={}",
+        xid, minor_version, op_count
+    );
+
+    let handler = context
+        .nfs4_handler
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("nfs4_handler not initialized"))?;
+
+    let first_op_code = if op_count > 0 {
+        Some(input.read_u32::<BigEndian>()?)
+    } else {
+        None
+    };
+
     for i in 0..op_count {
-        let op_code = input.read_u32::<BigEndian>()?;
+        let op_code = if i == 0 {
+            first_op_code.expect("op_count > 0 implies first_op_code is Some")
+        } else {
+            input.read_u32::<BigEndian>()?
+        };
         let op = Nfs4Op::from(op_code);
 
         // Debug: log current_fh state before each operation
@@ -127,14 +149,23 @@ async fn handle_compound(
             i, op, op_code, fh_state
         );
 
-        let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
-            Ok(data) => (Nfs4Status::Ok, data),
-            Err(e) => {
-                error!(
-                    "  Op[{}] {:?} failed: {:?} current_fh={}",
-                    i, op, e.status, fh_state
-                );
-                (e.status, Vec::new())
+        let (status, result_data) = if i == 0 && minor_version == 1 && op == Nfs4Op::Sequence {
+            match handle_sequence_first_op(xid, op_count, input, output, &mut ctx, handler)
+                .await?
+            {
+                SequenceFirstOp::Replay => return Ok(()),
+                SequenceFirstOp::Proceed { result_data } => (Nfs4Status::Ok, result_data),
+            }
+        } else {
+            match execute_operation(op, input, &mut ctx, context).await {
+                Ok(data) => (Nfs4Status::Ok, data),
+                Err(e) => {
+                    error!(
+                        "  Op[{}] {:?} failed: {:?} current_fh={}",
+                        i, op, e.status, fh_state
+                    );
+                    (e.status, Vec::new())
+                }
             }
         };
 
@@ -155,35 +186,126 @@ async fn handle_compound(
         results.len()
     );
 
-    make_success_reply(xid).serialize(output)?;
-    overall_status.serialize(output)?;
-    tag.serialize(output)?;
-    (results.len() as u32).serialize(output)?;
+    let reply_body = serialize_compound_body(overall_status, &tag, results)?;
 
-    for (op, status, data) in results {
-        debug!(
-            "  Result: op={:?}({}) status={:?} data_len={}",
-            op,
-            op as u32,
-            status,
-            data.len()
-        );
-        (op as u32).serialize(output)?;
-        status.serialize(output)?;
-        if status == Nfs4Status::Ok {
-            output.write_all(&data)?;
-        }
-    }
+    make_success_reply(xid).serialize(output)?;
+    output.write_all(&reply_body)?;
 
     if let (Some(sessionid), Some(slot_id)) = (ctx.sessionid, ctx.slot_id) {
-        if let Some(handler) = context.nfs4_handler.as_ref() {
+        if ctx.cachethis {
             handler
                 .sessions
-                .cache_reply(&sessionid, slot_id, Vec::new());
+                .cache_reply(&sessionid, slot_id, reply_body.clone());
+        } else {
+            handler.sessions.release_slot(&sessionid, slot_id);
         }
     }
 
     Ok(())
+}
+
+enum SequenceFirstOp {
+    Replay,
+    Proceed { result_data: Vec<u8> },
+}
+
+async fn handle_sequence_first_op(
+    xid: u32,
+    op_count: usize,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    ctx: &mut CompoundContext,
+    handler: &CompoundHandler,
+) -> Result<SequenceFirstOp, anyhow::Error> {
+    let mut sessionid = Sessionid4::default();
+    sessionid.deserialize(input)?;
+    let sequenceid = input.read_u32::<BigEndian>()?;
+    let slotid = input.read_u32::<BigEndian>()?;
+    let _highest_slotid = input.read_u32::<BigEndian>()?;
+    let cachethis = input.read_u32::<BigEndian>()?;
+
+    if let Some(cached_body) = handler
+        .sessions
+        .replay_reply(&sessionid, slotid, sequenceid)
+    {
+        if let Some(session) = handler.sessions.get_session(&sessionid) {
+            handler.clients.renew_lease(session.clientid)?;
+        }
+        info!(
+            "COMPOUND replay: xid={} sessionid={:02x?} seq={} slot={} op_count={}",
+            xid,
+            &sessionid[..8],
+            sequenceid,
+            slotid,
+            op_count
+        );
+        make_success_reply(xid).serialize(output)?;
+        output.write_all(&cached_body)?;
+        return Ok(SequenceFirstOp::Replay);
+    }
+
+    let (session, response_sequenceid, highest, target_highest, _session_flags) =
+        handler.sessions.sequence(&sessionid, slotid, sequenceid)?;
+
+    ctx.sessionid = Some(sessionid);
+    ctx.slot_id = Some(slotid);
+    ctx.clientid = Some(session.clientid);
+    ctx.cachethis = cachethis != 0;
+
+    handler.clients.renew_lease(session.clientid)?;
+
+    // NFS-Ganesha: sr_status_flags initialization (nfs4_op_sequence.c line 306-311)
+    // CRITICAL FIX: Check backchannel status to avoid 5-second client delay
+    const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+
+    let mut status_flags: u32 = 0;
+
+    // Check if backchannel is available (equivalent to nfs_rpc_get_chan check)
+    if !session.is_backchannel_up() {
+        status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+        tracing::warn!(
+            "SEQUENCE (first_op): Backchannel is down for session {:02x?}, setting CB_PATH_DOWN",
+            &sessionid[..8]
+        );
+    }
+
+    tracing::info!(
+        "SEQUENCE (first_op): resp_seq={} slot={} highest={} target_highest={} status_flags={:#x}",
+        response_sequenceid, slotid, highest, target_highest, status_flags
+    );
+
+    let mut result = Vec::new();
+    ctx.sessionid
+        .expect("sessionid set above")
+        .serialize(&mut result)?;
+    response_sequenceid.serialize(&mut result)?;
+    slotid.serialize(&mut result)?;
+    highest.serialize(&mut result)?;
+    target_highest.serialize(&mut result)?;
+    status_flags.serialize(&mut result)?;
+
+    Ok(SequenceFirstOp::Proceed { result_data: result })
+}
+
+fn serialize_compound_body(
+    overall_status: Nfs4Status,
+    tag: &[u8],
+    results: Vec<(Nfs4Op, Nfs4Status, Vec<u8>)>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let mut body = Vec::new();
+    overall_status.serialize(&mut body)?;
+    tag.to_vec().serialize(&mut body)?;
+    (results.len() as u32).serialize(&mut body)?;
+
+    for (op, status, data) in results {
+        (op as u32).serialize(&mut body)?;
+        status.serialize(&mut body)?;
+        if status == Nfs4Status::Ok {
+            body.extend_from_slice(&data);
+        }
+    }
+
+    Ok(body)
 }
 
 /// Skip remaining operations after an error
@@ -570,6 +692,7 @@ async fn op_sequence(
     ctx.sessionid = Some(sessionid);
     ctx.slot_id = Some(slotid);
     ctx.clientid = Some(session.clientid);
+    ctx.cachethis = cachethis != 0;
 
     handler.clients.renew_lease(session.clientid)?;
 
@@ -581,21 +704,26 @@ async fn op_sequence(
     // }
     // ```
     //
+    // nfs_rpc_get_chan() checks if any session has session_bc_up flag set
+    //
     // RFC 5661 Section 18.46.3 defines status flags:
     // - SEQ4_STATUS_CB_PATH_DOWN (0x01): Backchannel is not available
     // - SEQ4_STATUS_CB_PATH_DOWN_SESSION (0x200): Session's backchannel is down
     //
-    // IMPORTANT: Setting CB_PATH_DOWN causes Linux NFS client to wait 5 seconds
-    // trying to re-establish backchannel. Since we don't support delegation
-    // (delegation_enabled=false by default), we don't need backchannel.
-    //
-    // NFS-Ganesha only sets CB_PATH_DOWN when backchannel is actually needed
-    // (i.e., when delegations are granted). Since we return OPEN_DELEGATE_NONE,
-    // we can safely set status_flags=0 to avoid the 5-second delay.
-    //
-    // This is consistent with NFS-Ganesha behavior when backchannel is available
-    // (nfs_rpc_get_chan() returns non-NULL).
-    let status_flags: u32 = 0;
+    // CRITICAL: Setting CB_PATH_DOWN causes Linux NFS client to wait 5 seconds
+    // trying to re-establish backchannel. We must check session's bc_up status.
+    const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+
+    let mut status_flags: u32 = 0;
+
+    // Check if backchannel is available (equivalent to nfs_rpc_get_chan check)
+    if !session.is_backchannel_up() {
+        status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+        tracing::warn!(
+            "SEQUENCE: Backchannel is down for session {:02x?}, setting CB_PATH_DOWN",
+            &sessionid[..8]
+        );
+    }
 
     info!(
         "SEQUENCE response: resp_seq={} slot={} highest={} target_highest={} status_flags={:#x}",
@@ -666,16 +794,22 @@ async fn op_exchange_id(
             );
         }
     } else {
-        // NOT in grace period: set reclaim_complete=true immediately
-        // NFS-Ganesha behavior: clients created outside grace period don't need to reclaim
-        // This prevents NFS4ERR_GRACE on first OPEN operation
-        if let Some(client) = handler.clients.get_client(clientid) {
-            client.set_reclaim_complete(true);
-            info!(
-                "EXCHANGE_ID: client {} created outside grace period, reclaim_complete=true",
-                clientid
-            );
-        }
+        // NOT in grace period: Do NOT pre-set reclaim_complete
+        //
+        // CRITICAL FIX: Align with NFS-Ganesha behavior
+        //
+        // NFS-Ganesha does NOT pre-set cid_reclaim_complete in EXCHANGE_ID.
+        // It waits for the client to send RECLAIM_COMPLETE operation.
+        //
+        // Pre-setting it causes RECLAIM_COMPLETE to fail with NFS4ERR_COMPLETE_ALREADY,
+        // which may confuse the client and lead to abnormal behavior (5-second delays).
+        //
+        // Reference: nfs-ganesha/src/Protocols/NFS/nfs4_op_reclaim_complete.c line 104
+        // Only sets cid_reclaim_complete = true when RECLAIM_COMPLETE is called.
+        info!(
+            "EXCHANGE_ID: client {} created outside grace period, waiting for RECLAIM_COMPLETE",
+            clientid
+        );
     }
 
     // Build response flags (NFS-Ganesha: line 381-382)
@@ -742,10 +876,10 @@ async fn op_create_session(
     let flags = input.read_u32::<BigEndian>()?;
 
     // Read fore_chan_attrs (NFS-Ganesha: csa_fore_chan_attrs)
-    let fore_headerpadsize = input.read_u32::<BigEndian>()?;
+    let _fore_headerpadsize = input.read_u32::<BigEndian>()?;
     let fore_maxrequestsize = input.read_u32::<BigEndian>()?;
-    let fore_maxresponsesize = input.read_u32::<BigEndian>()?;
-    let fore_maxresponsesize_cached = input.read_u32::<BigEndian>()?;
+    let _fore_maxresponsesize = input.read_u32::<BigEndian>()?;
+    let _fore_maxresponsesize_cached = input.read_u32::<BigEndian>()?;
     let fore_maxoperations = input.read_u32::<BigEndian>()?;
     let fore_maxrequests = input.read_u32::<BigEndian>()?;
     let fore_rdma_count = input.read_u32::<BigEndian>()?;
@@ -906,13 +1040,44 @@ async fn op_create_session(
     // Note: Delegation is OPTIONAL in NFSv4.1. Without backchannel, server
     // simply won't grant delegations (or will use OPEN_DELEGATE_NONE_EXT).
     const CREATE_SESSION4_FLAG_PERSIST: u32 = 0x00000001;
+    const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x00000002;
     let mut csr_flags: u32 = 0;
     // Set PERSIST flag if client requested it
     if flags & CREATE_SESSION4_FLAG_PERSIST != 0 {
         csr_flags |= CREATE_SESSION4_FLAG_PERSIST;
     }
-    // Do NOT set CONN_BACK_CHAN flag since we don't have backchannel
-    // Setting it would cause Linux NFS client to wait 5 seconds expecting backchannel
+    // NFS-Ganesha Reference (nfs4_op_create_session.c line 638-647):
+    // ```c
+    // if (arg_CREATE_SESSION4->csa_flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN) {
+    //     if (nfs_rpc_create_chan_v41(...) == 0) {  // Only if backchannel creation succeeds
+    //         res_CREATE_SESSION4ok->csr_flags |= CREATE_SESSION4_FLAG_CONN_BACK_CHAN;
+    //         atomic_set_uint32_t_bits(&session->flags, session_bc_up);  // Line 868
+    //     }
+    // }
+    // ```
+    //
+    // CRITICAL FIX: Do NOT set bc_up without real RPC backchannel
+    //
+    // NFS-Ganesha only sets session_bc_up AFTER successfully creating the RPC backchannel:
+    // - Creating RPC client connection to client's callback program
+    // - Setting up authentication (AUTH_SYS, AUTH_GSS, etc.)
+    // - Verifying the connection works
+    //
+    // Without real RPC backchannel implementation, we MUST NOT set bc_up.
+    // Otherwise SEQUENCE returns status_flags=0 claiming backchannel is up,
+    // but client attempts to use it fail, causing delays.
+    //
+    // Correct behavior: Don't set bc_up, SEQUENCE returns CB_PATH_DOWN,
+    // telling client honestly that we have no backchannel.
+    if flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN != 0 {
+        info!(
+            "CREATE_SESSION: Client requested backchannel for session {:02x?}, but we don't have RPC backchannel implementation. NOT setting bc_up or CONN_BACK_CHAN",
+            &session.sessionid[..8]
+        );
+        // DO NOT call session.set_backchannel_up() - we have no real backchannel
+        // DO NOT set CONN_BACK_CHAN in csr_flags
+        // Let SEQUENCE return CB_PATH_DOWN to tell client the truth
+    }
     info!(
         "CREATE_SESSION: csa_flags={:#x} csr_flags={:#x}",
         flags, csr_flags
@@ -984,6 +1149,10 @@ async fn op_destroy_session(
 
 /// BIND_CONN_TO_SESSION - bind connection to session
 ///
+/// # RFC 5661 Section 18.34.3
+/// "BIND_CONN_TO_SESSION MUST appear by itself in a COMPOUND. If it does not,
+///  then the server MUST return NFS4ERR_NOT_ONLY_OP."
+///
 /// # NFS-Ganesha Reference
 /// File: nfs4_op_bind_conn.c
 ///
@@ -996,9 +1165,17 @@ async fn op_destroy_session(
 /// - bctsr_use_conn_in_rdma_mode: RDMA mode flag
 async fn op_bind_conn_to_session(
     input: &mut impl Read,
-    _ctx: &mut CompoundContext,
+    ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
+    // RFC 5661: BIND_CONN_TO_SESSION MUST be the only operation in the COMPOUND
+    if ctx.op_count != 1 {
+        warn!(
+            "BIND_CONN_TO_SESSION: rejected - must be only operation (op_count={})",
+            ctx.op_count
+        );
+        return Err(Nfs4Status::NotOnlyOp.into());
+    }
     // Read arguments
     let mut sessionid = Sessionid4::default();
     sessionid.deserialize(input)?;
@@ -1035,58 +1212,75 @@ async fn op_bind_conn_to_session(
     const CDFS4_BACK: u32 = 2;
     const CDFS4_BOTH: u32 = 3;
 
-    let server_dir: u32 = match dir {
-        CDFC4_FORE => {
-            // Client only wants fore channel
-            CDFS4_FORE
-        }
-        CDFC4_BACK | CDFC4_FORE_OR_BOTH | CDFC4_BACK_OR_BOTH => {
-            // Client wants backchannel
-            // NFS-Ganesha: calls bind_conn_to_session_backchannel()
-            // Phase 1: Mark backchannel as established to eliminate 5s client timeout
+    // CRITICAL FIX for 5-second delay issue:
+    //
+    // Problem Analysis:
+    // - Linux kernel commit dff58530c4ca (2020) added validation logic:
+    //   if (args->dir == CDFC4_FORE_OR_BOTH && res->dir != CDFS4_BOTH) {
+    //       rpc_task_close_connection(task);  // Reset connection and retry
+    //   }
+    // - This means if client requests FORE_OR_BOTH and we return anything except BOTH,
+    //   client will close connection and retry (causing 5s delay)
+    //
+    // - Linux kernel commit 1d15d121cc2a (2022) added fix:
+    //   "Don't retry BIND_CONN_TO_SESSION on session error"
+    //   If we return a session error (like NOTSUPP), client won't retry
+    //
+    // Solution Strategy:
+    // Option 1: Return NOTSUPP to tell client we don't support this operation
+    //   - Client kernel 5.15.49 (2022) should have the "don't retry on error" patch
+    //   - This should avoid the retry loop
+    //
+    // Option 2: Implement minimal RPC backchannel to satisfy client
+    //   - Complex, requires full backchannel RPC implementation
+    //
+    // We choose Option 1 first as it's simpler and aligns with nfs-ganesha behavior
+    //
+    // Reference:
+    // - https://lists.openwall.net/linux-kernel/2020/05/04/1033 (first patch)
+    // - https://patchwork.kernel.org/project/linux-nfs/patch/20220324142232.63492-1-olga.kornievskaia@gmail.com/ (second patch)
+    // - NFS-Ganesha: BIND_CONN_TO_SESSION is unimplemented, returns illegal op
+    //
+    // Test: If this doesn't work, we'll need to implement real RPC backchannel
 
-            if dir == CDFC4_FORE_OR_BOTH || dir == CDFC4_BACK_OR_BOTH {
-                // Client accepts backchannel if available, or can fall back
-                // NFS-Ganesha: bind_conn_to_session_backchannel() sets session_bc_up on success
-                // Phase 1: Mark backchannel as up (even though we don't have full RPC backchannel yet)
-                session.set_backchannel_up();
-                info!(
-                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir={} returning BOTH",
-                    &sessionid[..8],
-                    dir
-                );
-                // NFS-Ganesha: returns CDFS4_BOTH when backchannel is successfully established
-                CDFS4_BOTH
-            } else if dir == CDFC4_BACK {
-                // CDFC4_BACK: mandatory backchannel
-                // Phase 1: We can mark backchannel as up
-                // NFS-Ganesha: returns error if backchannel creation fails
-                // For Phase 1, we support basic backchannel setup
-                session.set_backchannel_up();
-                info!(
-                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir=CDFC4_BACK returning BACK",
-                    &sessionid[..8]
-                );
-                CDFS4_BACK
-            } else {
-                CDFS4_FORE
-            }
-        }
-        _ => {
-            warn!("BIND_CONN_TO_SESSION: unknown dir={}, defaulting to FORE", dir);
-            CDFS4_FORE
-        }
+    // CRITICAL FIX for 5-second delay:
+    //
+    // Root Cause Analysis:
+    // - Linux kernel retries BIND_CONN_TO_SESSION when receiving error responses
+    // - Client requests dir=CDFC4_FORE (1), not FORE_OR_BOTH
+    // - We must return SUCCESS with dir=CDFS4_FORE to avoid retry loop
+    //
+    // Strategy: Return successful binding for FORE channel only (no backchannel)
+    // This matches what client requested and prevents retry
+    //
+    // Reference: https://github.com/torvalds/linux/blob/master/fs/nfs/nfs4proc.c
+    // nfs4_bind_one_conn_to_session_done() function
+
+    let response_dir = if dir == CDFC4_FORE || dir == CDFC4_FORE_OR_BOTH {
+        CDFS4_FORE  // We only support fore channel
+    } else if dir == CDFC4_BACK || dir == CDFC4_BACK_OR_BOTH {
+        // Client wants backchannel, but we don't support it
+        // Return error in this case
+        warn!(
+            "BIND_CONN_TO_SESSION: client requests backchannel (dir={}), not supported",
+            dir
+        );
+        return Err(Nfs4Status::Notsupp.into());
+    } else {
+        warn!("BIND_CONN_TO_SESSION: unknown dir={}", dir);
+        return Err(Nfs4Status::Inval.into());
     };
-
-    let mut result = Vec::new();
-    sessionid.serialize(&mut result)?;
-    server_dir.serialize(&mut result)?;
-    use_rdma.serialize(&mut result)?; // Echo back RDMA mode
 
     info!(
         "BIND_CONN_TO_SESSION: success, client_dir={} server_dir={} rdma={}",
-        dir, server_dir, use_rdma
+        dir, response_dir, use_rdma
     );
+
+    // Build response: bctsr_sessid + bctsr_dir + bctsr_use_conn_in_rdma_mode
+    let mut result = Vec::new();
+    sessionid.serialize(&mut result)?;
+    response_dir.serialize(&mut result)?;
+    use_rdma.serialize(&mut result)?;  // Echo back rdma mode
 
     Ok(result)
 }

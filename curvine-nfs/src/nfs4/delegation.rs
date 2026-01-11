@@ -59,10 +59,6 @@ use tracing::{debug, info, warn};
 /// NFS-Ganesha: RECALL2DELEG_TIME = 10 seconds
 const RECALL2DELEG_TIME_SECS: u64 = 10;
 
-/// Maximum number of revokes before client is considered misbehaving
-/// NFS-Ganesha: num_revokes > 2
-const MAX_CLIENT_REVOKES: u32 = 2;
-
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -300,7 +296,7 @@ impl DelegationManager {
         }
     }
 
-    /// Generate a new delegation stateid
+    /// Generate a new delegation stateid (private)
     fn generate_stateid(&self) -> Stateid4 {
         let seq = self.next_stateid.fetch_add(1, Ordering::Relaxed);
         let mut other = [0u8; 12];
@@ -308,6 +304,12 @@ impl DelegationManager {
         other[0..4].copy_from_slice(&0xDE1E0000u32.to_le_bytes());
         other[4..8].copy_from_slice(&seq.to_le_bytes());
         Stateid4::new(1, other)
+    }
+
+    /// Generate a new delegation stateid
+    /// TEMPORARY PUBLIC for testing - should be private in production
+    pub fn generate_stateid_unsafe(&self) -> Stateid4 {
+        self.generate_stateid()
     }
 
     /// Check if delegations are enabled

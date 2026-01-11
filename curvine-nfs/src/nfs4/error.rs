@@ -220,18 +220,10 @@ impl fmt::Display for Nfs4Error {
 
 impl std::error::Error for Nfs4Error {}
 
-impl From<Nfs4Status> for Nfs4Error {
-    fn from(status: Nfs4Status) -> Self {
-        Self::new(status)
-    }
-}
-
 impl From<FsError> for Nfs4Error {
     fn from(e: FsError) -> Self {
         let status = Nfs4Status::from(&e);
         let msg = format!("[Curvine] {e}");
-
-        // Log detailed error for server-side troubleshooting
         match status {
             Nfs4Status::Serverfault | Nfs4Status::Moved | Nfs4Status::Delay => {
                 tracing::error!("Backend cluster error: {} -> NFS status: {:?}", msg, status);
@@ -241,7 +233,6 @@ impl From<FsError> for Nfs4Error {
             }
             _ => {}
         }
-
         Self::with_message(status, msg)
     }
 }
@@ -255,6 +246,12 @@ impl From<std::io::Error> for Nfs4Error {
 impl From<anyhow::Error> for Nfs4Error {
     fn from(e: anyhow::Error) -> Self {
         Self::with_message(Nfs4Status::Serverfault, e.to_string())
+    }
+}
+
+impl From<Nfs4Status> for Nfs4Error {
+    fn from(status: Nfs4Status) -> Self {
+        Nfs4Error::new(status)
     }
 }
 

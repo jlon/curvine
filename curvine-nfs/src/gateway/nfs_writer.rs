@@ -29,8 +29,84 @@ use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileAllocOpts;
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::bytes::Bytes;
+
+/// Phase 2 Layer 1: Write pattern tracker for small file detection
+///
+/// Tracks write operations to determine if a file matches small file criteria.
+/// Small files can skip flush on WRITE and delay flush to CLOSE for better performance.
+#[derive(Debug, Clone)]
+pub struct WritePattern {
+    /// Number of write operations
+    write_count: u32,
+
+    /// Total bytes written
+    total_bytes: u64,
+
+    /// Whether this file has switched to large file mode
+    /// Once switched, it remains in large file mode (no switching back)
+    switched_to_large: bool,
+}
+
+impl WritePattern {
+    /// Create new empty write pattern
+    fn new() -> Self {
+        Self {
+            write_count: 0,
+            total_bytes: 0,
+            switched_to_large: false,
+        }
+    }
+
+    /// Record a write operation
+    #[allow(dead_code)]
+    fn record_write(&mut self, bytes: usize) {
+        self.write_count += 1;
+        self.total_bytes += bytes as u64;
+    }
+
+    /// Check if this file matches small file pattern
+    #[allow(dead_code)]
+    pub fn is_small_file(&self, max_writes: u32, max_size: u64) -> bool {
+        if self.switched_to_large {
+            return false;
+        }
+
+        self.write_count <= max_writes && self.total_bytes <= max_size
+    }
+
+    /// Check if should switch to large file mode
+    #[allow(dead_code)]
+    pub fn should_switch_to_large(&self, max_writes: u32, max_size: u64) -> bool {
+        self.write_count > max_writes || self.total_bytes > max_size
+    }
+
+    /// Mark as switched to large file mode (irreversible)
+    #[allow(dead_code)]
+    pub fn mark_switched(&mut self) {
+        self.switched_to_large = true;
+    }
+
+    /// Get write count (for debugging/logging)
+    #[allow(dead_code)]
+    pub fn write_count(&self) -> u32 {
+        self.write_count
+    }
+
+    /// Get total bytes (for debugging/logging)
+    #[allow(dead_code)]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    /// Check if switched to large mode (for debugging/logging)
+    #[allow(dead_code)]
+    pub fn is_switched_to_large(&self) -> bool {
+        self.switched_to_large
+    }
+}
 
 /// Write task sent to background worker
 enum WriteTask {
@@ -70,7 +146,12 @@ pub struct NfsWriter {
     path: Path,
     sender: mpsc::Sender<WriteTask>,
     /// Track if complete() has been called (shared across clones)
-    completed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    completed: Arc<std::sync::atomic::AtomicBool>,
+
+    /// Phase 2 Layer 1: Write pattern tracker (shared across clones)
+    /// NOTE: Exists but NOT used yet - Phase 1 behavior maintained
+    #[allow(dead_code)]
+    write_pattern: Arc<Mutex<WritePattern>>,
 }
 
 impl NfsWriter {
@@ -86,7 +167,8 @@ impl NfsWriter {
         Self {
             path,
             sender,
-            completed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            write_pattern: Arc::new(Mutex::new(WritePattern::new())),
         }
     }
 

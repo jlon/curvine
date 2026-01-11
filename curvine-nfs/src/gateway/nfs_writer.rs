@@ -174,8 +174,7 @@ impl NfsWriter {
             sender,
             completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_pattern: Arc::new(Mutex::new(WritePattern::new())),
-            // Phase 2c: ENABLED to test skip flush behavior
-            // THIS IS THE CRITICAL TEST!
+            // Phase 2 ENABLED: Small file async flush optimization
             small_file_config: (20, 10 * 1024 * 1024, true),  // enabled=true
         }
     }
@@ -213,7 +212,7 @@ impl NfsWriter {
             (pattern.write_count(), pattern.total_bytes())
         };
 
-        tracing::info!(
+        tracing::debug!(
             "WritePattern: enabled={} is_small={} should_switch={} count={} bytes={} path={}",
             enabled,
             is_small,
@@ -239,19 +238,19 @@ impl NfsWriter {
 
         // Phase 2 Layer 2b: Conditional flush logic (all branches flush)
         if enabled && should_switch {
-            tracing::info!("FlushDecision: BRANCH should_switch - flushing");
+            tracing::debug!("FlushDecision: BRANCH should_switch - flushing");
             self.write_pattern.lock().unwrap().mark_switched();
             self.flush().await?;
         } else if enabled && !is_small {
-            tracing::info!("FlushDecision: BRANCH large file - flushing");
+            tracing::debug!("FlushDecision: BRANCH large file - flushing");
             self.flush().await?;
         } else if enabled && is_small {
-            tracing::warn!("FlushDecision: BRANCH small file - SKIPPING flush (Phase 2 REAL)");
+            tracing::debug!("FlushDecision: BRANCH small file - SKIPPING flush (Phase 2 REAL)");
             // Phase 2c: REAL Phase 2 - skip flush for small files
             // This is the suspected bug source!
             // DO NOT flush here - data buffered until CLOSE
         } else {
-            tracing::info!("FlushDecision: BRANCH disabled - flushing");
+            tracing::debug!("FlushDecision: BRANCH disabled - flushing");
             self.flush().await?;
         }
 

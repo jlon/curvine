@@ -180,6 +180,20 @@ impl NfsWriter {
     /// Write data at offset (queued for sequential processing)
     #[inline]
     pub async fn write(&self, offset: i64, data: Vec<u8>) -> FsResult<u32> {
+        let data_len = data.len();
+
+        // Phase 2 Layer 2a: Record write pattern但不改变行为
+        {
+            let mut pattern = self.write_pattern.lock().unwrap();
+            pattern.record_write(data_len);
+            tracing::debug!(
+                "WritePattern: count={} bytes={} path={}",
+                pattern.write_count(),
+                pattern.total_bytes(),
+                self.path.path()
+            );
+        }  // Mutex lock released here
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(WriteTask::Write {
@@ -190,8 +204,14 @@ impl NfsWriter {
             .await
             .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?;
 
-        rx.await
-            .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?
+        let result = rx
+            .await
+            .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?;
+
+        // Phase 1 behavior: Always flush after write
+        self.flush().await?;
+
+        result
     }
 
     /// Resize file

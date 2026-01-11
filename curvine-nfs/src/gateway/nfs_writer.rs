@@ -152,6 +152,11 @@ pub struct NfsWriter {
     /// NOTE: Exists but NOT used yet - Phase 1 behavior maintained
     #[allow(dead_code)]
     write_pattern: Arc<Mutex<WritePattern>>,
+
+    /// Phase 2 Layer 2b: Small file config (max_writes, max_size, enabled)
+    /// NOTE: Currently disabled (false) to maintain Phase 1 behavior
+    #[allow(dead_code)]
+    small_file_config: (u32, u64, bool),
 }
 
 impl NfsWriter {
@@ -169,6 +174,8 @@ impl NfsWriter {
             sender,
             completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             write_pattern: Arc::new(Mutex::new(WritePattern::new())),
+            // Phase 2 Layer 2b: Disabled by default (enabled=false)
+            small_file_config: (20, 10 * 1024 * 1024, false),
         }
     }
 
@@ -182,17 +189,32 @@ impl NfsWriter {
     pub async fn write(&self, offset: i64, data: Vec<u8>) -> FsResult<u32> {
         let data_len = data.len();
 
-        // Phase 2 Layer 2a: Record write pattern但不改变行为
-        {
+        // Phase 2 Layer 2b: Full conditional logic (but enabled=false)
+        let (max_writes, max_size, enabled) = self.small_file_config;
+        let (is_small, should_switch) = if enabled {
             let mut pattern = self.write_pattern.lock().unwrap();
             pattern.record_write(data_len);
-            tracing::debug!(
-                "WritePattern: count={} bytes={} path={}",
-                pattern.write_count(),
-                pattern.total_bytes(),
-                self.path.path()
-            );
-        }  // Mutex lock released here
+
+            let is_small = pattern.is_small_file(max_writes, max_size);
+            let should_switch = pattern.should_switch_to_large(max_writes, max_size);
+
+            (is_small, should_switch)
+        } else {
+            // Optimization disabled - record write for debugging
+            let mut pattern = self.write_pattern.lock().unwrap();
+            pattern.record_write(data_len);
+            (false, false)
+        };
+
+        tracing::info!(
+            "WritePattern: enabled={} is_small={} should_switch={} count={} bytes={} path={}",
+            enabled,
+            is_small,
+            should_switch,
+            self.write_pattern.lock().unwrap().write_count(),
+            self.write_pattern.lock().unwrap().total_bytes(),
+            self.path.path()
+        );
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
@@ -208,8 +230,23 @@ impl NfsWriter {
             .await
             .map_err(|_| curvine_common::error::FsError::common("Writer task closed"))?;
 
-        // Phase 1 behavior: Always flush after write
-        self.flush().await?;
+        // Phase 2 Layer 2b: Conditional flush logic (all branches flush)
+        if enabled && should_switch {
+            tracing::info!("FlushDecision: BRANCH should_switch - flushing");
+            self.write_pattern.lock().unwrap().mark_switched();
+            self.flush().await?;
+        } else if enabled && !is_small {
+            tracing::info!("FlushDecision: BRANCH large file - flushing");
+            self.flush().await?;
+        } else if enabled && is_small {
+            tracing::info!("FlushDecision: BRANCH small file - flushing (FORCED)");
+            // NOTE: In real Phase 2, this would SKIP flush
+            // But in Layer 2b, we force flush to verify logic
+            self.flush().await?;
+        } else {
+            tracing::info!("FlushDecision: BRANCH disabled - flushing");
+            self.flush().await?;
+        }
 
         result
     }

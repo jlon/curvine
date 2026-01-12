@@ -24,11 +24,13 @@ use curvine_common::utils::ProtoUtils;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;
+use orpc::io::retry::TimeBondedRetryBuilder;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
-use orpc::{err_box, try_log, try_option, CommonResult};
+use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -39,17 +41,13 @@ type WorkerId = u32;
 pub struct MasterReplicationManager {
     fs: MasterFilesystem,
     worker_manager: SyncWorkerManager,
-
     replication_semaphore: Arc<Semaphore>,
-    runtime: Arc<AsyncRuntime>,
-
     staging_queue_sender: Arc<Sender<BlockId>>,
     inflight_blocks: Arc<FastDashMap<BlockId, InflightReplicationJob>>,
-
     worker_client_factory: Arc<ClientFactory>,
-
+    retry_policy_builder: TimeBondedRetryBuilder,
+    rpc_timeout: Duration,
     replication_enabled: bool,
-
     metrics: &'static MasterMetrics,
 }
 
@@ -75,9 +73,10 @@ impl MasterReplicationManager {
             worker_manager: worker_manager.clone(),
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
-            runtime: rt.clone(),
             inflight_blocks: Default::default(),
             worker_client_factory: Arc::new(Default::default()),
+            retry_policy_builder: conf.io_retry_policy_builder(),
+            rpc_timeout: Duration::from_millis(conf.client.rpc_timeout_ms),
             replication_enabled: conf.master.block_replication_enabled,
             metrics: Master::get_metrics(),
         };
@@ -152,14 +151,14 @@ impl MasterReplicationManager {
             block_id, &locations, &target_worker_addr
         );
 
-        // step3: call the corresponding worker to do replication
-        let source_worker_addr = InetAddr::new(
+        // step3: call the corresponding worker to do replication with retry
+        let source_inet_addr = InetAddr::new(
             &source_worker_addr.ip_addr,
             source_worker_addr.rpc_port as u16,
         );
         let source_worker_client = self
             .worker_client_factory
-            .create_raw(&source_worker_addr)
+            .create_raw(&source_inet_addr)
             .await?;
 
         let request = SubmitBlockReplicationRequest {
@@ -170,13 +169,18 @@ impl MasterReplicationManager {
             .request(RequestStatus::Rpc)
             .proto_header(request)
             .build();
-        match source_worker_client.rpc(msg).await {
+
+        let retry_policy = self.retry_policy_builder.build();
+        match source_worker_client
+            .retry_rpc(self.rpc_timeout, retry_policy, msg)
+            .await
+        {
             Ok(response) => {
                 let response: SubmitBlockReplicationResponse = response.parse_header()?;
                 if !response.success {
                     return err_box!(
                         "Errors on submit replication job to {}. err: {:?}",
-                        &source_worker_addr,
+                        &source_inet_addr,
                         response.message
                     );
                 }
@@ -184,7 +188,7 @@ impl MasterReplicationManager {
             Err(e) => {
                 return err_box!(
                     "Errors on sending replication job to {}, err: {:?}",
-                    &source_worker_addr,
+                    &source_inet_addr,
                     e
                 );
             }
@@ -213,14 +217,25 @@ impl MasterReplicationManager {
         if !self.replication_enabled {
             return Ok(());
         }
-        self.runtime.block_on(async move {
-            for block_id in &block_ids {
-                info!("Accepting block {} replication job", block_id);
-                if try_log!(self.staging_queue_sender.send(*block_id).await).is_ok() {
-                    self.metrics.replication_staging_number.inc();
+
+        let sender = self.staging_queue_sender.clone();
+        let metrics = self.metrics;
+
+        for block_id in &block_ids {
+            info!("Accepting block {} replication job", block_id);
+
+            match sender.try_send(*block_id) {
+                Ok(_) => {
+                    metrics.replication_staging_number.inc();
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to queue replication job for block {}: {}. Queue may be full. Will retry on next heartbeat check.",
+                        block_id, e
+                    );
                 }
             }
-        });
+        }
         Ok(())
     }
 

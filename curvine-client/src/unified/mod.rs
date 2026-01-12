@@ -67,6 +67,10 @@ impl UnifiedWriter {
     /// FsWriter (direct curvine) does NOT need pre-resize because:
     /// - FsWriterBase::write() already checks pos > len and calls resize()
     /// - Pre-resize would interfere with normal write flow
+    ///
+    /// OssHdfsWriter (direct OSS HDFS) does NOT need pre-resize because:
+    /// - It directly writes to OSS via JindoSDK, similar to OpendalWriter
+    /// - The underlying storage handles file extension automatically
     #[inline]
     pub fn needs_pre_resize(&self) -> bool {
         match self {
@@ -74,6 +78,8 @@ impl UnifiedWriter {
             Self::CacheSync(_) => true,
             #[cfg(feature = "opendal")]
             Self::Opendal(_) => false,
+            #[cfg(feature = "oss-hdfs")]
+            Self::OssHdfs(_) => false,
         }
     }
 }

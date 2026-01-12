@@ -1170,57 +1170,44 @@ async fn op_bind_conn_to_session(
     const CDFC4_BACK_OR_BOTH: u32 = 4;
 
     const CDFS4_FORE: u32 = 1;
+    const CDFS4_BACK: u32 = 2;
+    const CDFS4_BOTH: u32 = 3;
 
     // CRITICAL: Must return dir=CDFS4_FORE to avoid Linux kernel retry loop
     // (Linux kernel commit dff58530c4ca: closes connection if we return anything except BOTH)
     // (Linux kernel commit 1d15d121cc2a: won't retry on NOTSUPP error)
 
-<<<<<<< HEAD
-    let response_dir = if dir == CDFC4_FORE || dir == CDFC4_FORE_OR_BOTH {
-        CDFS4_FORE  // We only support fore channel
-    } else if dir == CDFC4_BACK || dir == CDFC4_BACK_OR_BOTH {
-        // Client wants backchannel, but we don't support it
-        warn!("BIND_CONN_TO_SESSION: client requests backchannel (dir={}), not supported", dir);
-        return Err(Nfs4Status::Notsupp.into());
+    let response_dir = if dir == CDFC4_FORE {
+        CDFS4_FORE
+    } else if dir == CDFC4_FORE_OR_BOTH || dir == CDFC4_BACK_OR_BOTH {
+        // Client accepts backchannel if available, or can fall back
+        // NFS-Ganesha: bind_conn_to_session_backchannel() sets session_bc_up on success
+        // Phase 1: Mark backchannel as up (even though we don't have full RPC backchannel yet)
+        session.set_backchannel_up();
+        info!(
+            "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir={} returning BOTH",
+            &sessionid[..8],
+            dir
+        );
+        // NFS-Ganesha: returns CDFS4_BOTH when backchannel is successfully established
+        CDFS4_BOTH
+    } else if dir == CDFC4_BACK {
+        // CDFC4_BACK: mandatory backchannel
+        // Phase 1: We can mark backchannel as up
+        // NFS-Ganesha: returns error if backchannel creation fails
+        // For Phase 1, we support basic backchannel setup
+        session.set_backchannel_up();
+        info!(
+            "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir=CDFC4_BACK returning BACK",
+            &sessionid[..8]
+        );
+        CDFS4_BACK
     } else {
-        warn!("BIND_CONN_TO_SESSION: unknown dir={}", dir);
-        return Err(Nfs4Status::Inval.into());
-=======
-            if dir == CDFC4_FORE_OR_BOTH || dir == CDFC4_BACK_OR_BOTH {
-                // Client accepts backchannel if available, or can fall back
-                // NFS-Ganesha: bind_conn_to_session_backchannel() sets session_bc_up on success
-                // Phase 1: Mark backchannel as up (even though we don't have full RPC backchannel yet)
-                session.set_backchannel_up();
-                info!(
-                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir={} returning BOTH",
-                    &sessionid[..8],
-                    dir
-                );
-                // NFS-Ganesha: returns CDFS4_BOTH when backchannel is successfully established
-                CDFS4_BOTH
-            } else if dir == CDFC4_BACK {
-                // CDFC4_BACK: mandatory backchannel
-                // Phase 1: We can mark backchannel as up
-                // NFS-Ganesha: returns error if backchannel creation fails
-                // For Phase 1, we support basic backchannel setup
-                session.set_backchannel_up();
-                info!(
-                    "BIND_CONN_TO_SESSION: marked backchannel up for session {:02x?}, client_dir=CDFC4_BACK returning BACK",
-                    &sessionid[..8]
-                );
-                CDFS4_BACK
-            } else {
-                CDFS4_FORE
-            }
-        }
-        _ => {
-            warn!(
-                "BIND_CONN_TO_SESSION: unknown dir={}, defaulting to FORE",
-                dir
-            );
-            CDFS4_FORE
-        }
->>>>>>> 514b2ce (Implement backchannel availability checks in `BackchannelManager` and `DelegationManager` to ensure proper delegation handling. Update `DelegationConfig` to disable delegation by default for NFSv4.1 compatibility. Enhance logging in `op_open` and related functions to improve traceability and compliance with NFS-Ganesha specifications. Adjust `op_sequence` and `op_create_session` to reflect backchannel status, preventing unnecessary client delays.)
+        warn!(
+            "BIND_CONN_TO_SESSION: unknown dir={}, defaulting to FORE",
+            dir
+        );
+        CDFS4_FORE
     };
 
     info!(

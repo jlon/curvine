@@ -200,7 +200,9 @@ start_service() {
     local CONFIG_FILE=${CONF:-${DEFAULT_CONF}}
     local LISTEN_ADDR=${LISTEN:-${DEFAULT_LISTEN}}
     local EXPORT_PATH_VALUE=${EXPORT_PATH:-${DEFAULT_EXPORT_PATH}}
-    local WEB_PORT_VALUE=${WEB_PORT:-${DEFAULT_WEB_PORT}}
+    # Only set WEB_PORT_VALUE if explicitly provided via --web-port
+    # Don't use default here, let binary use config file default if not specified
+    local WEB_PORT_VALUE=${WEB_PORT:+$WEB_PORT}
 
     # Try to read from config file if not specified
     if [ -f "$CONFIG_FILE" ]; then
@@ -278,6 +280,23 @@ start_service() {
 
     if [ "$READ_ONLY" = "true" ]; then
         ARGS+=(--read-only)
+    fi
+
+    # Add optional configuration parameters if provided
+    if [ -n "$CLUSTER_GENERATION" ]; then
+        ARGS+=("--cluster-generation" "$CLUSTER_GENERATION")
+    fi
+
+    if [ -n "$WEB_PORT_VALUE" ]; then
+        ARGS+=("--web-port" "$WEB_PORT_VALUE")
+    fi
+
+    if [ -n "$DEFAULT_UID" ]; then
+        ARGS+=("--default-uid" "$DEFAULT_UID")
+    fi
+
+    if [ -n "$DEFAULT_GID" ]; then
+        ARGS+=("--default-gid" "$DEFAULT_GID")
     fi
 
     # serve subcommand comes AFTER options

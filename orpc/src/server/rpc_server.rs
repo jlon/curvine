@@ -208,6 +208,10 @@ where
         self.monitor.new_listener()
     }
 
+    pub fn shutdown(&self) {
+        self.monitor.advance_shutdown();
+    }
+
     pub fn add_shutdown_hook<T: FnOnce() + Send + Sync + 'static>(&self, hook: T) {
         let mut state = self.shutdown_hook.lock().unwrap();
         state.push(Box::new(hook));

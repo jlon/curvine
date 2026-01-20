@@ -83,6 +83,7 @@ impl HandlerService for WorkerService {
             task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
             replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
+            fs_context: self.task_manager.get_fs_context(),
         }
     }
 }
@@ -199,6 +200,10 @@ impl Worker {
     // Start a standalone worker.
     pub fn start_standalone(&self) {
         self.rpc_server.block_on_start();
+    }
+
+    pub fn shutdown(&self) {
+        self.rpc_server.shutdown();
     }
 
     pub fn get_conf<'a>() -> &'a ClusterConf {

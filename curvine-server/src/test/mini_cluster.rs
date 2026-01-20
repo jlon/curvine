@@ -18,6 +18,7 @@ use crate::master::Master;
 use crate::worker::Worker;
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
+use curvine_common::error::FsError;
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::FsResult;
 use dashmap::DashMap;
@@ -27,7 +28,7 @@ use orpc::common::LocalTime;
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, CommonResult};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +43,8 @@ pub struct MiniCluster {
 
     pub master_entries: DashMap<usize, MasterEntry>,
     pub client_rt: Arc<Runtime>,
+    worker_shutdowns: Mutex<Vec<Arc<Worker>>>,
+    worker_ids: Mutex<Vec<u32>>,
 }
 
 impl MiniCluster {
@@ -53,6 +56,8 @@ impl MiniCluster {
             worker_conf,
             master_entries: Default::default(),
             client_rt,
+            worker_shutdowns: Mutex::new(Vec::new()),
+            worker_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -75,8 +80,15 @@ impl MiniCluster {
 
     pub fn start_worker(&self) {
         for conf in &self.worker_conf {
-            let worker = Worker::with_conf(conf.clone()).unwrap();
-            thread::spawn(move || worker.block_on_start());
+            let worker = Arc::new(Worker::with_conf(conf.clone()).unwrap());
+            let worker_id = worker.worker_id;
+            if let Ok(mut shutdowns) = self.worker_shutdowns.lock() {
+                shutdowns.push(worker.clone());
+            }
+            if let Ok(mut worker_ids) = self.worker_ids.lock() {
+                worker_ids.push(worker_id);
+            }
+            thread::spawn(move || worker.start_standalone());
         }
     }
 
@@ -92,6 +104,33 @@ impl MiniCluster {
         self.start_worker();
 
         self.client_rt.block_on(self.wait_ready()).unwrap();
+    }
+
+    pub fn stop_worker_by_id(&self, worker_id: u32) -> FsResult<()> {
+        let ids = self
+            .worker_ids
+            .lock()
+            .map_err(|_| FsError::common("Worker ids lock poisoned"))?;
+        let idx = ids
+            .iter()
+            .position(|id| *id == worker_id)
+            .ok_or_else(|| FsError::common(format!("Worker id {} not found", worker_id)))?;
+        self.stop_worker(idx)
+    }
+
+    pub fn stop_worker(&self, idx: usize) -> FsResult<()> {
+        let shutdowns = self
+            .worker_shutdowns
+            .lock()
+            .map_err(|_| FsError::common("Worker shutdowns lock poisoned"))?;
+        if idx >= shutdowns.len() {
+            return Err(FsError::common(format!(
+                "Worker index {} out of range",
+                idx
+            )));
+        }
+        shutdowns[idx].shutdown();
+        Ok(())
     }
 
     /// Wait for Master service to be fully ready (Raft Leader + RPC service started)

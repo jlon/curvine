@@ -17,7 +17,7 @@ use log::info;
 use tracing::warn;
 
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileStatus, LoadJobResult, OpenFlags, WriteType};
+use curvine_common::state::{FileAllocOpts, FileStatus, LoadJobResult, OpenFlags, WriteType};
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::sys::DataSlice;
@@ -152,7 +152,7 @@ impl Writer for CacheSyncWriter {
         self.inner.seek(pos).await
     }
 
-    async fn resize(&mut self, opts: curvine_common::state::FileAllocOpts) -> FsResult<()> {
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
         // For CacheSync mode (object storage like S3):
         // - Resize operations are delegated to the inner FsWriter
         // - FsWriter updates Curvine's metadata (inode) on master
@@ -163,6 +163,14 @@ impl Writer for CacheSyncWriter {
         // 1. Large file writes (>128MB block size) to work correctly
         // 2. Random writes with seek to extend file size
         // 3. Explicit truncate/fallocate operations from NFS SETATTR
+        if !self.has_rand_write {
+            self.has_rand_write = true;
+            if let Err(e) = self.job_client.cancel_job(&self.job_res.job_id).await {
+                warn!("cancel job {} failed: {}", self.job_res.job_id, e);
+            } else {
+                info!("cancel(resize) job {} successfully", self.job_res.job_id);
+            }
+        }
         self.inner.resize(opts).await
     }
 }

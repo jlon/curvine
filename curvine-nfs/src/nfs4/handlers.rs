@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::gateway::uid_gid::{gid_to_nfs4_group, resolve_gid, resolve_uid, uid_to_nfs4_owner};
 use crate::nfs4::compound::{CompoundContext, CompoundHandler, Nfs4Op};
 use crate::nfs4::error::{Nfs4Error, Nfs4Result, Nfs4Status};
 use crate::nfs4::types::*;
@@ -104,21 +105,75 @@ async fn handle_compound(
     }
 
     let mut ctx = CompoundContext::with_minor_version(minor_version);
+    ctx.op_count = op_count; // Set for validation in operations like BIND_CONN_TO_SESSION
+    ctx.auth = context.auth.clone(); // Set auth for CREATE/OPEN/SETATTR operations
 
     let mut results: Vec<(Nfs4Op, Nfs4Status, Vec<u8>)> = Vec::with_capacity(op_count);
     let mut overall_status = Nfs4Status::Ok;
 
+    // Log compound request info for debugging NFSv4.1 delay issue
+    debug!(
+        "COMPOUND: xid={} minor_version={} op_count={}",
+        xid, minor_version, op_count
+    );
+
+    let handler = context
+        .nfs4_handler
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("nfs4_handler not initialized"))?;
+
+    let first_op_code = if op_count > 0 {
+        Some(input.read_u32::<BigEndian>()?)
+    } else {
+        None
+    };
+
     for i in 0..op_count {
-        let op_code = input.read_u32::<BigEndian>()?;
+        let op_code = if i == 0 {
+            first_op_code.expect("op_count > 0 implies first_op_code is Some")
+        } else {
+            input.read_u32::<BigEndian>()?
+        };
         let op = Nfs4Op::from(op_code);
 
-        debug!("  Op[{}]: {:?} ({})", i, op, op_code);
+        // Debug: log current_fh state before each operation
+        let fh_state = if let Some(ref fh) = ctx.current_fh {
+            format!(
+                "fh_len={} fh_data={:02x?}",
+                fh.data.len(),
+                &fh.data[..fh.data.len().min(8)]
+            )
+        } else {
+            "None".to_string()
+        };
+        debug!(
+            "  Op[{}]: {:?} ({}) current_fh={}",
+            i, op, op_code, fh_state
+        );
 
-        let (status, result_data) = match execute_operation(op, input, &mut ctx, context).await {
-            Ok(data) => (Nfs4Status::Ok, data),
-            Err(e) => {
-                error!("  Op[{}] {:?} failed: {:?}", i, op, e.status);
-                (e.status, Vec::new())
+        let (status, result_data) = if i == 0 && minor_version == 1 && op == Nfs4Op::Sequence {
+            match handle_sequence_first_op(xid, op_count, input, output, &mut ctx, handler).await {
+                Ok(SequenceFirstOp::Replay) => return Ok(()),
+                Ok(SequenceFirstOp::Proceed { result_data }) => (Nfs4Status::Ok, result_data),
+                Err(err) => {
+                    let status = err
+                        .downcast_ref::<Nfs4Error>()
+                        .map(|e| e.status)
+                        .unwrap_or(Nfs4Status::Serverfault);
+                    error!("SEQUENCE first op failed: {:?}", err);
+                    (status, Vec::new())
+                }
+            }
+        } else {
+            match execute_operation(op, input, &mut ctx, context).await {
+                Ok(data) => (Nfs4Status::Ok, data),
+                Err(e) => {
+                    error!(
+                        "  Op[{}] {:?} failed: {:?} current_fh={}",
+                        i, op, e.status, fh_state
+                    );
+                    (e.status, Vec::new())
+                }
             }
         };
 
@@ -139,35 +194,132 @@ async fn handle_compound(
         results.len()
     );
 
-    make_success_reply(xid).serialize(output)?;
-    overall_status.serialize(output)?;
-    tag.serialize(output)?;
-    (results.len() as u32).serialize(output)?;
+    let reply_body = serialize_compound_body(overall_status, &tag, results)?;
 
-    for (op, status, data) in results {
-        debug!(
-            "  Result: op={:?}({}) status={:?} data_len={}",
-            op,
-            op as u32,
-            status,
-            data.len()
-        );
-        (op as u32).serialize(output)?;
-        status.serialize(output)?;
-        if status == Nfs4Status::Ok {
-            output.write_all(&data)?;
-        }
-    }
+    make_success_reply(xid).serialize(output)?;
+    output.write_all(&reply_body)?;
 
     if let (Some(sessionid), Some(slot_id)) = (ctx.sessionid, ctx.slot_id) {
-        if let Some(handler) = context.nfs4_handler.as_ref() {
+        if ctx.cachethis {
             handler
                 .sessions
-                .cache_reply(&sessionid, slot_id, Vec::new());
+                .cache_reply(&sessionid, slot_id, reply_body.clone());
+        } else {
+            handler.sessions.release_slot(&sessionid, slot_id);
         }
     }
 
     Ok(())
+}
+
+enum SequenceFirstOp {
+    Replay,
+    Proceed { result_data: Vec<u8> },
+}
+
+async fn handle_sequence_first_op(
+    xid: u32,
+    op_count: usize,
+    input: &mut impl Read,
+    output: &mut impl Write,
+    ctx: &mut CompoundContext,
+    handler: &CompoundHandler,
+) -> Result<SequenceFirstOp, anyhow::Error> {
+    let mut sessionid = Sessionid4::default();
+    sessionid.deserialize(input)?;
+    let sequenceid = input.read_u32::<BigEndian>()?;
+    let slotid = input.read_u32::<BigEndian>()?;
+    let _highest_slotid = input.read_u32::<BigEndian>()?;
+    let cachethis = input.read_u32::<BigEndian>()?;
+
+    if let Some(cached_body) = handler
+        .sessions
+        .replay_reply(&sessionid, slotid, sequenceid)
+    {
+        if let Some(session) = handler.sessions.get_session(&sessionid) {
+            handler.clients.renew_lease(session.clientid)?;
+        }
+        info!(
+            "COMPOUND replay: xid={} sessionid={:02x?} seq={} slot={} op_count={}",
+            xid,
+            &sessionid[..8],
+            sequenceid,
+            slotid,
+            op_count
+        );
+        make_success_reply(xid).serialize(output)?;
+        output.write_all(&cached_body)?;
+        return Ok(SequenceFirstOp::Replay);
+    }
+
+    let (session, response_sequenceid, highest, target_highest, _session_flags) =
+        handler.sessions.sequence(&sessionid, slotid, sequenceid)?;
+
+    ctx.sessionid = Some(sessionid);
+    ctx.slot_id = Some(slotid);
+    ctx.clientid = Some(session.clientid);
+    ctx.cachethis = cachethis != 0;
+
+    handler.clients.renew_lease(session.clientid)?;
+
+    // NFS-Ganesha: sr_status_flags initialization (nfs4_op_sequence.c line 306-311)
+    // CRITICAL FIX: Check backchannel status to avoid 5-second client delay
+    const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+
+    let mut status_flags: u32 = 0;
+
+    // Check if backchannel is available (equivalent to nfs_rpc_get_chan check)
+    if !session.is_backchannel_up() {
+        status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+        tracing::warn!(
+            "SEQUENCE (first_op): Backchannel is down for session {:02x?}, setting CB_PATH_DOWN",
+            &sessionid[..8]
+        );
+    }
+
+    tracing::info!(
+        "SEQUENCE (first_op): resp_seq={} slot={} highest={} target_highest={} status_flags={:#x}",
+        response_sequenceid,
+        slotid,
+        highest,
+        target_highest,
+        status_flags
+    );
+
+    let mut result = Vec::new();
+    ctx.sessionid
+        .expect("sessionid set above")
+        .serialize(&mut result)?;
+    response_sequenceid.serialize(&mut result)?;
+    slotid.serialize(&mut result)?;
+    highest.serialize(&mut result)?;
+    target_highest.serialize(&mut result)?;
+    status_flags.serialize(&mut result)?;
+
+    Ok(SequenceFirstOp::Proceed {
+        result_data: result,
+    })
+}
+
+fn serialize_compound_body(
+    overall_status: Nfs4Status,
+    tag: &[u8],
+    results: Vec<(Nfs4Op, Nfs4Status, Vec<u8>)>,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let mut body = Vec::new();
+    overall_status.serialize(&mut body)?;
+    tag.to_vec().serialize(&mut body)?;
+    (results.len() as u32).serialize(&mut body)?;
+
+    for (op, status, data) in results {
+        (op as u32).serialize(&mut body)?;
+        status.serialize(&mut body)?;
+        if status == Nfs4Status::Ok {
+            body.extend_from_slice(&data);
+        }
+    }
+
+    Ok(body)
 }
 
 /// Skip remaining operations after an error
@@ -188,22 +340,17 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
         Nfs4Op::Sequence => {
             let mut buf = [0u8; 16 + 4 + 4 + 4 + 4]; // sessionid + slotid + seqid + highest + cache
             input.read_exact(&mut buf)?;
-            info!("Skipped SEQUENCE args: 36 bytes");
         }
         Nfs4Op::Putfh => {
             let len = input.read_u32::<BigEndian>()? as usize;
             let pad = (4 - len % 4) % 4;
             let mut buf = vec![0u8; len + pad];
             input.read_exact(&mut buf)?;
-            info!("Skipped PUTFH args: {} bytes + {} padding", len, pad);
         }
-        Nfs4Op::Putrootfh | Nfs4Op::Getfh | Nfs4Op::Savefh | Nfs4Op::Restorefh => {
-            info!("Skipped {:?} args: no arguments", op);
-        }
+        Nfs4Op::Putrootfh | Nfs4Op::Getfh | Nfs4Op::Savefh | Nfs4Op::Restorefh => {}
         Nfs4Op::Getattr => {
             let mut bitmap: Vec<u32> = Vec::new();
             bitmap.deserialize(input)?;
-            info!("Skipped GETATTR args: bitmap with {} words", bitmap.len());
         }
         Nfs4Op::Lookup => {
             let mut name: Vec<u8> = Vec::new();
@@ -226,7 +373,6 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             stateid.deserialize(input)?;
             let _offset = input.read_u64::<BigEndian>()?;
             let _count = input.read_u32::<BigEndian>()?;
-            info!("Skipped READ args: stateid + offset + count");
         }
         Nfs4Op::Setclientid => {
             // Skip verifier (8 bytes)
@@ -242,19 +388,16 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             let mut addr: Vec<u8> = Vec::new();
             addr.deserialize(input)?;
             let _callback_ident = input.read_u32::<BigEndian>()?;
-            info!("Skipped SETCLIENTID args: verifier + client_id + callback");
         }
         Nfs4Op::SetclientidConfirm => {
             let _clientid = input.read_u64::<BigEndian>()?;
             let mut verifier = [0u8; 8];
             input.read_exact(&mut verifier)?;
-            info!("Skipped SETCLIENTID_CONFIRM args: clientid + verifier");
         }
         Nfs4Op::Close => {
             let _seqid = input.read_u32::<BigEndian>()?;
             let mut stateid = Stateid4::default();
             stateid.deserialize(input)?;
-            info!("Skipped CLOSE args: seqid + stateid");
         }
         Nfs4Op::Write => {
             let mut stateid = Stateid4::default();
@@ -271,11 +414,9 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
         Nfs4Op::Commit => {
             let _offset = input.read_u64::<BigEndian>()?;
             let _count = input.read_u32::<BigEndian>()?;
-            info!("Skipped COMMIT args: offset + count");
         }
         Nfs4Op::Access => {
             let _access = input.read_u32::<BigEndian>()?;
-            info!("Skipped ACCESS args: access");
         }
         Nfs4Op::OpenDowngrade => {
             let mut stateid = Stateid4::default();
@@ -283,14 +424,12 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             let _seqid = input.read_u32::<BigEndian>()?;
             let _access = input.read_u32::<BigEndian>()?;
             let _deny = input.read_u32::<BigEndian>()?;
-            info!("Skipped OPEN_DOWNGRADE args: stateid + seqid + access + deny");
         }
         Nfs4Op::Setattr => {
             let mut stateid = Stateid4::default();
             stateid.deserialize(input)?;
             let mut fattr = Fattr4::default();
             fattr.deserialize(input)?;
-            info!("Skipped SETATTR args: stateid + fattr4");
         }
         Nfs4Op::Readdir => {
             let _cookie = input.read_u64::<BigEndian>()?;
@@ -300,7 +439,6 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             let _maxcount = input.read_u32::<BigEndian>()?;
             let mut bitmap: Vec<u32> = Vec::new();
             bitmap.deserialize(input)?;
-            info!("Skipped READDIR args: cookie + cookieverf + dircount + maxcount + bitmap");
         }
         Nfs4Op::Create => {
             let obj_type = input.read_u32::<BigEndian>()?;
@@ -319,28 +457,22 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             name.deserialize(input)?;
             let mut fattr = Fattr4::default();
             fattr.deserialize(input)?;
-            info!("Skipped CREATE args: objtype + [link/spec] + name + fattr4");
         }
         Nfs4Op::Remove => {
             let mut name: Vec<u8> = Vec::new();
             name.deserialize(input)?;
-            info!("Skipped REMOVE args: name");
         }
         Nfs4Op::Rename => {
             let mut oldname: Vec<u8> = Vec::new();
             oldname.deserialize(input)?;
             let mut newname: Vec<u8> = Vec::new();
             newname.deserialize(input)?;
-            info!("Skipped RENAME args: oldname + newname");
         }
         Nfs4Op::Link => {
             let mut newname: Vec<u8> = Vec::new();
             newname.deserialize(input)?;
-            info!("Skipped LINK args: newname");
         }
-        Nfs4Op::Readlink => {
-            info!("Skipped READLINK args: no arguments");
-        }
+        Nfs4Op::Readlink => {}
         Nfs4Op::Open => {
             let _seqid = input.read_u32::<BigEndian>()?;
             let _share_access = input.read_u32::<BigEndian>()?;
@@ -366,31 +498,25 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
                 let mut fattr = Fattr4::default();
                 fattr.deserialize(input)?;
             }
-            info!("Skipped OPEN args: seqid + share_access + share_deny + owner + [create]");
         }
         Nfs4Op::OpenConfirm => {
             let mut stateid = Stateid4::default();
             stateid.deserialize(input)?;
             let _seqid = input.read_u32::<BigEndian>()?;
-            info!("Skipped OPEN_CONFIRM args: stateid + seqid");
         }
         Nfs4Op::Renew => {
             let _clientid = input.read_u64::<BigEndian>()?;
-            info!("Skipped RENEW args: clientid");
         }
         Nfs4Op::ReclaimComplete => {
             let _one_fs = input.read_u32::<BigEndian>()?;
-            info!("Skipped RECLAIM_COMPLETE args: one_fs");
         }
         Nfs4Op::Delegreturn => {
             let mut stateid = Stateid4::default();
             stateid.deserialize(input)?;
-            info!("Skipped DELEGRETURN args: stateid");
         }
         Nfs4Op::Nverify | Nfs4Op::Verify => {
             let mut fattr = Fattr4::default();
             fattr.deserialize(input)?;
-            info!("Skipped {:?} args: fattr4", op);
         }
         Nfs4Op::Lock | Nfs4Op::Lockt | Nfs4Op::Locku => {
             warn!(
@@ -402,7 +528,6 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
             let _clientid = input.read_u64::<BigEndian>()?;
             let mut owner: Vec<u8> = Vec::new();
             owner.deserialize(input)?;
-            info!("Skipped RELEASE_LOCKOWNER args: clientid + owner");
         }
         Nfs4Op::ExchangeId | Nfs4Op::CreateSession | Nfs4Op::DestroySession => {
             warn!(
@@ -410,12 +535,9 @@ fn skip_operation_args(op: Nfs4Op, input: &mut impl Read) -> Result<(), anyhow::
                 op
             );
         }
-        Nfs4Op::Lookupp => {
-            info!("Skipped LOOKUPP args: no arguments");
-        }
+        Nfs4Op::Lookupp => {}
         Nfs4Op::Openattr => {
             let _attr_type = input.read_u32::<BigEndian>()?;
-            info!("Skipped OPENATTR args: attr_type");
         }
         _ => {
             warn!(
@@ -452,6 +574,7 @@ async fn execute_operation(
         Nfs4Op::ExchangeId => op_exchange_id(input, ctx, handler).await,
         Nfs4Op::CreateSession => op_create_session(input, ctx, handler).await,
         Nfs4Op::DestroySession => op_destroy_session(input, ctx, handler).await,
+        Nfs4Op::BindConnToSession => op_bind_conn_to_session(input, ctx, handler).await,
         // Common operations
         Nfs4Op::Putrootfh => op_putrootfh(ctx, handler),
         Nfs4Op::Putpubfh => op_putpubfh(ctx, handler),
@@ -476,11 +599,12 @@ async fn execute_operation(
         Nfs4Op::Rename => op_rename(input, ctx, handler).await,
         Nfs4Op::Link => op_link(input, ctx, handler).await,
         Nfs4Op::Readlink => op_readlink(ctx, handler).await,
-        Nfs4Op::ReclaimComplete => op_reclaim_complete(input, ctx),
+        Nfs4Op::ReclaimComplete => op_reclaim_complete(input, ctx, handler),
         Nfs4Op::Delegreturn => op_delegreturn(input, ctx, handler).await,
         Nfs4Op::Access => op_access(input, ctx, handler).await,
         Nfs4Op::Setattr => op_setattr(input, ctx, handler).await,
         Nfs4Op::Secinfo => op_secinfo(input, ctx, handler).await,
+        Nfs4Op::SecinfoNoName => op_secinfo_no_name(input, ctx, handler).await,
         Nfs4Op::Nverify => op_nverify(input, ctx, handler).await,
         Nfs4Op::Verify => op_verify(input, ctx, handler).await,
         Nfs4Op::Lock => op_lock(input, ctx, handler).await,
@@ -499,6 +623,18 @@ async fn execute_operation(
 // ============================================================================
 
 /// SEQUENCE - must be first operation in most COMPOUNDs
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_sequence.c
+///
+/// Key sequence validation logic (line 196-197):
+/// ```c
+/// if (slot->sequence + 1 != arg_SEQUENCE4->sa_sequenceid) {
+///     // Handle replay or misordered sequence
+/// }
+/// slot->sequence += 1;
+/// res_SEQUENCE4->sr_sequenceid = slot->sequence;  // Return NEW sequence
+/// ```
 async fn op_sequence(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
@@ -508,41 +644,92 @@ async fn op_sequence(
     sessionid.deserialize(input)?;
     let sequenceid = input.read_u32::<BigEndian>()?;
     let slotid = input.read_u32::<BigEndian>()?;
-    let _highest_slotid = input.read_u32::<BigEndian>()?;
-    let _cachethis = input.read_u32::<BigEndian>()?;
+    let highest_slotid = input.read_u32::<BigEndian>()?;
+    let cachethis = input.read_u32::<BigEndian>()?;
 
-    debug!(
-        "SEQUENCE: session={:?} seq={} slot={}",
-        &sessionid[..4],
+    // Enhanced logging aligned with NFS-Ganesha tracepoint
+    info!(
+        "SEQUENCE: sessionid={:02x?} seq={} slot={} highest_slot={} cachethis={}",
+        &sessionid[..8],
         sequenceid,
-        slotid
+        slotid,
+        highest_slotid,
+        cachethis
     );
 
-    let (session, cached, highest, target_highest, flags) =
-        handler.sessions.sequence(&sessionid, slotid, sequenceid)?;
-
-    if let Some(cached_reply) = cached {
-        return Ok(cached_reply.reply);
-    }
+    // Process SEQUENCE - returns the NEW sequence id for response
+    // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence (after increment)
+    let (session, response_sequenceid, highest, target_highest, _session_flags) =
+        match handler.sessions.sequence(&sessionid, slotid, sequenceid) {
+            Ok(result) => result,
+            Err(e) => {
+                error!(
+                    "SEQUENCE failed: sessionid={:02x?} req_seq={} error={:?}",
+                    &sessionid[..8],
+                    sequenceid,
+                    e.status
+                );
+                return Err(e);
+            }
+        };
 
     ctx.sessionid = Some(sessionid);
     ctx.slot_id = Some(slotid);
     ctx.clientid = Some(session.clientid);
+    ctx.cachethis = cachethis != 0;
 
     handler.clients.renew_lease(session.clientid)?;
 
+    // NFS-Ganesha: sr_status_flags initialization (nfs4_op_sequence.c line 306-311)
+    // ```c
+    // res_SEQUENCE4->sr_status_flags = 0;
+    // if (nfs_rpc_get_chan(session->clientid_record, 0) == NULL) {
+    //     sr_status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+    // }
+    // ```
+    //
+    // RFC 5661 Section 18.46.3 defines status flags:
+    // - SEQ4_STATUS_CB_PATH_DOWN (0x01): Backchannel is not available
+    // - SEQ4_STATUS_CB_PATH_DOWN_SESSION (0x200): Session's backchannel is down
+    const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+    let mut status_flags: u32 = 0;
+    if !session.is_backchannel_up() {
+        status_flags |= SEQ4_STATUS_CB_PATH_DOWN;
+    }
+
+    info!(
+        "SEQUENCE response: resp_seq={} slot={} highest={} target_highest={} status_flags={:#x}",
+        response_sequenceid, slotid, highest, target_highest, status_flags
+    );
+
     let mut result = Vec::new();
     sessionid.serialize(&mut result)?;
-    sequenceid.serialize(&mut result)?;
+    // Return the NEW sequence id (after increment), not the request sequence id
+    // NFS-Ganesha: res_SEQUENCE4->sr_sequenceid = slot->sequence
+    response_sequenceid.serialize(&mut result)?;
     slotid.serialize(&mut result)?;
     highest.serialize(&mut result)?;
     target_highest.serialize(&mut result)?;
-    flags.serialize(&mut result)?;
+    status_flags.serialize(&mut result)?;
+
+    info!("SEQUENCE response bytes: len={}", result.len());
 
     Ok(result)
 }
 
 /// EXCHANGE_ID - client registration
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_exchange_id.c
+///
+/// Response structure (RFC 5661):
+/// - eir_clientid: Client ID assigned by server
+/// - eir_sequenceid: Sequence ID for CREATE_SESSION
+/// - eir_flags: Server capability flags (pNFS, etc.)
+/// - eir_state_protect: State protection info (spr_how)
+/// - eir_server_owner: Server owner (so_major_id + so_minor_id)
+/// - eir_server_scope: Server scope
+/// - eir_server_impl_id: Server implementation ID (optional, len=0)
 async fn op_exchange_id(
     input: &mut impl Read,
     _ctx: &mut CompoundContext,
@@ -564,30 +751,93 @@ async fn op_exchange_id(
         time.deserialize(input)?;
     }
 
-    debug!("EXCHANGE_ID: owner={:?} flags={:#x}", client_owner, flags);
+    info!("EXCHANGE_ID: owner={:?} flags={:#x}", client_owner, flags);
 
-    let (clientid, seqid, result_flags) = handler.clients.exchange_id(client_owner)?;
+    let (clientid, seqid, _result_flags) = handler.clients.exchange_id(client_owner)?;
+
+    // If in grace period and client reconnected, allow reclaim (NFS-Ganesha aligned)
+    // This allows the client to use CLAIM_PREVIOUS during grace period
+    if handler.grace.in_grace() {
+        if let Some(client) = handler.clients.get_client(clientid) {
+            client.set_allow_reclaim(true);
+            info!(
+                "EXCHANGE_ID: client {} reconnected during grace period, allow_reclaim=true",
+                clientid
+            );
+        }
+    } else {
+        // NOT in grace period: Do NOT pre-set reclaim_complete
+        //
+        // CRITICAL FIX: Align with NFS-Ganesha behavior
+        //
+        // NFS-Ganesha does NOT pre-set cid_reclaim_complete in EXCHANGE_ID.
+        // It waits for the client to send RECLAIM_COMPLETE operation.
+        //
+        // Pre-setting it causes RECLAIM_COMPLETE to fail with NFS4ERR_COMPLETE_ALREADY,
+        // which may confuse the client and lead to abnormal behavior (5-second delays).
+        //
+        // Reference: nfs-ganesha/src/Protocols/NFS/nfs4_op_reclaim_complete.c line 104
+        // Only sets cid_reclaim_complete = true when RECLAIM_COMPLETE is called.
+        info!(
+            "EXCHANGE_ID: client {} created outside grace period, waiting for RECLAIM_COMPLETE",
+            clientid
+        );
+    }
+
+    // Build response flags (NFS-Ganesha: line 381-382)
+    // EXCHGID4_FLAG_USE_NON_PNFS = 0x00010000 (we don't support pNFS)
+    // EXCHGID4_FLAG_SUPP_MOVED_REFER = 0x00000001
+    let result_flags: u32 = 0x00010001; // USE_NON_PNFS | SUPP_MOVED_REFER
+
+    info!(
+        "EXCHANGE_ID: success clientid={} seqid={} result_flags={:#x}",
+        clientid, seqid, result_flags
+    );
 
     let mut result = Vec::new();
+
+    // eir_clientid (8 bytes)
     clientid.serialize(&mut result)?;
+
+    // eir_sequenceid (4 bytes)
     seqid.serialize(&mut result)?;
+
+    // eir_flags (4 bytes)
     result_flags.serialize(&mut result)?;
+
+    // eir_state_protect: state_protect4_r
+    // spr_how = SP4_NONE (0) - no state protection
     0u32.serialize(&mut result)?;
 
+    // eir_server_owner: server_owner4
+    // so_minor_id (8 bytes)
+    0u64.serialize(&mut result)?;
+    // so_major_id (opaque<NFS4_OPAQUE_LIMIT>)
     let server_owner_major: Vec<u8> = b"curvine".to_vec();
-    let server_owner_minor: Vec<u8> = Vec::new();
     server_owner_major.serialize(&mut result)?;
-    server_owner_minor.serialize(&mut result)?;
 
+    // eir_server_scope (opaque<NFS4_OPAQUE_LIMIT>)
     let server_scope: Vec<u8> = b"curvine.local".to_vec();
     server_scope.serialize(&mut result)?;
 
+    // eir_server_impl_id (nfs_impl_id4<1>) - empty array
     0u32.serialize(&mut result)?;
+
+    info!("EXCHANGE_ID: response len={}", result.len());
 
     Ok(result)
 }
 
 /// CREATE_SESSION
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_create_session.c
+///
+/// NFS-Ganesha echoes back client's channel attrs (line 457-458):
+/// ```c
+/// res_CREATE_SESSION4ok->csr_back_chan_attrs = nfs41_session->back_channel_attrs;
+/// ```
+/// where back_channel_attrs was saved from client's request.
 async fn op_create_session(
     input: &mut impl Read,
     _ctx: &mut CompoundContext,
@@ -597,20 +847,41 @@ async fn op_create_session(
     let seqid = input.read_u32::<BigEndian>()?;
     let flags = input.read_u32::<BigEndian>()?;
 
-    for _ in 0..2 {
-        let _headerpadsize = input.read_u32::<BigEndian>()?;
-        let _maxrequestsize = input.read_u32::<BigEndian>()?;
-        let _maxresponsesize = input.read_u32::<BigEndian>()?;
-        let _maxresponsesize_cached = input.read_u32::<BigEndian>()?;
-        let _maxoperations = input.read_u32::<BigEndian>()?;
-        let _maxrequests = input.read_u32::<BigEndian>()?;
-        let rdma_count = input.read_u32::<BigEndian>()?;
-        for _ in 0..rdma_count {
-            let _rdma = input.read_u32::<BigEndian>()?;
-        }
+    // Read fore_chan_attrs (NFS-Ganesha: csa_fore_chan_attrs)
+    let fore_headerpadsize = input.read_u32::<BigEndian>()?;
+    let fore_maxrequestsize = input.read_u32::<BigEndian>()?;
+    let fore_maxresponsesize = input.read_u32::<BigEndian>()?;
+    let fore_maxresponsesize_cached = input.read_u32::<BigEndian>()?;
+    let fore_maxoperations = input.read_u32::<BigEndian>()?;
+    let fore_maxrequests = input.read_u32::<BigEndian>()?;
+    let fore_rdma_count = input.read_u32::<BigEndian>()?;
+    let mut fore_rdma_ird: Vec<u32> = Vec::new();
+    for _ in 0..fore_rdma_count {
+        fore_rdma_ird.push(input.read_u32::<BigEndian>()?);
     }
 
-    let _cb_program = input.read_u32::<BigEndian>()?;
+    // Read back_chan_attrs (NFS-Ganesha: csa_back_chan_attrs)
+    // NFS-Ganesha saves these and echoes them back in response (line 416-417, 457-458)
+    // CRITICAL: Must echo back client's back_chan_attrs, not zeros!
+    let back_headerpadsize = input.read_u32::<BigEndian>()?;
+    let back_maxrequestsize = input.read_u32::<BigEndian>()?;
+    let back_maxresponsesize = input.read_u32::<BigEndian>()?;
+    let back_maxresponsesize_cached = input.read_u32::<BigEndian>()?;
+    let back_maxoperations = input.read_u32::<BigEndian>()?;
+    let back_maxrequests = input.read_u32::<BigEndian>()?;
+    let back_rdma_count = input.read_u32::<BigEndian>()?;
+    let mut back_rdma_ird: Vec<u32> = Vec::new();
+    for _ in 0..back_rdma_count {
+        back_rdma_ird.push(input.read_u32::<BigEndian>()?);
+    }
+
+    info!(
+        "CREATE_SESSION: fore_chan maxreq={} maxops={} maxrequests={}, back_chan maxrequests={} rdma_count={}",
+        fore_maxrequestsize, fore_maxoperations, fore_maxrequests, back_maxrequests, back_rdma_count
+    );
+
+    // Read callback program number (NFS-Ganesha: csa_cb_program)
+    let cb_program = input.read_u32::<BigEndian>()?;
     let sec_count = input.read_u32::<BigEndian>()?;
     for _ in 0..sec_count {
         let flavor = input.read_u32::<BigEndian>()?;
@@ -668,30 +939,152 @@ async fn op_create_session(
         return Err(Nfs4Status::SeqMisordered.into());
     }
 
-    let session = handler.sessions.create_session(clientid)?;
+    // Create session and save client-requested flags
+    // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
+    // We save this to know if client requested backchannel
+    let session = handler
+        .sessions
+        .create_session_with_flags(clientid, flags)?;
+
+    // Save callback program number (NFS-Ganesha: nfs41_session->cb_program = csa_cb_program)
+    session.set_cb_program(cb_program);
+    info!(
+        "CREATE_SESSION: saved cb_program={} for session {:02x?}",
+        cb_program,
+        &session.sessionid[..8]
+    );
 
     handler.clients.confirm_client(clientid)?;
 
+    // Build CREATE_SESSION4resok response per RFC 5661
+    // Response structure:
+    //   csr_sessionid (16 bytes)
+    //   csr_sequence (4 bytes)
+    //   csr_flags (4 bytes)
+    //   csr_fore_chan_attrs (channel_attrs4)
+    //   csr_back_chan_attrs (channel_attrs4)
+    //
+    // channel_attrs4 structure:
+    //   ca_headerpadsize (4 bytes)
+    //   ca_maxrequestsize (4 bytes)
+    //   ca_maxresponsesize (4 bytes)
+    //   ca_maxresponsesize_cached (4 bytes)
+    //   ca_maxoperations (4 bytes)
+    //   ca_maxrequests (4 bytes)
+    //   ca_rdma_ird<1> (array: 4 bytes len + data)
+
     let mut result = Vec::new();
+
+    // csr_sessionid (16 bytes)
     session.sessionid.serialize(&mut result)?;
+
+    // csr_sequence (4 bytes) - echo back the sequence from request
     seqid.serialize(&mut result)?;
-    flags.serialize(&mut result)?;
 
-    0u32.serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (64 * 1024u32).serialize(&mut result)?;
-    64u32.serialize(&mut result)?;
-    session.slot_count().serialize(&mut result)?;
-    0u32.serialize(&mut result)?;
+    // csr_flags (4 bytes)
+    // CREATE_SESSION4_FLAG_PERSIST = 0x00000001
+    // CREATE_SESSION4_FLAG_CONN_BACK_CHAN = 0x00000002
+    // CREATE_SESSION4_FLAG_CONN_RDMA = 0x00000004
+    //
+    // NFS-Ganesha Reference (nfs4_op_create_session.c line 637-647):
+    // ```c
+    // res_CREATE_SESSION4ok->csr_flags = 0;
+    // if (arg_CREATE_SESSION4->csa_flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN) {
+    //     if (nfs_rpc_create_chan_v41(...) == 0) {
+    //         res_CREATE_SESSION4ok->csr_flags |= CREATE_SESSION4_FLAG_CONN_BACK_CHAN;
+    //     }
+    // }
+    // ```
+    //
+    // NFS-Ganesha Reference: Only set CONN_BACK_CHAN when backchannel is truly created
+    // (nfs4_op_create_session.c line 637-647)
+    //
+    // RFC 5661 Section 18.36.3:
+    // "If csa_flags has CREATE_SESSION4_FLAG_CONN_BACK_CHAN set, the client is
+    //  requesting that the connection be associated with the session's backchannel."
+    //
+    // CRITICAL: We don't have a real backchannel implementation.
+    // Per NFS-Ganesha behavior, we should NOT set CONN_BACK_CHAN in response
+    // if we cannot actually create the backchannel. Setting it would cause
+    // Linux NFS client to wait ~5 seconds for backchannel establishment that never happens.
+    //
+    // However, we can set PERSIST flag if client requested it, as this just
+    // indicates that the session survives network partitions (we support this).
+    //
+    // Combined with SEQ4_STATUS_CB_PATH_DOWN in SEQUENCE response, this tells
+    // the client that backchannel is not available, which is RFC-compliant.
+    //
+    // Note: Delegation is OPTIONAL in NFSv4.1. Without backchannel, server
+    // simply won't grant delegations (or will use OPEN_DELEGATE_NONE_EXT).
+    //
+    // TODO: Implement real backchannel for full NFS-Ganesha compatibility.
+    const CREATE_SESSION4_FLAG_PERSIST: u32 = 0x00000001;
+    const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x00000002;
+    let mut csr_flags: u32 = 0;
+    // Set PERSIST flag if client requested it
+    if flags & CREATE_SESSION4_FLAG_PERSIST != 0 {
+        csr_flags |= CREATE_SESSION4_FLAG_PERSIST;
+    }
+    // CONN_BACK_CHAN handling (NFS-Ganesha: nfs4_op_create_session.c line 637-647)
+    //
+    // NFS-Ganesha only sets CONN_BACK_CHAN in response when nfs_rpc_create_chan_v41()
+    // succeeds (i.e., when a real RPC callback channel is established).
+    //
+    // We do NOT have a real backchannel RPC implementation, so we should NOT set
+    // CONN_BACK_CHAN flag. This tells the client:
+    // 1. Backchannel is not available on this connection
+    // 2. Server won't grant delegations (no way to send CB_RECALL)
+    // 3. Client should not wait for backchannel-related operations
+    //
+    // Setting CONN_BACK_CHAN without real backchannel causes Linux NFS client
+    // to wait ~5 seconds for backchannel establishment that never happens.
+    //
+    // FIX: Previously we tried setting CONN_BACK_CHAN, which caused 5s delay.
+    // Now we explicitly do NOT set it, following NFS-Ganesha behavior.
+    if flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN != 0 {
+        // Client requested backchannel, but we don't have real RPC callback support.
+        // Do NOT set CONN_BACK_CHAN in response - this is RFC-compliant behavior.
+        info!(
+            "CREATE_SESSION: client requested CONN_BACK_CHAN but we don't support it, NOT setting flag in response"
+        );
+    }
+    info!(
+        "CREATE_SESSION: csa_flags={:#x} csr_flags={:#x}",
+        flags, csr_flags
+    );
+    csr_flags.serialize(&mut result)?;
 
-    0u32.serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (1024 * 1024u32).serialize(&mut result)?;
-    (64 * 1024u32).serialize(&mut result)?;
-    64u32.serialize(&mut result)?;
-    session.slot_count().serialize(&mut result)?;
-    0u32.serialize(&mut result)?;
+    // csr_fore_chan_attrs: echo client attrs, only adjust ca_maxrequests to session slot count
+    fore_headerpadsize.serialize(&mut result)?; // ca_headerpadsize
+    fore_maxrequestsize.serialize(&mut result)?; // ca_maxrequestsize
+    fore_maxresponsesize.serialize(&mut result)?; // ca_maxresponsesize
+    fore_maxresponsesize_cached.serialize(&mut result)?; // ca_maxresponsesize_cached
+    fore_maxoperations.serialize(&mut result)?; // ca_maxoperations
+    session.slot_count().serialize(&mut result)?; // ca_maxrequests (slot count)
+    (fore_rdma_ird.len() as u32).serialize(&mut result)?; // ca_rdma_ird<1> array length
+    for rdma in &fore_rdma_ird {
+        rdma.serialize(&mut result)?;
+    }
+
+    // csr_back_chan_attrs: CRITICAL - echo back client's requested attributes verbatim
+    // NFS-Ganesha: res_CREATE_SESSION4ok->csr_back_chan_attrs = nfs41_session->back_channel_attrs
+    // Linux client expects this echo-back; returning zeros may cause 5s timeout
+    back_headerpadsize.serialize(&mut result)?; // ca_headerpadsize
+    back_maxrequestsize.serialize(&mut result)?; // ca_maxrequestsize
+    back_maxresponsesize.serialize(&mut result)?; // ca_maxresponsesize
+    back_maxresponsesize_cached.serialize(&mut result)?; // ca_maxresponsesize_cached
+    back_maxoperations.serialize(&mut result)?; // ca_maxoperations
+    back_maxrequests.serialize(&mut result)?; // ca_maxrequests
+    (back_rdma_ird.len() as u32).serialize(&mut result)?; // ca_rdma_ird<1> array length
+    for rdma in &back_rdma_ird {
+        rdma.serialize(&mut result)?;
+    }
+
+    info!(
+        "CREATE_SESSION: response len={} sessionid={:02x?}",
+        result.len(),
+        &session.sessionid[..8]
+    );
 
     client.cache_create_session_response(result.clone(), 0);
 
@@ -720,6 +1113,131 @@ async fn op_destroy_session(
     handler.sessions.destroy_session(&sessionid)?;
 
     Ok(Vec::new())
+}
+
+/// BIND_CONN_TO_SESSION - bind connection to session
+///
+/// # RFC 5661 Section 18.34.3
+/// "BIND_CONN_TO_SESSION MUST appear by itself in a COMPOUND. If it does not,
+///  then the server MUST return NFS4ERR_NOT_ONLY_OP."
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_bind_conn.c
+///
+/// This operation binds the current TCP connection to an existing session.
+/// It's used for session trunking (multiple connections per session).
+///
+/// # Response Structure (RFC 5661)
+/// - bctsr_sessid: Session ID (16 bytes)
+/// - bctsr_dir: Channel direction (CDFS4_FORE=1, CDFS4_BACK=2, CDFS4_BOTH=3)
+/// - bctsr_use_conn_in_rdma_mode: RDMA mode flag
+async fn op_bind_conn_to_session(
+    input: &mut impl Read,
+    ctx: &mut CompoundContext,
+    handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    // RFC 5661: BIND_CONN_TO_SESSION MUST be the only operation in the COMPOUND
+    if ctx.op_count != 1 {
+        warn!(
+            "BIND_CONN_TO_SESSION: rejected - must be only operation (op_count={})",
+            ctx.op_count
+        );
+        return Err(Nfs4Status::NotOnlyOp.into());
+    }
+    // Read arguments
+    let mut sessionid = Sessionid4::default();
+    sessionid.deserialize(input)?;
+    let dir = input.read_u32::<BigEndian>()?; // channel_dir_from_client4
+    let use_rdma = input.read_u32::<BigEndian>()?; // use_conn_in_rdma_mode
+
+    info!(
+        "BIND_CONN_TO_SESSION: sessionid={:02x?} dir={} rdma={}",
+        &sessionid[..8],
+        dir,
+        use_rdma
+    );
+
+    // Validate session exists
+    let session = handler
+        .sessions
+        .get_session(&sessionid)
+        .ok_or(Nfs4Status::BadSession)?;
+
+    // Renew lease
+    handler.clients.renew_lease(session.clientid)?;
+
+    // NFS-Ganesha Reference: nfs4_op_bind_conn.c line 195-227
+    // Handle backchannel creation based on client request
+    // CDFC4_FORE = 1, CDFC4_BACK = 2, CDFC4_FORE_OR_BOTH = 3, CDFC4_BACK_OR_BOTH = 4
+    // CDFS4_FORE = 1, CDFS4_BACK = 2, CDFS4_BOTH = 3
+    //
+    // Align with NFS-Ganesha behavior:
+    // - Only report BACK/BOTH when backchannel is actually created
+    // - If client allows fallback (FORE_OR_BOTH), return FORE when no backchannel
+    // - If client requires backchannel (BACK or BACK_OR_BOTH), return error
+
+    const CDFC4_FORE: u32 = 1;
+    const CDFC4_BACK: u32 = 2;
+    const CDFC4_FORE_OR_BOTH: u32 = 3;
+    const CDFC4_BACK_OR_BOTH: u32 = 4;
+
+    const CDFS4_FORE: u32 = 1;
+    const CDFS4_BACK: u32 = 2;
+    const CDFS4_BOTH: u32 = 3;
+
+    // Backchannel RPC is not implemented, so creation always fails
+    let backchannel_supported = false;
+
+    let response_dir = if dir == CDFC4_FORE {
+        CDFS4_FORE
+    } else if dir == CDFC4_FORE_OR_BOTH {
+        if backchannel_supported {
+            session.set_backchannel_up();
+            CDFS4_BOTH
+        } else {
+            info!(
+                "BIND_CONN_TO_SESSION: backchannel unsupported, client_dir=FORE_OR_BOTH returning FORE"
+            );
+            CDFS4_FORE
+        }
+    } else if dir == CDFC4_BACK_OR_BOTH {
+        if backchannel_supported {
+            session.set_backchannel_up();
+            CDFS4_BOTH
+        } else {
+            warn!(
+                "BIND_CONN_TO_SESSION: backchannel unsupported, client_dir=BACK_OR_BOTH returning INVAL"
+            );
+            return Err(Nfs4Status::Inval.into());
+        }
+    } else if dir == CDFC4_BACK {
+        if backchannel_supported {
+            session.set_backchannel_up();
+            CDFS4_BACK
+        } else {
+            warn!("BIND_CONN_TO_SESSION: backchannel unsupported, client_dir=BACK returning INVAL");
+            return Err(Nfs4Status::Inval.into());
+        }
+    } else {
+        warn!(
+            "BIND_CONN_TO_SESSION: unknown dir={}, defaulting to FORE",
+            dir
+        );
+        CDFS4_FORE
+    };
+
+    info!(
+        "BIND_CONN_TO_SESSION: success, client_dir={} server_dir={} rdma={}",
+        dir, response_dir, use_rdma
+    );
+
+    // Build response: bctsr_sessid + bctsr_dir + bctsr_use_conn_in_rdma_mode
+    let mut result = Vec::new();
+    sessionid.serialize(&mut result)?;
+    response_dir.serialize(&mut result)?;
+    use_rdma.serialize(&mut result)?; // Echo back rdma mode
+
+    Ok(result)
 }
 
 /// PUTROOTFH - set current FH to root
@@ -837,15 +1355,79 @@ async fn op_readdir(
 }
 
 /// RECLAIM_COMPLETE - client finished reclaiming state
-fn op_reclaim_complete(input: &mut impl Read, _ctx: &mut CompoundContext) -> Nfs4Result<Vec<u8>> {
-    let _one_fs = input.read_u32::<BigEndian>()?;
-    debug!("RECLAIM_COMPLETE");
+///
+/// NFS-Ganesha Reference: nfs4_op_reclaim_complete.c
+///
+/// This operation indicates that the client has finished reclaiming state
+/// after a server restart. After this, the client cannot use CLAIM_PREVIOUS.
+///
+/// # Arguments
+/// - rca_one_fs: If true, reclaim complete for one filesystem only (not supported)
+///
+/// # Returns
+/// - NFS4_OK: Success
+/// - NFS4ERR_COMPLETE_ALREADY: Client already called RECLAIM_COMPLETE
+/// - NFS4ERR_STALE_CLIENTID: Invalid client ID
+fn op_reclaim_complete(
+    input: &mut impl Read,
+    ctx: &CompoundContext,
+    handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    let rca_one_fs = input.read_u32::<BigEndian>()?;
+
+    // Get clientid from context (set by SEQUENCE operation)
+    let clientid = ctx.clientid.ok_or_else(|| {
+        tracing::warn!("RECLAIM_COMPLETE: no clientid in context");
+        Nfs4Status::OpNotInSession
+    })?;
+
+    // Get client state
+    let client = handler
+        .clients
+        .get_client(clientid)
+        .ok_or(Nfs4Status::StaleClientid)?;
+
+    // Check if already reclaim complete (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete)
+    // For now, we don't handle rca_one_fs, so we won't complain about complete already for it.
+    if client.is_reclaim_complete() && rca_one_fs == 0 {
+        tracing::warn!(
+            "RECLAIM_COMPLETE: client {} already completed reclaim",
+            clientid
+        );
+        return Err(Nfs4Status::CompleteAlready.into());
+    }
+
+    // Set reclaim complete flag (NFS-Ganesha: cid_cb.v41.cid_reclaim_complete = true)
+    if rca_one_fs == 0 {
+        client.set_reclaim_complete(true);
+        info!(
+            "RECLAIM_COMPLETE: client {} marked reclaim complete",
+            clientid
+        );
+    }
+
     Ok(Vec::new())
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Validate lock range parameters (offset and length)
+///
+/// Returns Nfs4Status::Inval if:
+/// - length is 0
+/// - offset + length would overflow (unless length is u64::MAX)
+#[inline]
+fn validate_lock_range(offset: u64, length: u64) -> Nfs4Result<()> {
+    if length == 0 {
+        return Err(Nfs4Status::Inval.into());
+    }
+    if length != u64::MAX && offset.checked_add(length).is_none() {
+        return Err(Nfs4Status::Inval.into());
+    }
+    Ok(())
+}
 
 // NFSv4 attribute bit definitions (RFC 7530)
 // Word 0 (bits 0-31)
@@ -1131,19 +1713,31 @@ where
         set_result(mask, FATTR4_NUMLINKS);
     }
     if is_requested(FATTR4_OWNER) {
+        // NFSv4 requires "user@domain" format (RFC 7530 Section 5.9)
+        // Aligned with nfs-ganesha idmapper implementation
         let owner = if attrs.owner.is_empty() {
-            "nobody"
+            // Empty owner: use default UID 65534 (nobody)
+            tracing::warn!("GETATTR FATTR4_OWNER: empty owner, using UID 65534");
+            uid_to_nfs4_owner(65534)
         } else {
-            &attrs.owner
+            // Resolve owner string to UID, then convert to NFSv4 format
+            let uid = resolve_uid(&attrs.owner, 65534);
+            uid_to_nfs4_owner(uid)
         };
         owner.as_bytes().to_vec().serialize(vals)?;
         set_result(mask, FATTR4_OWNER);
     }
     if is_requested(FATTR4_OWNER_GROUP) {
+        // NFSv4 requires "group@domain" format (RFC 7530 Section 5.9)
+        // Aligned with nfs-ganesha idmapper implementation
         let group = if attrs.group.is_empty() {
-            "nobody"
+            // Empty group: use default GID 65534 (nogroup)
+            tracing::warn!("GETATTR FATTR4_OWNER_GROUP: empty group, using GID 65534");
+            gid_to_nfs4_group(65534)
         } else {
-            &attrs.group
+            // Resolve group string to GID, then convert to NFSv4 format
+            let gid = resolve_gid(&attrs.group, 65534);
+            gid_to_nfs4_group(gid)
         };
         group.as_bytes().to_vec().serialize(vals)?;
         set_result(mask, FATTR4_OWNER_GROUP);
@@ -1405,7 +1999,7 @@ async fn op_setclientid(
 
     let callback_ident = input.read_u32::<BigEndian>()?;
 
-    info!(
+    debug!(
         "NFSv4.0 SETCLIENTID: verifier={:02x?} client_id={:?} cb_program={} netid={:?} addr={:?} cb_ident={}",
         &verifier[..4],
         String::from_utf8_lossy(&client_id),
@@ -1427,7 +2021,7 @@ async fn op_setclientid(
 
     ctx.clientid = Some(clientid);
 
-    info!(
+    debug!(
         "NFSv4.0 SETCLIENTID: assigned clientid={} confirm_verifier={:02x?}",
         clientid,
         &confirm_verifier[..4]
@@ -1437,7 +2031,7 @@ async fn op_setclientid(
     clientid.serialize(&mut result)?;
     result.extend_from_slice(&confirm_verifier);
 
-    info!("NFSv4.0 SETCLIENTID: response len={} bytes", result.len());
+    debug!("NFSv4.0 SETCLIENTID: response len={} bytes", result.len());
 
     Ok(result)
 }
@@ -1467,7 +2061,7 @@ fn handle_setclientid_v40(
             .ok_or(Nfs4Status::Serverfault)?;
 
         if existing_client.owner.co_verifier == *verifier && existing_client.is_confirmed() {
-            info!(
+            debug!(
                 "NFSv4.0 SETCLIENTID: CASE 2 - Update callback for existing confirmed client {}",
                 existing_clientid
             );
@@ -1481,11 +2075,11 @@ fn handle_setclientid_v40(
 
             return Ok((existing_clientid, confirm_verifier));
         } else {
-            info!("NFSv4.0 SETCLIENTID: CASE 3/4 - Different verifier, creating new client");
+            debug!("NFSv4.0 SETCLIENTID: CASE 3/4 - Different verifier, creating new client");
         }
     }
 
-    info!("NFSv4.0 SETCLIENTID: CASE 5 - New client registration");
+    debug!("NFSv4.0 SETCLIENTID: CASE 5 - New client registration");
 
     let (clientid, _seqid, _flags) = handler.clients.exchange_id(client_owner)?;
 
@@ -1516,7 +2110,7 @@ async fn op_setclientid_confirm(
     let mut verifier: [u8; 8] = [0; 8];
     input.read_exact(&mut verifier)?;
 
-    info!(
+    debug!(
         "NFSv4.0 SETCLIENTID_CONFIRM: clientid={} verifier={:02x?}",
         clientid,
         &verifier[..4]
@@ -1527,7 +2121,7 @@ async fn op_setclientid_confirm(
         Nfs4Status::StaleClientid
     })?;
 
-    info!(
+    debug!(
         "NFSv4.0 SETCLIENTID_CONFIRM: found client {}, confirmed={}",
         clientid,
         client.is_confirmed()
@@ -1537,7 +2131,7 @@ async fn op_setclientid_confirm(
 
     ctx.clientid = Some(clientid);
 
-    info!(
+    debug!(
         "NFSv4.0 SETCLIENTID_CONFIRM: client {} confirmed and stored in context",
         clientid
     );
@@ -1546,14 +2140,34 @@ async fn op_setclientid_confirm(
 }
 
 /// RENEW - NFSv4.0 lease renewal
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_renew.c, line 68-72
+///
+/// RENEW is ONLY for NFSv4.0. NFSv4.1 uses SEQUENCE for lease renewal.
+/// Per RFC 5661 Section 18.35.3:
+/// "RENEW MUST NOT be used in a COMPOUND with a minor version greater than 0"
 async fn op_renew(
     input: &mut impl Read,
     ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
+    // NFS-Ganesha: nfs4_op_renew.c line 68-72
+    // if (data->minorversion > 0) {
+    //     res_RENEW4->status = NFS4ERR_NOTSUPP;
+    //     return NFS_REQ_ERROR;
+    // }
+    if ctx.minor_version > 0 {
+        warn!(
+            "RENEW: rejected for NFSv4.{} (RENEW is only for NFSv4.0)",
+            ctx.minor_version
+        );
+        return Err(Nfs4Status::Notsupp.into());
+    }
+
     let clientid = input.read_u64::<BigEndian>()?;
 
-    debug!("RENEW: clientid={}", clientid);
+    debug!("NFSv4.0 RENEW: clientid={}", clientid);
 
     handler.clients.renew_lease(clientid)?;
 
@@ -1602,6 +2216,15 @@ async fn op_setattr(
     crate::nfs4::ops::setattr::op_setattr(input, ctx, handler).await
 }
 
+/// Build SECINFO response with AUTH_SYS support
+/// Returns array of secinfo4 with flavor = AUTH_SYS (1)
+fn build_secinfo_response() -> Nfs4Result<Vec<u8>> {
+    let mut result = Vec::new();
+    1u32.serialize(&mut result)?; // Array length = 1
+    1u32.serialize(&mut result)?; // flavor = AUTH_SYS (1)
+    Ok(result)
+}
+
 /// SECINFO - get security information for a directory entry
 async fn op_secinfo(
     input: &mut impl Read,
@@ -1639,15 +2262,44 @@ async fn op_secinfo(
         }
     }
 
-    let mut result = Vec::new();
-
-    1u32.serialize(&mut result)?;
-
-    1u32.serialize(&mut result)?;
+    let result = build_secinfo_response()?;
 
     info!(
         "SECINFO: returning AUTH_SYS support for '{}', result_len={}",
         name_str,
+        result.len()
+    );
+
+    Ok(result)
+}
+
+/// SECINFO_NO_NAME - get security information for current or parent directory
+///
+/// # NFS-Ganesha Reference
+/// File: nfs4_op_secinfo_no_name.c
+///
+/// This operation returns the security mechanisms supported by the server
+/// for the current file handle or its parent (based on style argument).
+async fn op_secinfo_no_name(
+    input: &mut impl Read,
+    ctx: &mut CompoundContext,
+    _handler: &CompoundHandler,
+) -> Nfs4Result<Vec<u8>> {
+    // Read style argument: SECINFO_STYLE4_CURRENT_FH (0) or SECINFO_STYLE4_PARENT (1)
+    let style = input.read_u32::<BigEndian>()?;
+
+    info!("SECINFO_NO_NAME: style={} (0=current_fh, 1=parent)", style);
+
+    // Validate current file handle exists
+    let _fh = ctx.require_current_fh()?;
+
+    let result = build_secinfo_response()?;
+
+    // Per RFC 5661, SECINFO_NO_NAME consumes the current filehandle
+    ctx.current_fh = None;
+
+    info!(
+        "SECINFO_NO_NAME: returning AUTH_SYS support, result_len={}",
         result.len()
     );
 
@@ -1784,13 +2436,7 @@ async fn op_lock(
         fileid, lock_type, reclaim, offset, length, lock_seqid, blocking
     );
 
-    if length == 0 {
-        return Err(Nfs4Status::Inval.into());
-    }
-
-    if length != u64::MAX && offset.checked_add(length).is_none() {
-        return Err(Nfs4Status::Inval.into());
-    }
+    validate_lock_range(offset, length)?;
 
     if new_lock_owner {
         if let Some(ref open_stateid) = open_stateid {
@@ -1862,13 +2508,7 @@ async fn op_lockt(
         fileid, lock_type, offset, length
     );
 
-    if length == 0 {
-        return Err(Nfs4Status::Inval.into());
-    }
-
-    if length != u64::MAX && offset.checked_add(length).is_none() {
-        return Err(Nfs4Status::Inval.into());
-    }
+    validate_lock_range(offset, length)?;
 
     let lock_owner = LockOwner4 {
         clientid: owner_clientid,
@@ -1944,13 +2584,7 @@ async fn op_locku(
         length
     );
 
-    if length == 0 {
-        return Err(Nfs4Status::Inval.into());
-    }
-
-    if length != u64::MAX && offset.checked_add(length).is_none() {
-        return Err(Nfs4Status::Inval.into());
-    }
+    validate_lock_range(offset, length)?;
 
     let lock_state = handler
         .locks

@@ -51,6 +51,35 @@ use tokio_util::bytes::Bytes;
 /// Root directory file ID
 pub const ROOT_FILEID: Fileid4 = 1000;
 
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Calculate read parameters and check bounds
+///
+/// Returns (read_count, early_eof) where:
+/// - read_count: actual bytes to read (may be 0)
+/// - early_eof: true if offset is beyond file or read_count is 0
+#[inline]
+fn calculate_read_params(offset: u64, count: u32, file_len: i64) -> (u32, bool) {
+    let file_len = file_len as u64;
+    if offset >= file_len {
+        return (0, true);
+    }
+
+    let remaining = file_len - offset;
+    let read_count = count.min(remaining as u32);
+
+    (read_count, read_count == 0)
+}
+
+/// Check if read reached EOF
+#[inline]
+fn is_eof(slices: &[DataSlice], offset: u64, count: u32, file_len: i64) -> bool {
+    let total_len: usize = slices.iter().map(|s| s.len()).sum();
+    total_len < count as usize || (offset + total_len as u64) >= file_len as u64
+}
+
 /// Generate a unique fileid from path for UFS files
 ///
 /// UFS (like S3) doesn't have inode concept, so FileStatus.id is 0.
@@ -64,11 +93,11 @@ pub const ROOT_FILEID: Fileid4 = 1000;
 fn generate_fileid_from_path(path: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
+
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     let hash = hasher.finish();
-    
+
     // Ensure fileid > 0 by using high bit as 0 and adding 1
     // This gives us range [1, 2^63]
     (hash & 0x7FFF_FFFF_FFFF_FFFF) + 1
@@ -284,15 +313,17 @@ impl OpenFile {
     /// # Arguments
     /// - writer: If provided, wraps in NfsWriter for auto-extend support
     /// - reader_pool: If provided, uses ReaderPool for concurrent reads
+    /// - small_file_config: (max_writes, max_size, enabled) for async flush optimization
     fn new(
         fileid: Fileid4,
         path: Path,
         reader_pool: Option<Arc<ReaderPool>>,
         writer: Option<UnifiedWriter>,
         access: u32,
+        small_file_config: (u32, u64, bool),
     ) -> Self {
         // Wrap UnifiedWriter in NfsWriter for auto-extend support
-        let nfs_writer = writer.map(NfsWriter::new);
+        let nfs_writer = writer.map(|w| NfsWriter::new(w, small_file_config));
 
         Self {
             fileid,
@@ -324,12 +355,6 @@ impl OpenFile {
     /// This is used by GETATTR to return the correct file size when
     /// there's buffered data in the Writer that hasn't been committed yet.
     ///
-    /// Returns None if no Writer exists or Writer has no data.
-    /// Get current write position from Writer (if any)
-    ///
-    /// This is used by GETATTR to return the correct file size when
-    /// there's buffered data in the Writer that hasn't been committed yet.
-    ///
     /// Returns None if no Writer exists.
     pub async fn get_writer_pos(&self) -> Option<i64> {
         let writer = {
@@ -337,10 +362,9 @@ impl OpenFile {
             writer_guard.clone()
         };
 
-        if let Some(writer) = writer {
-            writer.get_pos().await
-        } else {
-            None
+        match writer {
+            Some(w) => w.get_pos().await,
+            None => None,
         }
     }
 
@@ -357,6 +381,7 @@ impl OpenFile {
         new_access: u32,
         ufs: &UnifiedFileSystem,
         pool_size: usize,
+        small_file_config: (u32, u64, bool),
     ) -> Nfs4Result<()> {
         // Step 1: Check if upgrade is needed (acquire and release lock quickly)
         let (current_access, combined_access, need_reader, need_writer) = {
@@ -398,7 +423,7 @@ impl OpenFile {
                 .map_err(Nfs4Error::from)?;
 
             // Step 5: Wrap in NfsWriter and update (sync lock)
-            let nfs_writer = NfsWriter::new(writer);
+            let nfs_writer = NfsWriter::new(writer, small_file_config);
             *self.writer.write().unwrap() = Some(nfs_writer);
         }
 
@@ -423,37 +448,27 @@ impl OpenFile {
             let pool = pool_guard.as_ref().ok_or_else(|| {
                 Nfs4Error::with_message(Nfs4Status::Openmode, "File not opened for read")
             })?;
-            // Get a reader from pool (round-robin)
             pool.get()
         }; // RwLock released here - CRITICAL for Send trait
 
-        // Step 2: Lock the reader (each reader is independent)
+        // Step 2: Lock the reader and get file length
         let mut reader = reader_entry.reader.lock().await;
-
-        // Step 3: Get file length (no additional lock needed)
         let file_len = reader.len();
 
-        // Step 4: Check bounds
-        if offset >= file_len as u64 {
+        // Step 3: Check bounds and calculate read size
+        let (read_count, early_eof) = calculate_read_params(offset, count, file_len);
+        if early_eof {
             return Ok((vec![], true));
         }
 
-        let remaining = file_len as u64 - offset;
-        let read_count = count.min(remaining as u32);
-
-        if read_count == 0 {
-            return Ok((vec![], true));
-        }
-
-        // Step 5: Perform read operation (zero-copy, direct call)
+        // Step 4: Perform read operation (zero-copy)
         let slices = reader
             .fuse_read(offset as i64, read_count as usize)
             .await
             .map_err(Nfs4Error::from)?;
 
-        // Step 6: Calculate EOF
-        let total_len: usize = slices.iter().map(|s| s.len()).sum();
-        let eof = total_len < count as usize || (offset + total_len as u64) >= file_len as u64;
+        // Step 5: Calculate EOF
+        let eof = is_eof(&slices, offset, count, file_len);
 
         Ok((slices, eof))
     }
@@ -465,16 +480,28 @@ impl OpenFile {
     /// - Data blocks are committed on CLOSE (via complete())
     /// - If write extends beyond current file size, NfsWriter auto-extends
     ///
+    /// # Arguments
+    /// - need_sync: true if stable != UNSTABLE4 (following nfs-ganesha semantics)
+    ///
+    /// # Returns
+    /// - (written_bytes, actual_synced): written count and whether sync was performed
+    ///
     /// # Thread Safety
     /// NfsWriter uses internal AsyncMutex to serialize writes.
     /// Clone is cheap (Arc clone), no external lock needed.
-    pub async fn write(&self, offset: u64, data: Vec<u8>) -> Nfs4Result<u32> {
+    pub async fn write(
+        &self,
+        offset: u64,
+        data: Vec<u8>,
+        need_sync: bool,
+    ) -> Nfs4Result<(u32, bool)> {
         tracing::info!(
-            "OpenFile::write: fileid={} path={} offset={} len={}",
+            "OpenFile::write: fileid={} path={} offset={} len={} need_sync={}",
             self.fileid,
             self.path.path(),
             offset,
-            data.len()
+            data.len(),
+            need_sync
         );
 
         // Clone NfsWriter - cheap Arc clone
@@ -494,25 +521,27 @@ impl OpenFile {
         }; // RwLock released here before await
 
         tracing::info!(
-            "OpenFile::write: Calling NfsWriter.write fileid={} offset={} len={}",
+            "OpenFile::write: Calling NfsWriter.write fileid={} offset={} len={} need_sync={}",
             self.fileid,
             offset,
-            data.len()
+            data.len(),
+            need_sync
         );
 
-        // NfsWriter handles auto-extend internally
-        let result = writer
-            .write(offset as i64, data)
+        // NfsWriter handles auto-extend internally and returns (written, synced)
+        let (written, actual_synced) = writer
+            .write(offset as i64, data, need_sync)
             .await
             .map_err(Nfs4Error::from)?;
 
         tracing::info!(
-            "OpenFile::write: NfsWriter.write completed fileid={} written={}",
+            "OpenFile::write: NfsWriter.write completed fileid={} written={} synced={}",
             self.fileid,
-            result
+            written,
+            actual_synced
         );
 
-        Ok(result)
+        Ok((written, actual_synced))
     }
 
     /// Flush buffered data to storage (NFS-Ganesha: fsync)
@@ -578,6 +607,8 @@ pub struct Nfs4FileSystem {
     path_cache: PathCache,
     /// FileStatus cache (fileid -> FileStatus) - reduces Master queries
     status_cache: Option<Cache<Fileid4, FileStatus>>,
+    /// Small file data cache - caches entire file content for small files
+    file_data_cache: Option<Cache<Fileid4, Vec<u8>>>,
     /// Open files (fileid -> OpenFile) - NFS-Ganesha's fsal_obj_handle.fd equivalent
     /// This is the file-level fd storage, shared by multiple states
     open_files: RwLock<HashMap<Fileid4, Arc<OpenFile>>>,
@@ -617,15 +648,63 @@ impl Nfs4FileSystem {
             None
         };
 
+        // Small file data cache to avoid repeated reads for tiny files
+        // Only create if enabled (capacity > 0)
+        let file_data_cache = if gateway_config.file_data_cache_size > 0 {
+            Some(
+                Cache::builder()
+                    .max_capacity(gateway_config.file_data_cache_size)
+                    .time_to_live(Duration::from_secs(gateway_config.file_data_cache_ttl_secs))
+                    .build(),
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             ufs,
             config: gateway_config,
             cluster_generation,
             path_cache,
             status_cache,
+            file_data_cache,
             open_files: RwLock::new(HashMap::new()),
             runtime,
         })
+    }
+
+    // ========================================================================
+    // Configuration Access
+    // ========================================================================
+
+    /// Get gateway configuration
+    #[inline]
+    pub fn config(&self) -> &NfsGatewayConf {
+        &self.config
+    }
+
+    /// Get small file data from cache (if enabled)
+    #[inline]
+    pub fn get_file_data(&self, fileid: Fileid4) -> Option<Vec<u8>> {
+        self.file_data_cache
+            .as_ref()
+            .and_then(|cache| cache.get(&fileid))
+    }
+
+    /// Insert small file data into cache (if enabled and file size <= max_cacheable_file_size)
+    #[inline]
+    pub fn insert_file_data(&self, fileid: Fileid4, data: Vec<u8>) {
+        if let Some(ref cache) = self.file_data_cache {
+            cache.insert(fileid, data);
+        }
+    }
+
+    /// Invalidate small file data cache for a file
+    #[inline]
+    pub fn invalidate_file_data(&self, fileid: Fileid4) {
+        if let Some(ref cache) = self.file_data_cache {
+            cache.invalidate(&fileid);
+        }
     }
 
     // ========================================================================
@@ -759,6 +838,16 @@ impl Nfs4FileSystem {
         self.get_status(fileid).await
     }
 
+    /// Get small file config from gateway config (DRY helper)
+    #[inline]
+    fn get_small_file_config(&self) -> (u32, u64, bool) {
+        (
+            self.config.small_file_max_writes,
+            self.config.small_file_max_size,
+            self.config.enable_small_file_async_flush,
+        )
+    }
+
     /// Open file for a NEW state (NFS-Ganesha: fsal_open2)
     ///
     /// This is called when a NEW state is created (new_state=true in open_ex).
@@ -777,93 +866,120 @@ impl Nfs4FileSystem {
     /// for a NEW state. The ref_count tracks the number of states
     /// referencing this OpenFile.
     pub async fn open_file(&self, fileid: Fileid4, access: u32) -> Nfs4Result<Arc<OpenFile>> {
-        // Check if OpenFile already exists (fast path with read lock)
-        let existing_file = {
-            let open_files = self.open_files.read().unwrap();
-            open_files.get(&fileid).cloned()
-        }; // Lock released here before await
-
         let pool_size = self.config.reader_pool_size;
+        let small_file_config = self.get_small_file_config();
 
-        if let Some(open_file) = existing_file {
-            // OpenFile exists - this means another state already opened this file.
-            // We need to add_ref() because we're creating a NEW state.
-            // NFS-Ganesha: each state holds a reference to the fd
+        // Fast path: check if OpenFile already exists
+        if let Some(open_file) = self.try_get_existing_open_file(fileid) {
             open_file.add_ref();
-
-            // Upgrade access if needed
             open_file
-                .upgrade_access(access, &self.ufs, pool_size)
+                .upgrade_access(access, &self.ufs, pool_size, small_file_config)
                 .await?;
-
             return Ok(open_file);
         }
 
-        // OpenFile doesn't exist, create new one (slow path with write lock)
         // Double-check pattern to avoid race condition
-        let double_check_result = {
-            let open_files = self.open_files.read().unwrap();
-            open_files.get(&fileid).cloned()
-        }; // Lock released here - CRITICAL for Send trait
-
-        if let Some(open_file) = double_check_result {
-            // Race condition: another thread created the OpenFile
+        if let Some(open_file) = self.try_get_existing_open_file(fileid) {
             open_file.add_ref();
             open_file
-                .upgrade_access(access, &self.ufs, pool_size)
+                .upgrade_access(access, &self.ufs, pool_size, small_file_config)
                 .await?;
             return Ok(open_file);
         }
 
-        // Create new OpenFile (NFS-Ganesha: fsal_open2)
-        // ref_count starts at 1 (for this new state)
-        let path = self.get_path(fileid)?;
+        // Create new OpenFile
+        let open_file = self
+            .create_new_open_file(fileid, access, pool_size, small_file_config)
+            .await?;
 
-        // Create ReaderPool if read access requested
-        let reader_pool = if access & 0x01 != 0 {
-            let p = path.clone();
-            let ufs = self.ufs.clone();
-            match ReaderPool::new(pool_size, || {
-                let path_clone = p.clone();
-                let fs = ufs.clone();
-                async move { fs.open(&path_clone).await }
-            })
-            .await
-            {
-                Ok(pool) => Some(Arc::new(pool)),
-                Err(e) => {
-                    tracing::error!("Failed to create ReaderPool for fileid={}: {:?}", fileid, e);
-                    return Err(Nfs4Error::from(e));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Create Writer if write access requested
-        let writer = if access & 0x02 != 0 {
-            let flags = OpenFlags::new_write_only().set_create(false);
-            let opts = self.ufs.cv().create_opts_builder().build();
-            match self.ufs.open_with_opts(&path, opts, flags).await {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    tracing::error!("Failed to create Writer for fileid={}: {:?}", fileid, e);
-                    return Err(Nfs4Error::from(e));
-                }
-            }
-        } else {
-            None
-        };
-
-        let open_file = Arc::new(OpenFile::new(fileid, path, reader_pool, writer, access));
-
-        // Store in open_files HashMap (acquire write lock again)
+        // Store in open_files HashMap
         self.open_files
             .write()
             .unwrap()
             .insert(fileid, open_file.clone());
 
         Ok(open_file)
+    }
+
+    /// Try to get an existing OpenFile (returns None if not found)
+    #[inline]
+    fn try_get_existing_open_file(&self, fileid: Fileid4) -> Option<Arc<OpenFile>> {
+        self.open_files.read().unwrap().get(&fileid).cloned()
+    }
+
+    /// Create a new OpenFile with reader pool and/or writer as needed
+    async fn create_new_open_file(
+        &self,
+        fileid: Fileid4,
+        access: u32,
+        pool_size: usize,
+        small_file_config: (u32, u64, bool),
+    ) -> Nfs4Result<Arc<OpenFile>> {
+        let path = self.get_path(fileid)?;
+
+        let reader_pool = self
+            .create_reader_pool_if_needed(access, &path, pool_size, fileid)
+            .await?;
+        let writer = self.create_writer_if_needed(access, &path, fileid).await?;
+
+        Ok(Arc::new(OpenFile::new(
+            fileid,
+            path,
+            reader_pool,
+            writer,
+            access,
+            small_file_config,
+        )))
+    }
+
+    /// Create ReaderPool if read access is requested
+    async fn create_reader_pool_if_needed(
+        &self,
+        access: u32,
+        path: &Path,
+        pool_size: usize,
+        fileid: Fileid4,
+    ) -> Nfs4Result<Option<Arc<ReaderPool>>> {
+        if access & 0x01 == 0 {
+            return Ok(None);
+        }
+
+        let p = path.clone();
+        let ufs = self.ufs.clone();
+        ReaderPool::new(pool_size, || {
+            let path_clone = p.clone();
+            let fs = ufs.clone();
+            async move { fs.open(&path_clone).await }
+        })
+        .await
+        .map(|pool| Some(Arc::new(pool)))
+        .map_err(|e| {
+            tracing::error!("Failed to create ReaderPool for fileid={}: {:?}", fileid, e);
+            Nfs4Error::from(e)
+        })
+    }
+
+    /// Create Writer if write access is requested
+    async fn create_writer_if_needed(
+        &self,
+        access: u32,
+        path: &Path,
+        fileid: Fileid4,
+    ) -> Nfs4Result<Option<UnifiedWriter>> {
+        if access & 0x02 == 0 {
+            return Ok(None);
+        }
+
+        let flags = OpenFlags::new_write_only().set_create(false);
+        let opts = self.ufs.cv().create_opts_builder().build();
+        self.ufs
+            .open_with_opts(path, opts, flags)
+            .await
+            .map(Some)
+            .map_err(|e| {
+                tracing::error!("Failed to create Writer for fileid={}: {:?}", fileid, e);
+                Nfs4Error::from(e)
+            })
     }
 
     /// Reopen file to upgrade access mode (NFS-Ganesha: fsal_reopen2)
@@ -907,6 +1023,7 @@ impl Nfs4FileSystem {
         };
 
         let pool_size = self.config.reader_pool_size;
+        let small_file_config = self.get_small_file_config();
 
         if let Some(open_file) = open_file {
             // Only increment ref_count if add_ref is true
@@ -917,7 +1034,7 @@ impl Nfs4FileSystem {
 
             // Upgrade access mode if needed (NFS-Ganesha: fsal_reopen2)
             open_file
-                .upgrade_access(access, &self.ufs, pool_size)
+                .upgrade_access(access, &self.ufs, pool_size, small_file_config)
                 .await?;
 
             Ok(())
@@ -966,7 +1083,10 @@ impl Nfs4FileSystem {
         );
 
         if is_last {
-            tracing::info!("CLOSE: Last reference, calling complete() for fileid={}", fileid);
+            tracing::info!(
+                "CLOSE: Last reference, calling complete() for fileid={}",
+                fileid
+            );
             // Call complete() to commit data
             open_file.complete().await?;
 
@@ -1052,13 +1172,19 @@ impl Nfs4FileSystem {
         Ok((fileid, status))
     }
 
+    /// Build child path string from parent path and child name
+    #[inline]
+    fn build_child_path_str(parent_path: &str, child_name: &str) -> String {
+        if parent_path == "/" {
+            format!("/{}", child_name)
+        } else {
+            format!("{}/{}", parent_path, child_name)
+        }
+    }
+
     /// Build child path from parent and name
     fn build_child_path(&self, parent: &Path, name: &str) -> Nfs4Result<Path> {
-        let child_str = if parent.path() == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", parent.path())
-        };
+        let child_str = Self::build_child_path_str(parent.path(), name);
         Path::new(&child_str).map_err(|_| Nfs4Status::Inval.into())
     }
 
@@ -1070,6 +1196,7 @@ impl Nfs4FileSystem {
         max_entries: usize,
     ) -> Nfs4Result<(Vec<(Fileid4, String, FileStatus)>, bool)> {
         let path = self.get_path(dir_id)?;
+        let parent_path = path.path();
 
         let entries = self.ufs.list_status(&path).await.map_err(Nfs4Error::from)?;
 
@@ -1080,35 +1207,23 @@ impl Nfs4FileSystem {
         // Filter and collect entries
         let result: Vec<_> = sorted
             .into_iter()
-            .filter(|s| {
-                // Generate consistent fileid using unified function
-                let child_path = if path.path() == "/" {
-                    format!("/{}", s.name)
-                } else {
-                    format!("{}/{}", path.path(), s.name)
-                };
-                let fileid = get_fileid_from_status(s, &child_path);
-                
-                fileid > cookie
-            })
-            .take(max_entries)
-            .map(|status| {
-                // Generate consistent fileid using unified function
-                let child_path = if path.path() == "/" {
-                    format!("/{}", status.name)
-                } else {
-                    format!("{}/{}", path.path(), status.name)
-                };
+            .filter_map(|status| {
+                let child_path = Self::build_child_path_str(parent_path, &status.name);
                 let fileid = get_fileid_from_status(status, &child_path);
-                
+
+                if fileid <= cookie {
+                    return None;
+                }
+
                 self.cache_path(fileid, child_path);
-                
+
                 // Create a modified status with the generated fileid
                 let mut modified_status = status.clone();
                 modified_status.id = fileid as i64;
-                
-                (fileid, status.name.clone(), modified_status)
+
+                Some((fileid, status.name.clone(), modified_status))
             })
+            .take(max_entries)
             .collect();
 
         let end = result.len() < max_entries;
@@ -1475,16 +1590,10 @@ impl Nfs4FileSystem {
         let mut reader = self.ufs.open(&path).await.map_err(Nfs4Error::from)?;
         let file_len = reader.len();
 
-        // Check bounds
-        if offset >= file_len as u64 {
-            return Ok((vec![], true));
-        }
-
-        // Calculate read size
-        let remaining = file_len as u64 - offset;
-        let read_count = count.min(remaining as u32);
-
-        if read_count == 0 {
+        // Check bounds and calculate read size
+        let (read_count, early_eof) = calculate_read_params(offset, count, file_len);
+        if early_eof {
+            reader.complete().await.map_err(Nfs4Error::from)?;
             return Ok((vec![], true));
         }
 
@@ -1495,8 +1604,7 @@ impl Nfs4FileSystem {
             .map_err(Nfs4Error::from)?;
 
         // Calculate EOF
-        let total_len: usize = slices.iter().map(|s| s.len()).sum();
-        let eof = total_len < count as usize || (offset + total_len as u64) >= file_len as u64;
+        let eof = is_eof(&slices, offset, count, file_len);
 
         // Complete reader
         reader.complete().await.map_err(Nfs4Error::from)?;
@@ -1624,20 +1732,43 @@ impl Nfs4FileSystem {
         }
 
         // Build SetAttrOpts for mode/owner/group changes
+        // Follow curvine-fuse pattern: use numeric string fallback when username/groupname lookup fails
+        // This aligns with curvine-fuse: fs/curvine_file_system.rs line 453-466
+        let owner_name =
+            uid.map(|u| orpc::sys::get_username_by_uid(u).unwrap_or_else(|| u.to_string()));
+        let group_name =
+            gid.map(|g| orpc::sys::get_groupname_by_gid(g).unwrap_or_else(|| g.to_string()));
+
+        tracing::info!(
+            "SETATTR: fileid={} path={} mode={:?} uid={:?} gid={:?} owner_name={:?} group_name={:?}",
+            fileid, path.path(), mode, uid, gid, owner_name, group_name
+        );
+
         let opts = curvine_common::state::SetAttrOpts {
             mode,
-            // Use function reference directly instead of closure (clippy::redundant_closure)
-            owner: uid.and_then(orpc::sys::get_username_by_uid),
-            group: gid.and_then(orpc::sys::get_groupname_by_gid),
+            owner: owner_name,
+            group: group_name,
             ..Default::default()
         };
 
         // Set attributes if any are specified
         if opts.mode.is_some() || opts.owner.is_some() || opts.group.is_some() {
+            tracing::info!(
+                "SETATTR: Calling ufs.set_attr with mode={:?} owner={:?} group={:?}",
+                opts.mode,
+                opts.owner,
+                opts.group
+            );
             self.ufs
                 .set_attr(&path, opts)
                 .await
                 .map_err(Nfs4Error::from)?;
+        } else {
+            tracing::warn!(
+                "SETATTR: No attributes to set (all None) - fileid={} path={}",
+                fileid,
+                path.path()
+            );
         }
 
         // Return updated status

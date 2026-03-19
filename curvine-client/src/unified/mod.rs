@@ -194,7 +194,7 @@ impl UfsFileSystem {
 
             (Provider::Opendal, Some(scheme))
                 if [
-                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs",
+                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
                 ]
                 .contains(&scheme) =>
             {
@@ -260,7 +260,10 @@ impl UfsFileSystem {
             // Other schemes with auto provider
             #[cfg(feature = "opendal")]
             (Provider::Auto, Some(scheme))
-                if ["s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs"].contains(&scheme) =>
+                if [
+                    "s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
+                ]
+                .contains(&scheme) =>
             {
                 let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::Opendal(fs))

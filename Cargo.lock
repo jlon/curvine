@@ -1110,7 +1110,6 @@ name = "curvine-ufs"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "bytes",
  "cc",

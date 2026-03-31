@@ -599,6 +599,90 @@ cargo test -p curvine-common proto_roundtrip_keeps -- --nocapture
 
 ---
 
+## 5.1 Reduced-Intrusion Follow-Up Placement
+
+The later reduced-intrusion work on `feature/p2p` must **not** become `p2p-18`.
+
+Reason:
+
+1. it does not introduce a new user-visible capability,
+2. it is mostly structure cleanup around already-planned read-path and runtime-service slices,
+3. a new standalone PR would create another dependency edge without reducing review risk.
+
+Split that work back into the existing late-series PRs as follows.
+
+### Placement A: fold the internal read-acceleration boundary into `p2p-14`
+
+This includes:
+
+- `curvine-client/src/file/read_accelerator.rs`
+- `curvine-client/src/file/mod.rs`
+- `curvine-client/src/file/fs_context.rs` read-acceleration ownership narrowing
+- `curvine-client/src/block/block_reader.rs` migration away from raw P2P request/cache internals
+
+Why `p2p-14`:
+
+- this code owns adaptive EWMA state, read-flight coordination, and local accelerated cache state,
+- it touches the exact same files already assigned to `p2p-14`,
+- it keeps the adaptive-performance PR internally coherent instead of spreading read-path internals across multiple late PRs.
+
+Rule:
+
+- keep this placement behavior-preserving,
+- do not mix proof-driver changes or generic caller migrations into `p2p-14`.
+
+### Placement B: fold public-surface narrowing into `p2p-15`
+
+This includes:
+
+- `curvine-client/src/file/curvine_filesystem.rs`
+- `curvine-client/src/unified/unified_filesystem.rs`
+- `curvine-client/src/unified/cache_sync_writer.rs`
+- `curvine-server/src/worker/task/task_manager.rs`
+- `curvine-fuse/src/fs/curvine_file_system.rs`
+- `curvine-fuse/src/fs/state/node_state.rs`
+- non-P2P harness callers that only adapt to the narrower filesystem API
+
+Why `p2p-15`:
+
+- this is runtime/service encapsulation hardening, not new validation material,
+- it finishes hiding raw `P2pService` and excess `FsContext` exposure behind filesystem-level APIs,
+- it keeps `p2p-17` from carrying product-path API churn.
+
+Rule:
+
+- do not force unrelated unified mount-model changes into this slice,
+- keep it limited to exposure narrowing and direct caller adaptation.
+
+### Placement C: keep harness-facing migrations in `p2p-17`
+
+This includes:
+
+- `curvine-cli/src/bin/p2p_proof_driver.rs`
+- `curvine-tests/tests/p2p_read_acceleration_test.rs`
+
+Why `p2p-17`:
+
+- these files are already owned by the validation/harness slice,
+- the changes only adapt harness code to the narrowed filesystem observation APIs.
+
+Rule:
+
+- if a harness change requires a new product API, land that API in `p2p-15` first,
+- only keep the harness-side callsite migration in `p2p-17`.
+
+### Explicit non-goal
+
+Do not create:
+
+- `p2p-18-reduced-intrusion`
+- a detached side PR for `FsContext` exposure cleanup
+- a style-only PR that only rewrites callsites to new helper methods
+
+That work is too cross-cutting for a safe standalone PR and is cleaner when absorbed by the owning late slices above.
+
+---
+
 ## 6. Commits That Must Not Become Standalone PRs
 
 Do **not** create separate PRs for these categories:
@@ -638,7 +722,110 @@ For every PR branch, execute this checklist in order.
 
 ---
 
-## 8. Reviewer Guidance
+## 8. Upstream Merge Order and Restack Rules
+
+The upstream PRs for this split series all target `CurvineIO/curvine:main`.
+
+That means:
+
+1. `p2p-01` is the only PR whose visible diff is naturally minimal against `main`.
+2. `p2p-02` and later PRs are cumulative against `main` until earlier PRs are merged and the remaining branches are restacked.
+3. Do **not** assume reviewers can infer the intended delta from the GitHub diff alone.
+
+### 8.1 Required Merge Order
+
+Merge the core chain in this exact order:
+
+1. `p2p-01`
+2. `p2p-02`
+3. `p2p-03`
+4. `p2p-04`
+5. `p2p-05`
+6. `p2p-06`
+7. `p2p-07`
+8. `p2p-08`
+9. `p2p-09`
+10. `p2p-10`
+11. `p2p-11`
+12. `p2p-13`
+13. `p2p-14`
+14. `p2p-15`
+15. `p2p-16`
+16. `p2p-17`
+
+`p2p-12` is still a detached side PR. Merge it after `p2p-11` when ready. It must not block `p2p-13` through `p2p-17`.
+
+### 8.2 Default Assumption: Restack After Every Upstream Merge
+
+Assume upstream will use `squash merge` or `rebase merge`, not merge commits.
+
+Under that assumption, every time one PR is merged upstream:
+
+1. fetch fresh `github/main`,
+2. restack every later unmerged branch,
+3. force-push those rewritten branches to the fork,
+4. let the corresponding upstream PRs refresh against the new branch tips.
+
+Do **not** wait until `p2p-01` and `p2p-02` both merge before restacking. Restack after each merged PR.
+
+Only skip restacking if the maintainer explicitly confirms that the series will be merged with real merge commits and the GitHub diffs have already collapsed as expected.
+
+### 8.3 Recommended Restack Method
+
+Before rewriting any branch, capture the current branch tips:
+
+```bash
+old_p2p_01=$(git rev-parse p2p-01-file-version-foundation)
+old_p2p_02=$(git rev-parse p2p-02-master-policy-protocol)
+old_p2p_03=$(git rev-parse p2p-03-p2p-config-surface)
+```
+
+After `p2p-01` merges upstream, restack like this:
+
+```bash
+git fetch github
+
+git switch p2p-02-master-policy-protocol
+git rebase --onto github/main "$old_p2p_01"
+git push --force-with-lease origin p2p-02-master-policy-protocol
+
+git switch p2p-03-p2p-config-surface
+git rebase --onto p2p-02-master-policy-protocol "$old_p2p_02"
+git push --force-with-lease origin p2p-03-p2p-config-surface
+```
+
+Continue the same pattern for the rest of the chain:
+
+- new parent = already-restacked immediate predecessor,
+- old parent = frozen pre-restack tip of that predecessor,
+- then `git push --force-with-lease`.
+
+If the chain becomes messy, stop and recreate the next branch from fresh `github/main` plus already-merged slices. Do not push through a confused rebase.
+
+### 8.4 Special Rule For `p2p-12`
+
+`p2p-12` depends on `p2p-11`, but `p2p-13` and later do not.
+
+That means:
+
+1. if `p2p-11` moves, restack `p2p-12` onto the new `p2p-11`,
+2. do not inject `p2p-12` into the core chain,
+3. if `p2p-12` is still open after `p2p-11` merges, retarget its effective content by restacking it separately.
+
+### 8.5 Mandatory Post-Merge Checks
+
+After each upstream merge and restack:
+
+1. verify the next PR diff visibly shrank,
+2. verify the next PR title/body still match the branch purpose,
+3. verify no later branch accidentally absorbed `p2p-12`,
+4. verify force-push completed before asking for the next review round.
+
+If any of these checks fail, stop and repair the branch stack before continuing review.
+
+---
+
+## 9. Reviewer Guidance
 
 Each PR description should explicitly answer these four questions:
 
@@ -651,7 +838,7 @@ If the PR description cannot answer those four questions cleanly, the PR is too 
 
 ---
 
-## 9. Stop Conditions
+## 10. Stop Conditions
 
 Stop and rescope if any of the following happens:
 
@@ -664,7 +851,7 @@ When a stop condition triggers, split the PR further or move code to a later PR.
 
 ---
 
-## 10. Final Recommendation
+## 11. Final Recommendation
 
 Use **17 PRs**, not 20.
 

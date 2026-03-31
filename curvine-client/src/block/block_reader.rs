@@ -14,20 +14,19 @@
 
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
-use crate::file::{FsContext, ReadChunkKey};
-use crate::p2p::ChunkId;
+use crate::client_metrics::{ReadFallbackReason, ReadSource};
+use crate::file::{AcceleratedReadRequest, FsContext, ReadChunkFlight};
 use bytes::Bytes;
 use curvine_common::error::FsError;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use log::warn;
-use orpc::common::Utils;
+use orpc::common::{LocalTime, Utils};
 use orpc::error::ErrorExt;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 enum ReaderAdapter {
     Local(BlockReaderLocal),
@@ -115,6 +114,14 @@ impl ReaderAdapter {
             Hole(r) => r.worker_address(),
         }
     }
+
+    fn source_tag(&self) -> ReadSource {
+        match self {
+            Local(_) => ReadSource::WorkerLocal,
+            Remote(_) => ReadSource::WorkerRemote,
+            Hole(_) => ReadSource::Hole,
+        }
+    }
 }
 
 pub struct BlockReader {
@@ -124,12 +131,22 @@ pub struct BlockReader {
     file_id: i64,
     file_version_epoch: i64,
     file_mtime: i64,
+    tenant_id: Option<String>,
+    job_id: Option<String>,
     fs_context: Arc<FsContext>,
 }
 
-type ReadChunkFlight = (Arc<AsyncMutex<()>>, OwnedMutexGuard<()>);
+struct ReadPipelineInput {
+    request: AcceleratedReadRequest,
+}
+
+enum ReadPipelineOutcome {
+    Data(DataSlice),
+    Retry,
+}
 
 impl BlockReader {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         fs_context: Arc<FsContext>,
         located: LocatedBlock,
@@ -137,6 +154,8 @@ impl BlockReader {
         file_id: i64,
         file_version_epoch: i64,
         file_mtime: i64,
+        tenant_id: Option<String>,
+        job_id: Option<String>,
     ) -> CommonResult<Self> {
         let len = located.block.len;
 
@@ -146,8 +165,16 @@ impl BlockReader {
             &fs_context.client_addr,
         )?;
 
-        let adapter =
-            Self::get_reader(&locs, located.block.clone(), fs_context.clone(), off, len).await?;
+        let adapter = Self::get_reader(
+            &locs,
+            located.block.clone(),
+            fs_context.clone(),
+            off,
+            len,
+            tenant_id.as_deref(),
+            job_id.as_deref(),
+        )
+        .await?;
 
         let reader = Self {
             inner: adapter,
@@ -156,6 +183,8 @@ impl BlockReader {
             file_id,
             file_version_epoch,
             file_mtime,
+            tenant_id,
+            job_id,
             fs_context,
         };
 
@@ -193,6 +222,8 @@ impl BlockReader {
         fs_context: Arc<FsContext>,
         off: i64,
         len: i64,
+        tenant_id: Option<&str>,
+        job_id: Option<&str>,
     ) -> FsResult<ReaderAdapter> {
         if locs.is_empty() && block.alloc_opts.is_some() {
             let reader = BlockReaderHole::new(fs_context.clone(), block.clone(), off, len)?;
@@ -223,6 +254,11 @@ impl BlockReader {
             match res {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    FsContext::get_metrics().observe_read_fallback(
+                        ReadFallbackReason::OpenReaderError,
+                        tenant_id,
+                        job_id,
+                    );
                     warn!("fail to create block reader for {}: {}", loc, e);
                 }
             }
@@ -238,52 +274,20 @@ impl BlockReader {
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            // end of block file
             return Ok(DataSlice::empty());
         }
-
-        let read_key = ReadChunkKey::new(
-            self.file_id,
-            self.file_version_epoch,
-            self.block.id,
-            self.pos(),
-        );
-        if let Some(chunk) = self.try_read_chunk_cache(&read_key)? {
-            return Ok(chunk);
+        loop {
+            let input = self.build_read_pipeline_input();
+            match self.execute_read_pipeline(&input).await? {
+                ReadPipelineOutcome::Data(data) => return Ok(data),
+                ReadPipelineOutcome::Retry => continue,
+            }
         }
-
-        let mut flight = self.acquire_read_chunk_flight(&read_key).await;
-        if let Some(chunk) = self.try_read_chunk_cache(&read_key)? {
-            self.release_read_chunk_flight(&read_key, &mut flight);
-            return Ok(chunk);
-        }
-
-        let chunk_id = ChunkId::with_version(
-            self.file_id,
-            self.file_version_epoch,
-            self.block.id,
-            self.pos(),
-        );
-        let expect_len = self
-            .remaining()
-            .min(self.fs_context.read_chunk_size() as i64)
-            .max(0) as usize;
-        if let Some(chunk) = self
-            .try_read_from_p2p(chunk_id, expect_len, &read_key)
-            .await?
-        {
-            self.release_read_chunk_flight(&read_key, &mut flight);
-            return Ok(chunk);
-        }
-
-        let chunk = self.read_from_worker(&read_key, chunk_id).await;
-        self.release_read_chunk_flight(&read_key, &mut flight);
-        chunk
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            return Ok(DataSlice::empty()); // end of block file
+            return Ok(DataSlice::empty());
         }
         rt.block_on(self.read())
     }
@@ -324,89 +328,146 @@ impl BlockReader {
         self.inner.block_id()
     }
 
-    async fn acquire_read_chunk_flight(&self, read_key: &ReadChunkKey) -> Option<ReadChunkFlight> {
-        if !self.fs_context.read_chunk_cache_enabled() {
-            return None;
-        }
-        let lock = self.fs_context.read_chunk_flight_lock(read_key.clone());
-        let guard = lock.clone().lock_owned().await;
-        Some((lock, guard))
+    async fn acquire_read_chunk_flight(
+        &self,
+        request: &AcceleratedReadRequest,
+    ) -> Option<ReadChunkFlight> {
+        self.fs_context
+            .read_accelerator()
+            .acquire_flight(request)
+            .await
     }
 
     fn release_read_chunk_flight(
         &self,
-        read_key: &ReadChunkKey,
+        request: &AcceleratedReadRequest,
         flight: &mut Option<ReadChunkFlight>,
     ) {
-        if let Some((lock, guard)) = flight.take() {
-            drop(guard);
-            self.fs_context.cleanup_read_chunk_flight(read_key, &lock);
-        }
+        self.fs_context
+            .read_accelerator()
+            .release_flight(request, flight);
     }
 
-    fn try_read_chunk_cache(&mut self, read_key: &ReadChunkKey) -> FsResult<Option<DataSlice>> {
-        let Some(cached) = self.fs_context.get_read_chunk_cache(read_key) else {
-            return Ok(None);
-        };
-        self.advance_cached_position(cached.len())?;
-        Ok(Some(DataSlice::bytes(cached)))
+    fn observe_read_source_metric(&self, source: ReadSource, bytes: usize, start_nanos: u128) {
+        self.observe_read_source_metric_with_adaptive(source, Some(source), bytes, start_nanos);
+    }
+
+    fn observe_read_source_metric_with_adaptive(
+        &self,
+        source: ReadSource,
+        adaptive_source: Option<ReadSource>,
+        bytes: usize,
+        start_nanos: u128,
+    ) {
+        if let Some(adaptive_source) = adaptive_source {
+            self.fs_context
+                .read_accelerator()
+                .observe_adaptive_read_latency(adaptive_source, start_nanos);
+        }
+        FsContext::get_metrics().observe_read_source(
+            source,
+            bytes,
+            start_nanos,
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
+        );
+    }
+
+    fn observe_read_fallback_metric(&self, reason: ReadFallbackReason) {
+        FsContext::get_metrics().observe_read_fallback(
+            reason,
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
+        );
+    }
+
+    fn try_read_chunk_cache(
+        &mut self,
+        request: &AcceleratedReadRequest,
+    ) -> FsResult<Option<DataSlice>> {
+        let start = LocalTime::nanos();
+        if let Some(cached) = self
+            .fs_context
+            .read_accelerator()
+            .try_read_local_chunk(request)
+        {
+            self.advance_cached_position(cached.len())?;
+            self.observe_read_source_metric(ReadSource::LocalChunkCache, cached.len(), start);
+            return Ok(Some(DataSlice::bytes(cached)));
+        }
+        Ok(None)
+    }
+
+    async fn try_read_from_p2p_cached(
+        &mut self,
+        request: &AcceleratedReadRequest,
+    ) -> FsResult<Option<DataSlice>> {
+        let start = LocalTime::nanos();
+        if let Some(data) = self
+            .fs_context
+            .read_accelerator()
+            .try_read_cached_p2p(request)
+            .await
+        {
+            self.advance_cached_position(data.len())?;
+            self.observe_read_source_metric_with_adaptive(ReadSource::P2p, None, data.len(), start);
+            return Ok(Some(DataSlice::bytes(data)));
+        }
+        Ok(None)
     }
 
     async fn try_read_from_p2p(
         &mut self,
-        chunk_id: ChunkId,
-        expect_len: usize,
-        read_key: &ReadChunkKey,
+        request: &AcceleratedReadRequest,
     ) -> FsResult<Option<DataSlice>> {
-        if expect_len == 0 || !matches!(&self.inner, Remote(_)) {
-            return Ok(None);
-        }
-        let Some(service) = self.fs_context.p2p_service() else {
-            return Ok(None);
-        };
-        if let Some(cached) = service
-            .fetch_chunk(chunk_id, expect_len, Some(self.file_mtime))
-            .await
+        let start = LocalTime::nanos();
+        if let Some(hit) = self
+            .fs_context
+            .read_accelerator()
+            .try_read_network_p2p(request)
+            .await?
         {
-            self.advance_cached_position(cached.len())?;
-            self.fs_context
-                .put_read_chunk_cache(read_key.clone(), cached.clone());
-            return Ok(Some(DataSlice::bytes(cached)));
+            let (data, adaptive_source) = hit.into_parts();
+            self.advance_cached_position(data.len())?;
+            self.observe_read_source_metric_with_adaptive(
+                ReadSource::P2p,
+                adaptive_source,
+                data.len(),
+                start,
+            );
+            return Ok(Some(DataSlice::bytes(data)));
         }
-        if service.conf().fallback_worker_on_fail {
-            Ok(None)
-        } else {
-            err_box!("p2p read miss and worker fallback is disabled")
+        Ok(None)
+    }
+
+    fn normalize_worker_chunk(chunk: DataSlice) -> Bytes {
+        match chunk.freeze() {
+            DataSlice::Bytes(bytes) => bytes,
+            DataSlice::Empty => Bytes::new(),
+            other => Bytes::copy_from_slice(other.as_slice()),
         }
     }
 
-    async fn read_from_worker(
-        &mut self,
-        read_key: &ReadChunkKey,
-        chunk_id: ChunkId,
-    ) -> FsResult<DataSlice> {
-        loop {
-            match self.inner.read().await {
-                Ok(chunk) => {
-                    if !chunk.is_empty() {
-                        self.fs_context.on_worker_chunk_read(
-                            read_key.clone(),
-                            chunk_id,
-                            Bytes::copy_from_slice(chunk.as_slice()),
-                            self.file_mtime,
-                        );
-                    }
-                    return Ok(chunk);
-                }
-                Err(e) => {
-                    self.handle_worker_read_error(e).await?;
-                }
-            }
+    async fn read_from_worker(&mut self, request: &AcceleratedReadRequest) -> FsResult<DataSlice> {
+        let start = LocalTime::nanos();
+        let bytes = Self::normalize_worker_chunk(self.inner.read().await?);
+        if !bytes.is_empty() {
+            self.fs_context
+                .read_accelerator()
+                .on_worker_chunk_read(request, bytes.clone());
         }
+        self.observe_read_source_metric(request.source(), bytes.len(), start);
+        Ok(DataSlice::bytes(bytes))
     }
 
     async fn handle_worker_read_error(&mut self, e: FsError) -> FsResult<()> {
         if matches!(&self.inner, Hole(_)) || self.locs.is_empty() {
+            let reason = if matches!(&self.inner, Hole(_)) {
+                ReadFallbackReason::HoleReadError
+            } else {
+                ReadFallbackReason::AllWorkersFailed
+            };
+            self.observe_read_fallback_metric(reason);
             return Err(e.ctx(format!(
                 "failed to read block on {}",
                 self.inner.worker_address()
@@ -423,17 +484,77 @@ impl BlockReader {
         self.inner.abort().await;
         self.locs.retain(|x| x != &failed_addr);
         if self.locs.is_empty() {
+            self.observe_read_fallback_metric(ReadFallbackReason::AllWorkersFailed);
             return Err(e.ctx(format!("failed to read block on {}", failed_addr)));
         }
+        self.observe_read_fallback_metric(ReadFallbackReason::SwitchReplica);
         self.inner = Self::get_reader(
             &self.locs,
             self.block.clone(),
             self.fs_context.clone(),
             self.pos(),
             self.len(),
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
         )
         .await?;
         Ok(())
+    }
+
+    fn build_read_pipeline_input(&self) -> ReadPipelineInput {
+        let read_off = self.pos();
+        let version_epoch = self.file_version_epoch.max(0);
+        let block_id = self.block.id;
+        ReadPipelineInput {
+            request: AcceleratedReadRequest::new(
+                self.file_id,
+                version_epoch,
+                block_id,
+                read_off,
+                self.remaining()
+                    .min(self.fs_context.read_chunk_size() as i64)
+                    .max(0) as usize,
+                self.file_mtime,
+                self.inner.source_tag(),
+                self.tenant_id.clone(),
+                self.job_id.clone(),
+            ),
+        }
+    }
+
+    async fn execute_read_pipeline(
+        &mut self,
+        input: &ReadPipelineInput,
+    ) -> FsResult<ReadPipelineOutcome> {
+        if let Some(data) = self.try_read_chunk_cache(&input.request)? {
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+        if let Some(data) = self.try_read_from_p2p_cached(&input.request).await? {
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        let mut flight = self.acquire_read_chunk_flight(&input.request).await;
+        if let Some(data) = self.try_read_chunk_cache(&input.request)? {
+            self.release_read_chunk_flight(&input.request, &mut flight);
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        if let Some(data) = self.try_read_from_p2p(&input.request).await? {
+            self.release_read_chunk_flight(&input.request, &mut flight);
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        match self.read_from_worker(&input.request).await {
+            Ok(data) => {
+                self.release_read_chunk_flight(&input.request, &mut flight);
+                Ok(ReadPipelineOutcome::Data(data))
+            }
+            Err(e) => {
+                self.release_read_chunk_flight(&input.request, &mut flight);
+                self.handle_worker_read_error(e).await?;
+                Ok(ReadPipelineOutcome::Retry)
+            }
+        }
     }
 
     fn advance_cached_position(&mut self, len: usize) -> FsResult<()> {
@@ -447,12 +568,14 @@ impl BlockReader {
 mod tests {
     use super::*;
     use crate::block::block_reader::ReaderAdapter::Remote;
+    use crate::p2p::ChunkId;
     use curvine_common::conf::ClusterConf;
     use curvine_common::error::FsError;
     use curvine_common::state::{
         FileAllocMode, FileAllocOpts, FileType, StorageType, WorkerAddress,
     };
     use once_cell::sync::Lazy;
+    use tokio::time::{sleep, timeout, Duration, Instant};
 
     static TEST_RT: Lazy<Arc<Runtime>> = Lazy::new(|| {
         let conf = ClusterConf::default();
@@ -474,6 +597,77 @@ mod tests {
         }
     }
 
+    async fn wait_until_cached(fs_context: &FsContext, timeout_budget: Duration) -> bool {
+        let deadline = Instant::now() + timeout_budget;
+        while Instant::now() < deadline {
+            if fs_context
+                .p2p_stats_snapshot()
+                .is_some_and(|snapshot| snapshot.cached_chunks_count > 0)
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn cached_p2p_hit_bypasses_read_chunk_flight() {
+        let mut conf = ClusterConf::default();
+        conf.client.read_chunk_size = 4;
+        conf.client.p2p.enable = true;
+        let fs_context =
+            Arc::new(FsContext::with_rt(conf, TEST_RT.clone()).expect("fs context should build"));
+        let block = ExtendedBlock::new(7, 4, StorageType::Disk, FileType::File);
+        let chunk_id = ChunkId::with_version(11, 3, block.id, 0);
+        let mtime = 17;
+        assert_eq!(fs_context.p2p_state(), Some(crate::p2p::P2pState::Running));
+        assert!(fs_context.read_accelerator().publish_p2p_chunk(
+            chunk_id,
+            Bytes::from_static(b"ping"),
+            mtime
+        ));
+        assert!(wait_until_cached(&fs_context, Duration::from_secs(1)).await);
+        let request = AcceleratedReadRequest::new(
+            11,
+            3,
+            block.id,
+            0,
+            4,
+            mtime,
+            ReadSource::WorkerRemote,
+            None,
+            None,
+        );
+
+        let _held_flight = fs_context.read_accelerator().acquire_flight(&request).await;
+
+        let mut reader = BlockReader {
+            inner: Hole(BlockReaderHole::new(fs_context.clone(), block.clone(), 0, 4).unwrap()),
+            locs: Vec::new(),
+            block: block.clone(),
+            file_id: 11,
+            file_version_epoch: 3,
+            file_mtime: mtime,
+            tenant_id: None,
+            job_id: None,
+            fs_context: fs_context.clone(),
+        };
+        let input = ReadPipelineInput { request };
+
+        let outcome = timeout(
+            Duration::from_millis(50),
+            reader.execute_read_pipeline(&input),
+        )
+        .await
+        .expect("cached p2p hit should not wait for read chunk flight")
+        .expect("pipeline should succeed");
+        let ReadPipelineOutcome::Data(data) = outcome else {
+            panic!("expected cached data");
+        };
+        assert_eq!(data.as_slice(), b"ping");
+    }
+
     #[tokio::test]
     async fn last_replica_read_failure_does_not_turn_allocated_block_into_hole() {
         let fs_context = test_fs_context();
@@ -493,6 +687,8 @@ mod tests {
             file_id: 11,
             file_version_epoch: 3,
             file_mtime: 17,
+            tenant_id: None,
+            job_id: None,
             fs_context,
         };
 

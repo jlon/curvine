@@ -18,9 +18,13 @@ use crate::nfs4::CompoundHandler;
 use crate::protocol::rpc::auth_unix;
 use crate::server::transaction::TransactionTracker;
 use crate::vfs::NFSFileSystem;
+use anyhow::Error;
 use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::bytes::Bytes;
+
+pub type OutboundTx = mpsc::UnboundedSender<Result<Bytes, Error>>;
 
 /// Context for processing RPC requests
 #[derive(Clone)]
@@ -41,6 +45,8 @@ pub struct RPCContext {
     pub export_name: Arc<String>,
     /// Transaction tracker for retransmission detection
     pub transaction_tracker: Arc<TransactionTracker>,
+    /// Raw outbound channel for replies and server-initiated callbacks
+    pub outbound_tx: Option<OutboundTx>,
 }
 
 impl fmt::Debug for RPCContext {
@@ -50,6 +56,7 @@ impl fmt::Debug for RPCContext {
             .field("client_addr", &self.client_addr)
             .field("auth", &self.auth)
             .field("nfs4_enabled", &self.nfs4_handler.is_some())
+            .field("has_outbound_tx", &self.outbound_tx.is_some())
             .finish()
     }
 }

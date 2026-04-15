@@ -9,7 +9,7 @@
 ### 0.2 开发环境
 
 **参考实现**:
-- NFS-Ganesha: `/home/oppo/Documents/nfs-ganesha/src/Protocols/NFS`
+- NFS-Ganesha: `/tmp/nfs-ganesha/src/Protocols/NFS`
 - 核心参考文件:
   - `nfs4_op_open.c`: OPEN 操作和 CLAIM_PREVIOUS 处理
   - `nfs4_op_delegreturn.c`: DELEGRETURN 操作
@@ -44,6 +44,8 @@ sudo mount -t nfs -o vers=4.1,port=2049,tcp,resvport 127.0.0.1:/ /mnt/curvine-nf
 3. **性能优先**: 在保证正确性的前提下，优化性能（如 lock-free 设计）
 4. **可维护性**: 代码结构清晰，注释详细，便于后续维护和扩展
 
+> 2026-04-15 实现状态补充：Curvine 已经打通 delegation 主路径，包括授予判断、冲突触发 recall、`DELEGRETURN`、超时回收、revoked-state 跟踪、`FREE_STATEID` 清理，以及 `SEQUENCE` 中的 revoked-state 标志报告。`OPEN` 现在也支持 `CLAIM_DELEGATE_CUR` 和 `CLAIM_DELEG_CUR_FH`。`BIND_CONN_TO_SESSION` 还能在 Curvine 进程内建立可用的 backchannel 队列，发送最小 `CB_COMPOUND [CB_SEQUENCE, CB_RECALL]`，并在收到 reply 后释放 callback slot；仍待补齐的是 `CLAIM_DELEGATE_PREV`、persisted delegation recovery 和完整 on-wire callback 互操作细节。
+
 ## 1. 概述
 
 ### 1.1 客户端和服务端的 Delegation 支持
@@ -59,6 +61,8 @@ sudo mount -t nfs -o vers=4.1,port=2049,tcp,resvport 127.0.0.1:/ /mnt/curvine-nf
 
 **服务端方面**：
 - ✅ **配置开关**：服务端通过 `delegation_enabled` 配置项控制是否启用 delegation（默认：`false`）
+- ✅ **主路径已接通**：授予判断、冲突触发 recall、`DELEGRETURN`、超时回收、`stateid` 校验、`SEQUENCE` revoked-state 标志报告、匿名 special-stateid I/O gate
+- ⚠️ **仍待补齐**：更完整的 on-wire backchannel 互操作细节、文件类型/FSAL gate、NLM gate
 - ✅ **多层判断逻辑**：
   1. **全局开关检查**：`delegations.is_enabled()` - 服务端是否启用 delegation
   2. **客户端请求检查**：检查 OPEN 操作中的 `want_flags` 是否包含 delegation 请求
@@ -363,8 +367,8 @@ bool deleg_supported(struct fsal_obj_handle *obj,
 **Curvine-nfs 当前实现**：
 - ✅ 全局开关检查：`is_enabled()`
 - ✅ 客户端请求检查：`want_flags` 检查
-- ⚠️ 文件类型检查：当前未实现（TODO）
-- ⚠️ FSAL 支持检查：当前未实现（TODO）
+- ⚠️ 文件类型检查：仍需继续对齐 Ganesha 的 gate 规则
+- ⚠️ FSAL 支持检查：仍需继续对齐 Ganesha 的 gate 规则
 
 #### 5.1.4 第四层：技术可行性检查（can_grant）
 
@@ -377,7 +381,7 @@ fn can_grant(&self, fileid: Fileid4) -> bool {
     }
     
     // TODO: 检查锁冲突（NLM locks）
-    // TODO: 检查匿名操作（anonymous operations）
+    // ✅ 已接通：匿名 special-stateid I/O 会阻止 delegation 授予
     
     true
 }
@@ -385,8 +389,9 @@ fn can_grant(&self, fileid: Fileid4) -> bool {
 
 **检查项**：
 - ✅ 文件是否已有 delegation（已实现）
-- ❌ NLM 锁冲突检查（待实现）
-- ❌ 匿名操作检查（待实现）
+- ✅ 冲突触发 recall 与后续 revocation / cleanup（已接入主路径）
+- ✅ 匿名 special-stateid I/O 检查（已实现）
+- ❌ NLM 锁冲突检查（待继续对齐）
 
 #### 5.1.5 第五层：策略决策检查（should_grant）
 
@@ -463,20 +468,18 @@ fn should_grant(&self, _clientid: Clientid4, _fileid: Fileid4, _want_flags: u32)
         return false;
     }
 
-    // ❌ 待实现：检查客户端 revoke 计数
-    // ❌ 待实现：检查最近 recall 历史（RECALL2DELEG_TIME = 10s）
-    // ❌ 待实现：检查写冲突（num_write_opens）
-    // ❌ 待实现：检查 Backchannel 状态
+    // ✅ 主路径已接通：冲突触发 recall、DELEGRETURN、timeout revoke、stateid 验证、
+    //    SEQUENCE revoked-state 标志报告
+    // ⚠️ 仍待对齐：文件类型/FSAL gate、NLM gate、更完整的 backchannel 互操作
 
     true
 }
 ```
 
 **实现优先级**：
-1. ✅ **已完成**：全局开关、客户端请求检查、最大数量限制
-2. ⚠️ **待实现**：文件类型检查、Backchannel 状态检查
-3. ⚠️ **待实现**：客户端行为检查（num_revokes）、recall 历史检查
-4. ⚠️ **待实现**：写冲突检查（num_write_opens）
+1. ✅ **已完成**：全局开关、客户端请求检查、最大数量限制、主路径 recall/return/revoke 链路
+2. ⚠️ **待完善**：文件类型/FSAL gate、Backchannel on-wire 状态
+3. ⚠️ **待完善**：客户端行为检查（num_revokes）、recall 历史检查、写冲突检查（num_write_opens）
 
 ### 5.2 Delegation 统计信息
 
@@ -532,6 +535,8 @@ CB_COMPOUND {
 }
 ```
 
+> 当前 Curvine 已有回收与撤销的逻辑链路，但 backchannel 仍不是完整的 on-wire RPC 实现，因此这里不能写成完整的 CB_* 互操作。
+
 ### 6.2 Backchannel 连接管理
 
 ```rust
@@ -556,16 +561,16 @@ pub struct BackchannelConn {
 
 ### 7.1 当前状态
 
-Curvine NFS Gateway 已有基础的 Delegation 框架：
-- `delegation.rs`: DelegationManager 实现
-- `backchannel.rs`: BackchannelManager 框架
+Curvine NFS Gateway 已完成 Delegation 主路径：
+- `delegation.rs`: DelegationManager 实现，覆盖授予、冲突 recall、DELEGRETURN、timeout revocation、revoked-state cleanup
+- `backchannel.rs`: BackchannelManager 已支持 session 注册、队列投递和状态切换，真实 on-wire callback RPC 仍未完整
 
 ### 7.2 需要增强的部分
 
-1. **Backchannel 实际连接**：当前是空实现，需要实现真正的 RPC 回调
-2. **文件统计信息**：需要跟踪 `FileStats` 用于启发式决策
-3. **客户端行为跟踪**：需要跟踪 `num_revokes` 等指标
-4. **Grace Period 集成**：服务器重启后的 delegation 恢复（已实现基础框架）
+1. **Backchannel 实际连接**：当前仍缺真实 on-wire RPC 回调
+2. **文件统计信息**：需要继续跟踪 `FileStats` 用于启发式决策
+3. **客户端行为跟踪**：需要继续跟踪 `num_revokes` 等指标
+4. **Delegation 恢复**：`CLAIM_DELEGATE_PREV`、持久化 delegation state 仍待补齐
 
 ## 8. 状态恢复（State Recovery）
 
@@ -796,6 +801,7 @@ if handler.grace.in_grace() {
 - CLAIM_PREVIOUS 验证逻辑
 - EXCHANGE_ID 时设置 allow_reclaim
 - Open state 的查找和恢复
+- FREE_STATEID：空 lock stateid 与 revoked delegation cleanup
 
 ⏳ **待实现**:
 - Lock state 的恢复（当前仅加载，未恢复）
@@ -803,21 +809,22 @@ if handler.grace.in_grace() {
   - CLAIM_DELEGATE_PREV 支持
   - Delegation state 持久化
   - 恢复时的 pre-recall 处理
+- 真实 on-wire backchannel RPC
 - 多实例部署时的状态同步
 
 ### 8.9 Delegation 恢复的特殊考虑
 
 #### 8.9.1 CLAIM_DELEGATE_PREV
 
-当前实现**不支持** `CLAIM_DELEGATE_PREV`（返回 `NFS4ERR_NOTSUPP`），原因：
+当前 Curvine 已经打通 delegation 主路径，但 `CLAIM_DELEGATE_PREV` 仍未闭环，因为它依赖 persisted delegation state 和真实 on-wire backchannel RPC。当前实现的边界是：
 
-1. **复杂性**：Delegation 恢复需要处理 backchannel 状态
-2. **Pre-recall 机制**：恢复的 delegation 需要标记为 pre-recall，等待客户端确认
-3. **状态同步**：需要确保 delegation state 与 open state 的一致性
+1. **主路径已实现**：授予、冲突 recall、`DELEGRETURN`、超时 revocation、`stateid` 校验、`SEQUENCE` revoked-state 标志报告
+2. **恢复语义未闭环**：缺少 persisted delegation state 的加载与恢复
+3. **回调链路未闭环**：缺少真实 backchannel RPC，因此 pre-recall 无法写成完整互操作路径
 
 #### 8.9.2 未来实现方向
 
-如果未来需要支持 delegation 恢复，需要：
+如果未来需要把 delegation 恢复补完整，需要：
 
 1. **持久化 Delegation State**:
    ```rust
@@ -836,7 +843,7 @@ if handler.grace.in_grace() {
    - 等待客户端通过 backchannel 确认
 
 3. **Backchannel 状态检查**:
-   - 如果 backchannel 未建立，允许恢复但标记 pre-recall
+   - 补齐真实 on-wire backchannel RPC
    - 参考 NFS-Ganesha: `should_we_grant_deleg()` 中的处理逻辑
 
 ### 7.3 配置选项
@@ -861,9 +868,12 @@ pub struct DelegationConfig {
 | 授予 Read Delegation | OPEN(file, WANT_READ_DELEG) | 返回 READ_DELEGATION |
 | 授予 Write Delegation | OPEN(file, WANT_WRITE_DELEG), 无其他打开 | 返回 WRITE_DELEGATION |
 | 拒绝 (已有 delegation) | OPEN(file, WANT_DELEG), 文件已有 delegation | 返回 OPEN_DELEGATE_NONE |
-| 回收 (写冲突) | Client A 持有 Read Deleg, Client B OPEN(WRITE) | CB_RECALL 发送给 A |
-| 超时回收 | CB_RECALL 后 30s 无响应 | Delegation 被强制回收 |
+| 回收 (写冲突) | Client A 持有 Read Deleg, Client B OPEN(WRITE) | 触发 recall，并进入 revocation 流程 |
+| 超时回收 | recall 后 30s 无响应 | Delegation 被强制 revocation |
 | 客户端归还 | DELEGRETURN(stateid) | Delegation 被移除 |
+| 空 lock stateid 释放 | FREE_STATEID(empty lock stateid) | 空 lock stateid 被清理 |
+| revoked delegation 清理 | FREE_STATEID(revoked delegation) | revoked tracking 被清理 |
+| revoked state 报告 | SEQUENCE(revoked stateid) | 返回 revoked-state flag |
 | Lease 过期 | 客户端 lease 过期 | 所有 delegation 被回收 |
 
 ## 10. 性能考虑
@@ -888,17 +898,18 @@ pub struct DelegationConfig {
 
 ## 11. 总结
 
-Delegation 是一个强大的性能优化特性，但也增加了系统复杂性。当前 Curvine NFS Gateway 的实现已经有了基础框架，主要缺失的是：
+Delegation 是一个强大的性能优化特性，但也增加了系统复杂性。当前 Curvine NFS Gateway 已经打通了 delegation 主路径，主要剩余缺口是：
 
-1. **Backchannel 实际实现**：需要实现 RPC 回调机制
-2. **启发式决策**：需要实现完整的 `should_we_grant_deleg()` 逻辑
-3. **统计信息跟踪**：需要跟踪文件和客户端的统计信息
+1. **Backchannel on-wire RPC**：需要实现真实的回调网络链路
+2. **Delegation 恢复**：`CLAIM_DELEGATE_PREV` 和 persisted delegation state 仍未闭环
+3. **启发式决策细化**：需要继续收口文件类型/FSAL/NLM gate
+4. **统计信息跟踪**：需要继续跟踪文件和客户端的统计信息
 
 建议按以下优先级实现：
-1. P0: 保持当前禁用状态，确保基本功能稳定
-2. P1: 实现 Backchannel 连接管理
-3. P2: 实现完整的启发式决策逻辑
-4. P3: 添加 delegation 统计和监控
+1. P0: 补齐 Backchannel on-wire RPC
+2. P1: 打通 Delegation 恢复和 `CLAIM_DELEGATE_PREV`
+3. P2: 完善启发式决策和统计信息
+4. P3: 添加 delegation 监控和压测
 
 ---
 

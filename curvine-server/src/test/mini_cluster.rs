@@ -324,6 +324,7 @@ impl MiniCluster {
             let mut worker = conf.clone();
             worker.worker.rpc_port = Self::reserve_test_port();
             worker.worker.web_port = Self::reserve_test_port();
+            worker.worker.nfs_gateway_port = Self::reserve_test_port();
 
             let mut dirs = vec![];
             for item in worker.worker.data_dir {

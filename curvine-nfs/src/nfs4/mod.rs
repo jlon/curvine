@@ -44,6 +44,7 @@ pub mod error;
 pub mod fs;
 pub mod handlers;
 pub mod ops; // NFSv4 operation handlers (mirrors nfs-ganesha/src/Protocols/NFS/)
+pub mod pnfs;
 pub mod session;
 pub mod state;
 pub mod types;

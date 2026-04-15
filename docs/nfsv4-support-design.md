@@ -107,6 +107,8 @@ Delegation 的安全性保证：
   关键：服务器可以随时收回 delegation，保证一致性！
 ```
 
+Curvine 现在已经把 delegation 主路径落地：OPEN 授予、冲突 recall、DELEGRETURN、超时 revocation、FREE_STATEID 收尾、stateid 验证和 SEQUENCE revoked-state 报告都在链路里。`BIND_CONN_TO_SESSION` 也已经能在 Curvine 进程内建立可用的 backchannel 队列，发送最小 `CB_COMPOUND [CB_SEQUENCE, CB_RECALL]`，并在 reply 后释放 callback slot。当前仍不完整的是更完整的 callback 互操作细节和 delegation recovery，所以恢复和回调语义还没有完全闭环。
+
 **真实场景**:
 - `make` 编译：频繁检查文件时间戳
 - `git status`：检查大量文件状态
@@ -202,10 +204,14 @@ Grace Period 的作用:
 | **Stateid 版本管理** | 🔴 高 | 每次操作 stateid.seqid 必须递增 |
 | **Share Reservation** | 🟡 中 | OPEN 的 deny 模式，防止冲突访问 |
 | **Open Upgrade/Downgrade** | 🟡 中 | 同一文件多次 OPEN 的处理 |
-| **Persistent State** | 🟡 中 | 状态持久化到磁盘，支持服务器重启 |
+| **Delegation 恢复持久化** | 🟡 中 | open state 持久化已有框架，仍需补齐 delegation state 持久化 |
+| **Backchannel on-wire RPC** | 🔴 高 | Delegation 主路径已完成，但真实回调链路还未完整 |
+| **Delegation 恢复** | 🟡 中 | `CLAIM_DELEGATE_PREV` 和 persisted delegation state 仍待闭环 |
 | **ACL 支持** | 🟢 低 | NFSv4 ACL，比 Unix mode 更细粒度 |
 
 ## 1. 设计目标（修订版）
+
+> 2026-04-15 实现状态补充：Curvine 已实现 `TEST_STATEID`、`DESTROY_CLIENTID`、`FREE_STATEID`，delegation 主路径也已包含授予、冲突触发 recall、`DELEGRETURN`、超时回收和 revoked-state 清理；`OPEN` 已支持 `CLAIM_DELEGATE_CUR` 和 `CLAIM_DELEG_CUR_FH`。仍待补的是真实 on-wire backchannel 互操作细节、`CLAIM_DELEGATE_PREV` 和 delegation 持久化恢复。
 
 基于以上反思，重新定义目标：
 
@@ -223,8 +229,8 @@ Grace Period 的作用:
 
 | 特性 | 价值 | 复杂度 |
 |------|------|--------|
-| Delegation | 客户端缓存优化，减少 GETATTR | 高 |
-| Backchannel | Delegation 的前提 | 高 |
+| Delegation 主路径 | 客户端缓存优化，减少 GETATTR | 高 |
+| Backchannel on-wire RPC | Delegation 的前提 | 高 |
 | Share Reservation | 防止冲突的文件访问模式 | 中 |
 | Grace Period | 服务器重启后的状态恢复 | 中 |
 
@@ -232,10 +238,10 @@ Grace Period 的作用:
 
 | 特性 | 原因 |
 |------|------|
-| pNFS | Worker 没有 NFS 服务，实现成本高 |
+| pNFS 数据面 | metadata plane 已启动，但 Worker 仍没有真实 DS NFS 服务 |
 | Directory Delegation | 复杂度高，收益有限 |
 | NFSv4 ACL | Unix mode 够用 |
-| Persistent State | 先实现内存版本 |
+| Delegation Recovery | 复杂度高，先完成 delegation 主路径 |
 
 ## 2. 核心概念详解
 
@@ -1168,9 +1174,9 @@ sequenceDiagram
 | 任务 | 文件 | 说明 |
 |------|------|------|
 | ClientManager | `state/client.rs` | EXCHANGE_ID, 客户端确认 |
-| SessionManager | `session/manager.rs` | CREATE_SESSION, DESTROY_SESSION |
-| Slot 管理 | `session/slot.rs` | SEQUENCE, replay 检测 |
-| LeaseManager | `session/lease.rs` | 续租, 过期检测 |
+| SessionManager | `nfs4/session.rs` | CREATE_SESSION, DESTROY_SESSION |
+| Slot 管理 | `nfs4/session.rs` | SEQUENCE, replay 检测 |
+| LeaseManager | `state/lease.rs` | 续租, 过期检测 |
 
 ### Phase 3: 文件操作 (2 周)
 
@@ -1193,9 +1199,10 @@ sequenceDiagram
 
 | 任务 | 文件 | 说明 |
 |------|------|------|
-| DelegationManager | `state/delegation.rs` | 授予, 回收 |
-| BackchannelManager | `session/backchannel.rs` | CB_COMPOUND, CB_RECALL |
-| Delegation 操作 | `nfs4/ops/delegation.rs` | DELEGRETURN, WANT_DELEGATION |
+| DelegationManager | `nfs4/delegation.rs` | 授予, 回收, timeout revocation, revoked-state cleanup |
+| BackchannelManager | `nfs4/backchannel.rs` | CB_COMPOUND, CB_RECALL（真实 on-wire 仍在补齐） |
+| Delegation 操作 | `nfs4/ops/open.rs`, `nfs4/handlers.rs` | OPEN delegation request, DELEGRETURN, FREE_STATEID |
+| 状态管理补充 | `nfs4/handlers.rs`, `nfs4/state/*` | TEST_STATEID, DESTROY_CLIENTID |
 
 ### Phase 6: 状态恢复 (1 周)
 
@@ -1203,6 +1210,9 @@ sequenceDiagram
 |------|------|------|
 | GracePeriodManager | `state/grace.rs` | Grace period 管理 |
 | 恢复操作 | `nfs4/ops/recovery.rs` | CLAIM_PREVIOUS, RECLAIM_COMPLETE |
+| Delegation 恢复待补 | `nfs4/ops/open.rs`, `nfs4/delegation.rs` | CLAIM_DELEGATE_PREV, persisted delegation, pre-recall |
+
+> 当前实现状态：Delegation 主路径已经在 Curvine 中落地，Phase 5 还剩下的是 backchannel on-wire RPC 和 delegation 恢复闭环。
 
 ### Phase 7: 测试和优化 (2 周)
 
@@ -1260,7 +1270,7 @@ sequenceDiagram
 
 | 原则 | 应用 |
 |------|------|
-| **KISS** | 不做 pNFS，聚焦核心特性 |
+| **KISS** | 先做 pNFS metadata plane，不提前扩张到 DS 写路径 |
 | **YAGNI** | 不做 Directory Delegation, ACL |
 | **DRY** | 复用 FuseReader/FuseWriter |
 | **SRP** | 每个 Manager 单一职责 |

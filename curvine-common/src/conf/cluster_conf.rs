@@ -356,6 +356,10 @@ pub struct NfsGatewayConf {
     /// If 0, will use current timestamp
     pub cluster_generation: u64,
 
+    /// Shared secret used to sign pNFS DS block filehandles
+    /// Must match on the MDS and all worker-side DS gateways
+    pub pnfs_ds_secret: Option<String>,
+
     /// Default UID when owner cannot be resolved (default: 65534 = nobody)
     pub default_uid: u32,
 
@@ -448,8 +452,9 @@ impl Default for NfsGatewayConf {
             listen_port: 2049,
             export_path: "/".to_string(),
             cluster_generation: 0, // 0 means use timestamp
-            default_uid: 65534,    // nobody
-            default_gid: 65534,    // nogroup
+            pnfs_ds_secret: None,
+            default_uid: 65534, // nobody
+            default_gid: 65534, // nogroup
             max_handles: 10000,
             handle_idle_timeout_secs: 60,
             path_cache_size: 100000,

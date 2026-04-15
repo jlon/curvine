@@ -109,6 +109,8 @@ pub enum LockStateStatus {
 pub struct LockState {
     /// Lock stateid
     pub stateid: Stateid4,
+    /// File that owns this lock state (Ganesha state_t is per-object).
+    pub fileid: Fileid4,
     /// Lock owner
     pub owner: LockOwner4,
     /// List of lock entries (lock ranges) belonging to this state
@@ -173,8 +175,10 @@ impl LockEntry {
 impl LockState {
     /// Create a new lock state
     pub fn new(stateid: Stateid4, owner: LockOwner4, initial_entry: Arc<LockEntry>) -> Self {
+        let fileid = initial_entry.fileid;
         Self {
             stateid,
+            fileid,
             owner,
             lock_entries: RwLock::new(vec![initial_entry]),
             status: RwLock::new(LockStateStatus::Active),
@@ -272,13 +276,6 @@ impl LockState {
                 new_end.saturating_sub(new_offset)
             };
             *new_entry.length.write().unwrap() = new_length;
-
-            tracing::debug!(
-                "Merged {} lock entries into range {}+{}",
-                to_remove.len(),
-                new_offset,
-                new_length
-            );
         }
 
         // Remove merged entries (reverse order)
@@ -319,11 +316,6 @@ impl LockState {
             // Check if fully covered
             if offset <= entry_offset && unlock_end >= entry_end {
                 // Fully covered - remove entire entry
-                tracing::debug!(
-                    "Removing lock entry {}+{} (fully covered by unlock)",
-                    entry_offset,
-                    entry.get_length()
-                );
                 continue;
             }
 
@@ -338,7 +330,6 @@ impl LockState {
                     left_length,
                 ));
                 new_entries.push(left_entry);
-                tracing::debug!("Created left fragment {}+{}", entry_offset, left_length);
             }
 
             // Right fragment: [unlock_end, entry_end)
@@ -356,7 +347,6 @@ impl LockState {
                     right_length,
                 ));
                 new_entries.push(right_entry);
-                tracing::debug!("Created right fragment {}+{}", right_offset, right_length);
             }
         }
 
@@ -528,6 +518,7 @@ impl LockManager {
     /// - For new_lock_owner: create new LockState with first LockEntry
     /// - For existing_lock_owner: find LockState, add/merge LockEntry
     /// - Returns the stateid (new or existing with updated seqid)
+    #[allow(clippy::too_many_arguments)]
     pub fn lock(
         &self,
         clientid: Clientid4,
@@ -548,13 +539,6 @@ impl LockManager {
             if !blocking {
                 // Non-blocking lock request with conflicts -> return DENIED
                 self.stats.total_denied.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    "Lock denied: {} conflicts found for file {} at {}+{}",
-                    conflicts.len(),
-                    fileid,
-                    offset,
-                    length
-                );
                 return Err(Nfs4Error::with_message(
                     Nfs4Status::Denied,
                     format!("Lock conflict with {} existing locks", conflicts.len()),
@@ -587,17 +571,12 @@ impl LockManager {
             if state.owner != lock_owner {
                 return Err(Nfs4Status::BadStateid.into());
             }
+            if state.fileid != fileid {
+                return Err(Nfs4Status::BadStateid.into());
+            }
 
             // Add lock entry to existing state (with merging)
             state.add_lock_entry(new_entry);
-
-            tracing::debug!(
-                "Added lock entry to existing state {:?} for file {} at {}+{}",
-                &existing.other[..4],
-                fileid,
-                offset,
-                length
-            );
 
             // Return updated stateid (incremented seqid)
             Ok(state.update_stateid())
@@ -627,14 +606,6 @@ impl LockManager {
                 .write()
                 .unwrap()
                 .insert(lock_owner.clone(), stateid_key);
-
-            tracing::debug!(
-                "Created new lock state {:?} for file {} at {}+{}",
-                &stateid_key[..4],
-                fileid,
-                offset,
-                length
-            );
 
             Ok(stateid)
         };
@@ -685,52 +656,11 @@ impl LockManager {
         // Remove lock range from state (may split entries)
         let should_delete = state.remove_lock_range(offset, length)?;
 
-        if should_delete {
-            // No more lock entries - delete the state
-            let mut lock_states = self.lock_states.write().unwrap();
-            let removed_state = lock_states
-                .remove(&stateid.other)
-                .ok_or(Nfs4Status::BadStateid)?;
+        let _state_is_now_empty = should_delete;
+        self.stats.total_released.fetch_add(1, Ordering::Relaxed);
 
-            // Remove from client_locks
-            if let Some(locks) = self
-                .client_locks
-                .write()
-                .unwrap()
-                .get_mut(&removed_state.owner.clientid)
-            {
-                locks.retain(|s| s != &stateid.other);
-            }
-
-            // Remove from owner_locks
-            self.owner_locks
-                .write()
-                .unwrap()
-                .remove(&removed_state.owner);
-
-            tracing::debug!(
-                "Lock state {:?} fully released (no more entries)",
-                &stateid.other[..4]
-            );
-
-            self.stats.total_released.fetch_add(1, Ordering::Relaxed);
-
-            // Return updated stateid (even though state is deleted)
-            Ok(state.update_stateid())
-        } else {
-            // State still has lock entries - return updated stateid
-            tracing::debug!(
-                "Lock state {:?} partially released at {}+{}",
-                &stateid.other[..4],
-                offset,
-                length
-            );
-
-            self.stats.total_released.fetch_add(1, Ordering::Relaxed);
-
-            // Return updated stateid (incremented seqid, same state)
-            Ok(state.update_stateid())
-        }
+        // Ganesha keeps the empty lock state around until FREE_STATEID/CLOSE.
+        Ok(state.update_stateid())
     }
 
     /// Get lock state by stateid (for verification and operations)
@@ -740,6 +670,62 @@ impl LockManager {
             .unwrap()
             .get(&stateid.other)
             .cloned()
+    }
+
+    /// Verify a lock stateid using the same seqid semantics as NFS-Ganesha's
+    /// `nfs4_Check_Stateid()` for non-layout state.
+    pub fn verify_stateid(&self, stateid: &Stateid4) -> Nfs4Result<Arc<LockState>> {
+        if stateid.is_special() {
+            return Err(Nfs4Status::BadStateid.into());
+        }
+
+        let state = self.get_lock_state(stateid).ok_or(Nfs4Status::BadStateid)?;
+        let current_seqid = state.seqid.load(Ordering::Acquire);
+
+        if stateid.seqid != 0 && stateid.seqid != current_seqid {
+            if stateid.seqid < current_seqid {
+                return Err(Nfs4Status::OldStateid.into());
+            }
+            return Err(Nfs4Status::BadStateid.into());
+        }
+
+        Ok(state)
+    }
+
+    fn delete_stateid(&self, stateid_other: &[u8; 12]) -> Nfs4Result<()> {
+        let removed_state = self
+            .lock_states
+            .write()
+            .unwrap()
+            .remove(stateid_other)
+            .ok_or(Nfs4Status::BadStateid)?;
+
+        if let Some(locks) = self
+            .client_locks
+            .write()
+            .unwrap()
+            .get_mut(&removed_state.owner.clientid)
+        {
+            locks.retain(|s| s != stateid_other);
+        }
+
+        self.owner_locks
+            .write()
+            .unwrap()
+            .remove(&removed_state.owner);
+
+        Ok(())
+    }
+
+    /// FREE_STATEID on a lock state is only allowed when no byte-range locks
+    /// remain under that stateid.
+    pub fn free_stateid(&self, stateid: &Stateid4) -> Nfs4Result<()> {
+        let state = self.verify_stateid(stateid)?;
+        if !state.lock_entries.read().unwrap().is_empty() {
+            return Err(Nfs4Status::LocksHeld.into());
+        }
+
+        self.delete_stateid(&stateid.other)
     }
 
     /// Release all locks for a client (on client expiration)

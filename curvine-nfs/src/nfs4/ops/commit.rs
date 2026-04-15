@@ -92,6 +92,10 @@ pub async fn op_commit(
     // Get current filehandle (NFS-Ganesha: nfs4_sanity_check_FH at line 82)
     // COMMIT is done only on a file (REGULAR_FILE)
     let fh = ctx.require_current_fh()?;
+    if handler.pnfs_block_handle(fh)?.is_some() {
+        return Err(Nfs4Status::Notsupp.into());
+    }
+
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
     // Verify it's a regular file

@@ -54,6 +54,7 @@
 
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use crate::nfs4::types::{Clientid4, Sessionid4};
+use crate::protocol::rpc::opaque_auth;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -270,6 +271,8 @@ pub struct Session {
     /// Whether backchannel is established
     /// NFS-Ganesha: session->flags & session_bc_up
     pub backchannel_up: AtomicU8,
+    /// Callback authentication chosen from CREATE_SESSION security parameters.
+    cb_auth: RwLock<opaque_auth>,
 }
 
 impl Session {
@@ -285,6 +288,7 @@ impl Session {
             flags: AtomicU32::new(0),
             cb_program: AtomicU32::new(0),
             backchannel_up: AtomicU8::new(0),
+            cb_auth: RwLock::new(opaque_auth::default()),
         }
     }
 
@@ -347,6 +351,16 @@ impl Session {
     #[inline]
     pub fn get_cb_program(&self) -> u32 {
         self.cb_program.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_cb_auth(&self, auth: opaque_auth) {
+        *self.cb_auth.write().unwrap() = auth;
+    }
+
+    #[inline]
+    pub fn cb_auth(&self) -> opaque_auth {
+        self.cb_auth.read().unwrap().clone()
     }
 
     /// Mark backchannel as established
@@ -502,6 +516,17 @@ impl SessionManager {
         for sid in session_ids {
             sessions.remove(&sid);
         }
+    }
+
+    /// Check whether a client still has any live sessions.
+    #[inline]
+    pub fn has_client_sessions(&self, clientid: Clientid4) -> bool {
+        self.client_sessions
+            .read()
+            .unwrap()
+            .get(&clientid)
+            .map(|sessions| !sessions.is_empty())
+            .unwrap_or(false)
     }
 
     /// Process SEQUENCE operation (optimized)

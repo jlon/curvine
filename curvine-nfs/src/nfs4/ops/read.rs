@@ -27,6 +27,17 @@ use orpc::sys::DataSlice;
 use std::io::Read;
 use tokio_util::bytes::Bytes;
 
+struct AnonReadGuard<'a> {
+    delegations: &'a crate::nfs4::DelegationManager,
+    fileid: Fileid4,
+}
+
+impl Drop for AnonReadGuard<'_> {
+    fn drop(&mut self) {
+        self.delegations.end_anon_op(self.fileid);
+    }
+}
+
 /// READ operation handler
 ///
 /// # Small File Cache (curvine-nfs extension for AI training)
@@ -58,12 +69,34 @@ pub async fn op_read(
     let count = input.read_u32::<BigEndian>()?;
 
     let fh = ctx.require_current_fh()?;
+    if let Some((ds, handle)) = handler.pnfs_block_handle(fh)? {
+        tracing::info!(
+            "pNFS DS READ: worker_id={} block_id={} offset={} count={}",
+            handle.worker_id,
+            handle.block.id,
+            offset,
+            count
+        );
+        let (slices, eof) = ds.read(&handle, &stateid, offset, count).await?;
+        return build_read_response(slices, eof);
+    }
+
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
     let status = handler.fs.get_status(fileid).await?;
     if status.file_type != curvine_common::state::FileType::File {
         return Err(Nfs4Status::Inval.into());
     }
+
+    let anon_guard = if stateid.is_special() {
+        handler.delegations.begin_anon_op(fileid);
+        Some(AnonReadGuard {
+            delegations: &handler.delegations,
+            fileid,
+        })
+    } else {
+        None
+    };
 
     // Get max_cacheable_file_size from config
     let max_cacheable_size = handler.fs.config().max_cacheable_file_size;
@@ -81,6 +114,7 @@ pub async fn op_read(
             let read_len = (count as usize).min(cached_data.len());
             let eof = read_len >= cached_data.len();
             let slice = DataSlice::bytes(Bytes::from(cached_data[..read_len].to_vec()));
+            drop(anon_guard);
             return build_read_response(vec![slice], eof);
         }
     }
@@ -89,6 +123,7 @@ pub async fn op_read(
         check_read_limits(offset, count, &status, handler)?;
 
     if early_eof {
+        drop(anon_guard);
         return build_read_response(vec![], true);
     }
 
@@ -130,6 +165,7 @@ pub async fn op_read(
         }
     }
 
+    drop(anon_guard);
     build_read_response(slices, eof)
 }
 

@@ -30,6 +30,17 @@ use crate::protocol::xdr::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::Read;
 
+struct AnonWriteGuard<'a> {
+    delegations: &'a crate::nfs4::DelegationManager,
+    fileid: Fileid4,
+}
+
+impl Drop for AnonWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.delegations.end_anon_op(self.fileid);
+    }
+}
+
 /// NFS4 stable write mode: UNSTABLE4
 pub const UNSTABLE4: u32 = 0;
 
@@ -70,6 +81,16 @@ pub async fn op_write(
         return Err(Nfs4Status::Inval.into());
     }
 
+    let anon_guard = if stateid.is_special() {
+        handler.delegations.begin_anon_op(fileid);
+        Some(AnonWriteGuard {
+            delegations: &handler.delegations,
+            fileid,
+        })
+    } else {
+        None
+    };
+
     let adjusted_size = check_write_limits(offset, data.len() as u64, handler)?;
     if adjusted_size < data.len() {
         data.truncate(adjusted_size);
@@ -79,7 +100,8 @@ pub async fn op_write(
     let need_sync = stable != UNSTABLE4;
 
     let (count, actual_synced) = if stateid.is_special() {
-        let written = handler.fs.write(fileid, offset, data).await?;
+        let write_res = handler.fs.write(fileid, offset, data).await;
+        let written = write_res?;
         // Invalidate small file data cache since file content has changed
         handler.fs.invalidate_file_data(fileid);
         (written, true) // Special stateid always syncs
@@ -131,6 +153,7 @@ pub async fn op_write(
         (written, actual_synced)
     };
 
+    drop(anon_guard);
     build_write_response(count as usize, actual_synced, handler)
 }
 

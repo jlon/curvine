@@ -43,6 +43,14 @@ pub async fn op_getattr(
     }
 
     let fh = ctx.require_current_fh()?;
+    if let Some((ds, handle)) = handler.pnfs_block_handle(fh)? {
+        let attrs = ds.attrs(&handle);
+        let fattr = crate::nfs4::handlers::encode_fattr4(&attrs, &requested_attrs, Some(fh))?;
+        let mut result = Vec::new();
+        fattr.serialize(&mut result)?;
+        return Ok(result);
+    }
+
     let fileid = handler.fs.fh_to_fileid(fh)?;
 
     let status = handler.fs.get_status_cached(fileid).await?;

@@ -1,4 +1,4 @@
-# pNFS 并行读取设计文档
+# Curvine pNFS Metadata Plane 设计文档
 
 ## 0. 项目背景
 
@@ -43,6 +43,20 @@ sudo mount -t nfs -o vers=4.1,port=2049,tcp,resvport 127.0.0.1:/ /mnt/curvine-nf
 3. **复用现有接口**: 充分利用 Curvine Worker 已有的读写接口
 4. **渐进式实现**: 先实现读取，再实现写入
 
+### 0.4 当前代码状态（2026-04-15）
+
+当前 Curvine 只实现了 pNFS 的 **metadata plane**，还没有完整的数据面直连闭环：
+
+- **MDS = curvine-nfs Gateway**：已经实现 `LAYOUTGET`、`GETDEVICEINFO`、`LAYOUTRETURN`
+- **布局来源 = Master 元数据**：`LAYOUTGET` 复用 `get_block_locations`，把 Curvine 的块位置信息映射成 file layout
+- **DS read-only foundation 已启动**：worker 侧 `curvine-nfs` 现在可以识别 pNFS block filehandle，并处理最小只读 DS 路径上的 `PUTFH/GETATTR/READ`
+- **DS block FH 已签名**：MDS 和 worker-side DS 通过 `nfs_gateway.pnfs_ds_secret` 校验 block FH，避免客户端伪造任意 block 句柄
+- **Worker 当前角色仍不是完整 DS 产品形态**：它复用现有 `curvine-nfs` 协议栈承接 block FH，而不是一个独立完成度的 NFSv4.1 DS 服务
+- **本地手工 read-only e2e 已验证**：使用真实 Curvine 集群、独立 `curvine-nfs-gateway` 和 Linux NFSv4.1 挂载进行手工验证，worker 日志已经出现 `pNFS DS READ`
+- **尚未实现**：`LAYOUTCOMMIT`、DS 写路径、多 worker 并行直读验证、自动化的 Linux pNFS 客户端互操作矩阵
+
+因此，本文中的 “Client 直连 Worker” 和 “DS 服务” 描述必须视为 **目标架构**，不是当前已交付能力。
+
 ## 1. 背景与目标
 
 ### 1.1 当前架构的瓶颈
@@ -81,7 +95,7 @@ sudo mount -t nfs -o vers=4.1,port=2049,tcp,resvport 127.0.0.1:/ /mnt/curvine-nf
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 pNFS 目标架构
+### 1.2 pNFS 目标架构（最终态）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -158,11 +172,11 @@ struct nfsv4_1_file_layout4 {
 
 | pNFS 概念 | Curvine 概念 | 说明 |
 |-----------|-------------|------|
-| MDS (Metadata Server) | NFS Gateway | 处理元数据操作 |
-| DS (Data Server) | Worker Node | 存储实际数据块 |
+| MDS (Metadata Server) | NFS Gateway | 当前已落地，负责 `LAYOUTGET/GETDEVICEINFO/LAYOUTRETURN` |
+| DS (Data Server) | Worker 侧未来 DS Shim | 当前未落地；需要在 Worker 之上补标准 NFSv4.1 DS 协议层 |
 | Layout | Block Location | 文件块的位置信息 |
 | Stripe Unit | Block Size | 128MB (curvine-block) |
-| Device | Worker Cluster | Worker 节点集合 |
+| Device | Worker 集合的逻辑视图 | 当前由 Gateway 根据 `FileBlocks` 动态编码 |
 
 ### 3.2 Curvine 文件结构
 
@@ -394,7 +408,7 @@ pub struct DsAddr {
 
 #### 5.3.1 LAYOUTGET 实现
 
-**当前状态**：❌ **未实现**（handlers.rs 中返回 `Notsupp`）
+**当前状态**：✅ **metadata plane 已实现**（`handlers.rs` + `pnfs.rs`）
 
 **实现方案**：
 
@@ -523,7 +537,7 @@ fn extract_block_infos(
 
 #### 5.3.2 GETDEVICEINFO 实现
 
-**当前状态**：❌ **未实现**（handlers.rs 中返回 `Notsupp`）
+**当前状态**：✅ **metadata plane 已实现**（`handlers.rs` + `pnfs.rs`）
 
 **实现方案**：
 
@@ -615,7 +629,7 @@ fn format_nfs_addr(worker_addr: &WorkerAddress) -> Nfs4Result<Vec<u8>> {
 - ✅ Worker 地址信息：Worker 注册时包含地址信息
 
 
-### 5.4 数据服务器 (DS) 实现
+### 5.4 数据服务器 (DS) 实现（未来阶段）
 
 #### 5.4.1 Worker 端架构分析
 
@@ -988,39 +1002,39 @@ pNFS 架构延迟:
 ### 7.1 阶段一：基础 pNFS 支持 (2 周)
 
 1. **MDS 端实现**
-   - [ ] LAYOUTGET 操作
-     - [ ] 实现 `op_layoutget` 处理函数
-     - [ ] 从 `FileStatus.blocks` 提取 Block 信息
-     - [ ] 构建 pNFS File Layout 响应
-     - [ ] 文件句柄编码（Block ID → NFS FH）
-   - [ ] GETDEVICEINFO 操作
-     - [ ] 实现 `op_getdeviceinfo` 处理函数
-     - [ ] 从 Master 获取 Worker 地址列表
-     - [ ] 构建 Device Info 响应（multipath_list）
-   - [ ] LAYOUTRETURN 操作
-     - [ ] 实现 `op_layoutreturn` 处理函数
-     - [ ] 清理 Layout 状态
-   - [ ] Layout Manager
-     - [ ] Layout 状态管理
-     - [ ] Device ID 管理
+   - [x] LAYOUTGET 操作
+     - [x] 实现 `op_layoutget` 处理函数
+     - [x] 复用 `get_block_locations`
+     - [x] 构建单段 pNFS File Layout 响应
+     - [x] 编码布局专用文件句柄
+   - [x] GETDEVICEINFO 操作
+     - [x] 实现 `op_getdeviceinfo` 处理函数
+     - [x] 从 `FileBlocks` 提取 Worker 地址
+     - [x] 构建 Device Info 响应（metadata plane）
+   - [x] LAYOUTRETURN 操作
+     - [x] 实现 `op_layoutreturn` 处理函数
+     - [x] 清理 Layout 状态
+   - [x] Layout Manager
+     - [x] Layout 状态管理
+     - [x] Device ID 管理
 
 2. **协议支持**
-   - [ ] pNFS File Layout 编解码（RFC 5663）
-   - [ ] Device Info 编解码（RFC 5661）
-   - [ ] 文件句柄编解码（Block ID ↔ NFS FH）
+   - [x] pNFS File Layout 基础编码（RFC 5663，单段 file layout）
+   - [x] Device Info 基础编码（RFC 5661，metadata plane）
+   - [x] 文件句柄基础编码（布局专用 FH）
 
 ### 7.2 阶段二：DS 服务 (2-3 周)
 
 1. **Worker 端实现**
-   - [ ] pNFS DS 服务框架
-     - [ ] NFSv4.1 协议服务器（复用 curvine-nfs 代码）
-     - [ ] 监听标准 NFS 端口 2049（与 Gateway 相同，通过 IP 区分）
-     - [ ] 最小化 NFS 操作集（READ/WRITE/COMMIT/GETATTR）
-     - [ ] 文件句柄处理（Block ID 编码/解码）
-   - [ ] DS READ 操作
-     - [ ] 解析 NFS 文件句柄获取 Block ID
-     - [ ] 调用 Curvine RPC `BlockReadRequest`
-     - [ ] 返回标准 NFS READ 响应
+   - [x] pNFS DS 服务框架（最小只读切片）
+     - [x] 复用 `curvine-nfs` 代码栈承接 worker 侧 DS block FH
+     - [x] worker 启动时可选注入 DS read-only 模式
+     - [x] 最小化 NFS 操作集（`PUTFH/GETATTR/READ`）
+     - [x] 文件句柄处理（Block FH 编码/解码）
+   - [x] DS READ 操作（只读）
+     - [x] 解析 NFS 文件句柄获取 Block 元数据
+     - [x] 桥接到 Curvine Worker block read
+     - [x] 返回标准 NFS READ 响应
    - [ ] DS WRITE 操作（可选，初期可跳过）
      - [ ] 解析文件句柄
      - [ ] 调用 Curvine RPC `BlockWriteRequest`
@@ -1073,13 +1087,15 @@ pNFS 架构延迟:
 - ✅ Worker 地址信息可从 Master 获取
 
 **待实现的核心功能**：
-- ❌ MDS 端：LAYOUTGET、GETDEVICEINFO、LAYOUTRETURN
-- ❌ DS 端：NFSv4.1 协议服务器、READ/WRITE 操作
-- ❌ 协议桥接：NFS 协议 ↔ Curvine RPC
-- ❌ 文件句柄编码：Block ID ↔ NFS 文件句柄
+- ⚠️ MDS 端：`LAYOUTCOMMIT` 与更完整的 layout 生命周期管理
+- ⚠️ DS 端：写路径、更多互操作所需操作、独立服务形态完善
+- ⚠️ 协议桥接：只读 `READ` 已桥接，写路径未桥接
+- ⚠️ 文件句柄编码：DS block FH 已实现，仍需为后续写路径和更多布局类型预留演进空间
+- ⚠️ 配置治理：部署时必须统一 `nfs_gateway.pnfs_ds_secret`
+- ⚠️ 性能验证：当前只完成单 worker、本地手工 read-only e2e，尚未证明多 worker 并发拉流
 
 **技术难点**：
-1. **文件句柄设计**：需要设计紧凑且可扩展的文件句柄格式
+1. **文件句柄设计**：当前 DS block FH 已落地，后续还要控制兼容性和扩展性
 2. **协议兼容性**：确保与 Linux pNFS 客户端完全兼容
 3. **错误处理**：Worker 故障时的 Layout 失效和恢复
 4. **性能优化**：减少协议转换开销
@@ -1091,21 +1107,23 @@ pNFS 架构延迟:
 | 组件 | 状态 | 说明 |
 |------|------|------|
 | **MDS 端 (Gateway)** | | |
-| LAYOUTGET | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
-| GETDEVICEINFO | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
-| LAYOUTRETURN | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
+| LAYOUTGET | ✅ 已实现 | `handlers.rs` + `pnfs.rs`，从 `get_block_locations` 生成 file layout |
+| GETDEVICEINFO | ✅ 已实现 | `handlers.rs` + `pnfs.rs`，返回 Worker 地址编码 |
+| LAYOUTRETURN | ✅ 已实现 | `handlers.rs` + `pnfs.rs`，支持 file-return 清理布局状态 |
 | LAYOUTCOMMIT | ❌ 未实现 | handlers.rs 返回 `Notsupp` |
-| Layout Manager | ❌ 未实现 | 需要新建模块 |
-| Device Manager | ❌ 未实现 | 需要新建模块 |
+| Layout Manager | ✅ 已实现 | `PnfsManager` 维护 layout state 和 synthetic deviceid |
+| Device Manager | ✅ 已实现 | `PnfsManager` 维护 deviceid 到 `FileBlocks` 的映射 |
 | **DS 端 (Worker)** | | |
-| NFS DS 服务 | ❌ 未实现 | 需要新建服务 |
-| DS READ 操作 | ❌ 未实现 | 需要实现 NFS 协议 |
-| DS WRITE 操作 | ❌ 未实现 | 可选，初期可跳过 |
+| NFS DS 角色注入 | ✅ 已实现 | worker 侧 `curvine-nfs` 可选进入 DS read-only 模式 |
+| DS block FH 编码/解码 | ✅ 已实现 | block id / len / storage / worker id + 签名进入 FH 命名空间 |
+| DS GETATTR/READ | ✅ 已实现 | 最小只读数据面已经打通 |
+| Linux pNFS read-only e2e | ⚠️ 本地手工验证 | 真实挂载读路径已命中 worker `pNFS DS READ` 日志，但尚未自动化 |
+| DS WRITE 操作 | ❌ 未实现 | 写路径留到后续阶段 |
 | **基础接口** | | |
 | get_block_locations | ✅ 已存在 | `curvine_nfs_fs.rs` |
 | FileStatus.blocks | ✅ 已存在 | Curvine 文件状态 |
 | Worker RPC 接口 | ✅ 已存在 | BlockReadRequest/BlockWriteRequest |
-| Worker 地址信息 | ✅ 已存在 | Worker 注册时包含 |
+| Worker 地址信息 | ✅ 已存在 | `WorkerAddress` 已可用于编码 device addr |
 
 ### 9.2 依赖关系分析
 
@@ -1115,16 +1133,16 @@ pNFS 架构延迟:
 LAYOUTGET
   ├─ get_block_locations() ✅ 已存在
   ├─ FileStatus.blocks ✅ 已存在
-  └─ Layout Manager ❌ 待实现
-      └─ Device Manager ❌ 待实现
+  └─ Layout Manager ✅ 已实现
+      └─ Device Manager ✅ 已实现
 
 GETDEVICEINFO
   ├─ Worker 地址列表 ⚠️ 需要从 Master 获取
-  └─ Device Manager ❌ 待实现
+  └─ Device Manager ✅ 已实现
 
 DS READ
-  ├─ NFS DS 服务 ❌ 待实现
-  ├─ 文件句柄解析 ❌ 待实现
+  ├─ NFS DS read-only 路径 ✅ 已实现
+  ├─ 文件句柄解析 ✅ 已实现
   └─ Curvine RPC ✅ 已存在
       └─ BlockReadRequest ✅ 已存在
 ```

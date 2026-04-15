@@ -176,7 +176,7 @@ impl Worker {
         if conf.worker.enable_nfs_gateway {
             info!("Starting NFS gateway alongside worker");
             let worker_rt = self.rpc_server.clone_rt();
-            Self::start_nfs_gateway(conf.clone(), worker_rt).await;
+            Self::start_nfs_gateway(conf.clone(), worker_rt, self.addr.clone()).await;
         }
 
         // step 3: Start rpc server
@@ -247,8 +247,11 @@ impl Worker {
     }
 
     /// Start NFS gateway alongside worker
-    async fn start_nfs_gateway(conf: ClusterConf, worker_rt: Arc<Runtime>) {
-        use curvine_common::conf::NfsGatewayConf;
+    async fn start_nfs_gateway(
+        conf: ClusterConf,
+        worker_rt: Arc<Runtime>,
+        local_worker: WorkerAddress,
+    ) {
         use curvine_nfs::gateway::NfsGatewayServer;
 
         let nfs_port = conf.worker.nfs_gateway_port;
@@ -265,7 +268,14 @@ impl Worker {
         let conf_clone = conf.clone();
 
         worker_rt.spawn(async move {
-            match NfsGatewayServer::new(conf_clone, gateway_config, rt_clone.clone()).await {
+            match NfsGatewayServer::new_with_pnfs_ds(
+                conf_clone,
+                gateway_config,
+                rt_clone.clone(),
+                Some(local_worker),
+            )
+            .await
+            {
                 Ok(server) => {
                     info!("NFS gateway started successfully on port {}", nfs_port);
                     if let Err(e) = server.start().await {

@@ -131,6 +131,7 @@ pub async fn op_open_confirm(
     // Increment seqid and build response (line 129)
     let new_seqid = open_state.next_seqid();
     let confirmed_stateid = Stateid4::new(new_seqid, stateid.other);
+    ctx.current_stateid = Some(confirmed_stateid);
 
     info!(
         "✅ OPEN_CONFIRM: confirmed file {} stateid={:02x?} new_seqid={}",

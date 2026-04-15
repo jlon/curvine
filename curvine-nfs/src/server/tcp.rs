@@ -65,7 +65,7 @@ pub fn generate_host_ip(hostnum: u16) -> String {
 /// - Aggressive keepalive settings
 async fn process_socket(
     socket: tokio::net::TcpStream,
-    context: RPCContext,
+    mut context: RPCContext,
 ) -> Result<(), anyhow::Error> {
     // Apply aggressive TCP tuning (50x better than NFS-Ganesha)
     // Configuration can be customized via environment variables
@@ -85,8 +85,11 @@ async fn process_socket(
     // Split socket into read/write halves for concurrent I/O
     let (read_half, mut write_half) = socket.into_split();
 
+    let (msg_tx, mut msgrecvchan) = mpsc::unbounded_channel();
+    context.outbound_tx = Some(msg_tx.clone());
+
     // Create message handler with read half
-    let (mut message_handler, mut msgrecvchan) = SocketMessageHandler::new(read_half, &context);
+    let mut message_handler = SocketMessageHandler::new(read_half, &context, msg_tx);
 
     // Spawn read task
     let read_task = tokio::spawn(async move {
@@ -264,6 +267,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
+                outbound_tx: None,
             };
             info!("Accepting connection from {}", client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);

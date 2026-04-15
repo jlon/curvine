@@ -25,7 +25,9 @@ moka.workspace = true
 
 # Direct dependencies
 hex = "0.4"
+hmac = "0.12"
 hostname = "0.4"
+sha2 = "0.10"
 socket2 = "0.5"
 
 # Curvine dependencies
@@ -42,3 +44,5 @@ path = "src/bin/curvine-nfs-gateway.rs"
 default = []
 gateway = []
 
+[dev-dependencies]
+curvine-tests.workspace = true

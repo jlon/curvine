@@ -2,7 +2,7 @@
 
 ## 1. NFSv4 高级特性实现对比
 
-### 已实现的操作 (39个)
+### 已实现的操作 (42个)
 
 #### NFSv4.0 基础操作 (24个)
 - ✅ ACCESS - 权限检查
@@ -40,30 +40,33 @@
 - ✅ VERIFY - 验证属性相同（缓存验证）
 - ✅ WRITE - 写入文件
 
-#### NFSv4.1 会话管理 (5个)
+#### NFSv4.1 会话与状态管理 (8个)
 - ✅ EXCHANGE_ID - 客户端注册
 - ✅ CREATE_SESSION - 创建会话
 - ✅ DESTROY_SESSION - 销毁会话
 - ✅ SEQUENCE - 会话序列号管理
 - ✅ RECLAIM_COMPLETE - 完成状态回收
+- ✅ TEST_STATEID - 测试 stateid 有效性
+- ✅ DESTROY_CLIENTID - 销毁空闲客户端 ID
+- ✅ FREE_STATEID - 释放空 lock state / 清理 revoked delegation stateid
 
-#### 委托管理 (1个)
-- ✅ DELEGRETURN - 返回委托（简化实现）
+#### 委托管理 (2个)
+- ✅ DELEGRETURN - 返回活跃委托
+- ✅ Delegation 主路径 - 授予、冲突触发 recall、超时回收、revoked-state 清理
 
-### NFS-Ganesha 有但我们缺失的高级特性 (17个)
+### NFS-Ganesha 有但我们仍缺失或未完整的高级特性 (16个)
 
-#### pNFS (并行NFS) 相关 (6个)
-- ❌ LAYOUTGET - 获取文件布局（pNFS核心）
+#### pNFS (并行NFS) 相关 (5个)
+- ⚠️ LAYOUTGET - metadata plane 已实现；DS 直连数据面未实现
 - ❌ LAYOUTCOMMIT - 提交布局修改
-- ❌ LAYOUTRETURN - 返回布局
-- ❌ GETDEVICEINFO - 获取存储设备信息
+- ⚠️ LAYOUTRETURN - metadata plane 已实现；仅支持 file-return 主路径
+- ⚠️ GETDEVICEINFO - metadata plane 已实现；返回 Worker 地址编码
 - ❌ GETDEVICELIST - 获取设备列表
-- ❌ BIND_CONN_TO_SESSION - 绑定连接到会话
 
-#### 高级状态管理 (4个)
-- ❌ FREE_STATEID - 释放状态ID
-- ❌ TEST_STATEID - 测试状态ID有效性
-- ❌ DESTROY_CLIENTID - 销毁客户端ID
+#### 回调/会话桥接 (1个)
+- ⚠️ BIND_CONN_TO_SESSION - 已有 Curvine 进程内 backchannel 注册与 recall 队列，真实 on-wire callback RPC 仍未完成
+
+#### 高级状态管理 (1个)
 - ❌ DELEGPURGE - 清除委托
 
 #### 安全相关 (2个)
@@ -119,26 +122,29 @@
 ⚠️  简化实现：未实现锁升级/降级
 ```
 
-### NFS-Ganesha 有但我们缺失的状态管理
+### NFS-Ganesha 仍领先的状态管理
 
 #### 委托管理 (Delegation)
 ```rust
-❌ 读委托 (Read Delegation)
-❌ 写委托 (Write Delegation)
-❌ 委托回调 (CB_RECALL)
-❌ 委托冲突检测
-⚠️  我们有基础框架但未完整实现
+✅ 读委托 (Read Delegation)
+✅ 写委托 (Write Delegation)
+✅ 委托冲突检测与 recall 触发
+✅ DELEGRETURN
+✅ 超时回收后进入 revoked state，等待 FREE_STATEID 清理
+⚠️ Curvine 进程内 recall 队列已可用，但真实 on-wire CB_RECALL / callback RPC 仍未完成
+✅ CLAIM_DELEGATE_CUR / CLAIM_DELEG_CUR_FH 已实现
+⚠️ CLAIM_DELEGATE_PREV / delegation recovery 仍未完成
 ```
 
 #### 回调通道 (Backchannel)
 ```rust
-⚠️  我们有 BackchannelManager 但功能不完整
+✅ 最小 recall callback 链路已接通：
+  BIND_CONN_TO_SESSION 注册、CB_SEQUENCE 发送、CB_RECALL 发送、reply 后 slot 回收
+⚠️ 更完整的 callback 互操作细节仍未完成
 ❌ CB_GETATTR - 回调获取属性
-❌ CB_RECALL - 回调召回委托
 ❌ CB_LAYOUTRECALL - 回调召回布局
 ❌ CB_NOTIFY - 回调通知
 ❌ CB_PUSH_DELEG - 回调推送委托
-❌ CB_SEQUENCE - 回调序列号
 ```
 
 #### 锁管理增强
@@ -198,11 +204,11 @@ NFSv3:
   
 NFSv4:
   - 属性缓存: ✅ 客户端自行管理
-  - 委托机制: ❌ 未完整实现
-    - 读委托: 客户端可以缓存数据，无需每次 READ
-    - 写委托: 客户端可以缓存写入，批量提交
+  - 委托机制: ⚠️ 主路径已实现，但 callback RPC / recovery 仍未完整
+    - 读委托: ✅ 服务端授予与回收控制流已接通
+    - 写委托: ✅ 服务端授予与冲突检测已接通
   
-⚠️  我们依赖客户端缓存，但未实现委托机制来保证缓存一致性
+⚠️ 服务器侧委托生命周期已接通，但仍缺真实 callback RPC 与恢复语义
 ```
 
 #### 4. 属性获取优化 ✅ 已实现
@@ -284,21 +290,21 @@ NFSv4 有委托 (NFS-Ganesha):
 ## 4. 关键差距总结
 
 ### 功能完整性
-1. **pNFS 支持**: 完全缺失，这是 NFSv4.1 的核心高级特性
-2. **委托机制**: 有框架但未完整实现，影响性能
+1. **pNFS 支持**: 已有 metadata plane、DS read-only foundation，以及本地手工 Linux read-only 验证；但 `LAYOUTCOMMIT`、DS 写路径、多 worker 并发验证仍缺失
+2. **Backchannel on-wire RPC**: 委托主路径已实现，但真实回调链路仍未完整
 3. **锁管理**: 简化实现，不适合生产环境
-4. **状态恢复**: 缺失 Grace Period 和完整的恢复机制
+4. **状态恢复**: 仍缺 delegation 恢复闭环与部分 Grace Period 细节
 
 ### 性能优化
 1. **COMPOUND 优化**: ✅ 完全实现，性能提升显著
 2. **状态化协议**: ✅ 完全实现
-3. **委托缓存**: ❌ 未实现，在频繁读写场景下性能不如 NFS-Ganesha
-4. **回调机制**: ⚠️ 框架存在但功能不完整
+3. **委托缓存**: ✅ 主路径已实现，但互操作还受 backchannel 限制
+4. **回调机制**: ⚠️ 框架存在，但 on-wire RPC 不完整
 
 ### 生产就绪度
 1. **基础功能**: ✅ 完整，可用于生产
 2. **高级功能**: ⚠️ 部分缺失，适合中等负载
-3. **高性能场景**: ⚠️ 缺少委托和 pNFS，不如 NFS-Ganesha
+3. **高性能场景**: ⚠️ 已完成本地手工 Linux 客户端 read-only 验证，但缺少多 worker 并发验证、自动化互操作验证和写路径
 4. **容错能力**: ⚠️ 缺少完整的状态恢复机制
 
 ---
@@ -307,16 +313,16 @@ NFSv4 有委托 (NFS-Ganesha):
 
 ### 高优先级 (影响生产使用)
 1. **完善锁管理**: 实现真正的锁冲突检测和队列管理
-2. **实现委托机制**: 显著提升读写性能
+2. **实现 Backchannel on-wire RPC**: 打通 delegation 真实回调链路
 3. **Grace Period**: 提升容错能力
 
 ### 中优先级 (提升性能)
 1. **完善回调通道**: 支持 CB_RECALL 等核心回调
 2. **状态恢复机制**: 处理网络分区等异常情况
-3. **FREE_STATEID/TEST_STATEID**: 更好的状态管理
+3. **Delegation 恢复**: 补齐 CLAIM_DELEGATE_PREV 和 persisted delegation state
 
 ### 低优先级 (高级特性)
-1. **pNFS 支持**: 适合大规模部署
+1. **pNFS 剩余数据面**: 补齐 DS 写路径与多 worker 并发直读验证
 2. **ALLOCATE**: NFSv4.2 特性
 3. **扩展属性**: 非标准扩展
 
@@ -325,15 +331,15 @@ NFSv4 有委托 (NFS-Ganesha):
 ## 6. 结论
 
 ### 我们的优势
-- ✅ 核心 NFSv4.0/4.1 功能完整
+- ✅ 核心 NFSv4.0/4.1 功能基本完整
 - ✅ COMPOUND 优化完全实现，基础性能优秀
 - ✅ 代码简洁，易于维护和扩展
 - ✅ 使用 Rust，内存安全和并发性能好
 
 ### 需要改进
-- ⚠️ 委托机制不完整，影响高负载性能
+- ⚠️ 委托恢复和真实回调链路还未闭环
 - ⚠️ 锁管理过于简化
-- ⚠️ 缺少 pNFS 支持
+- ⚠️ pNFS 仍缺写路径和多 worker 并发直读验证
 - ⚠️ 状态恢复机制不完整
 
 ### 适用场景
@@ -341,4 +347,4 @@ NFSv4 有委托 (NFS-Ganesha):
 - ✅ 基础文件共享
 - ✅ 开发测试环境
 - ⚠️ 高并发写入场景（需要委托）
-- ⚠️ 大规模集群（需要 pNFS）
+- ⚠️ 大规模集群（仍需 pNFS 多 worker 并发直读验证与写路径）

@@ -71,7 +71,7 @@ use tracing::{debug, info};
 /// Serialized OPEN_DOWNGRADE4res
 pub async fn op_open_downgrade(
     input: &mut impl Read,
-    ctx: &CompoundContext,
+    ctx: &mut CompoundContext,
     handler: &CompoundHandler,
 ) -> Nfs4Result<Vec<u8>> {
     // Read OPEN_DOWNGRADE4args (line 65-67)
@@ -145,6 +145,7 @@ pub async fn op_open_downgrade(
 
     // Build response
     let mut result = Vec::new();
+    ctx.current_stateid = Some(downgraded_stateid);
     downgraded_stateid.serialize(&mut result)?;
 
     Ok(result)

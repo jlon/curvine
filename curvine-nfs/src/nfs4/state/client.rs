@@ -15,6 +15,7 @@
 //! Client State Management
 
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
+use crate::nfs4::session::SessionManager;
 use crate::nfs4::types::{ClientOwner4, Clientid4};
 use crate::nfs4::DEFAULT_LEASE_TIME;
 use std::collections::HashMap;
@@ -237,6 +238,27 @@ impl ClientManager {
         let clients = self.clients.read().unwrap();
         let client = clients.get(&clientid).ok_or(Nfs4Status::StaleClientid)?;
         client.renew();
+        Ok(())
+    }
+
+    /// Validate whether DESTROY_CLIENTID can proceed for a client.
+    ///
+    /// NFS-Ganesha returns:
+    /// - `NFS4ERR_STALE_CLIENTID` when the client does not exist
+    /// - `NFS4ERR_CLIENTID_BUSY` when the client still has live sessions
+    pub fn ensure_destroyable(
+        &self,
+        clientid: Clientid4,
+        sessions: &SessionManager,
+    ) -> Nfs4Result<()> {
+        if self.get_client(clientid).is_none() {
+            return Err(Nfs4Status::StaleClientid.into());
+        }
+
+        if sessions.has_client_sessions(clientid) {
+            return Err(Nfs4Status::ClientidBusy.into());
+        }
+
         Ok(())
     }
 

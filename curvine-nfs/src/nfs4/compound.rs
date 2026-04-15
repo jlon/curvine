@@ -21,14 +21,17 @@ use crate::nfs4::backchannel::BackchannelManager;
 use crate::nfs4::delegation::DelegationManager;
 use crate::nfs4::error::{Nfs4Result, Nfs4Status};
 use crate::nfs4::fs::Nfs4FileSystem;
+use crate::nfs4::pnfs::{is_block_fh, PnfsBlockHandle, PnfsDataServer, PnfsManager};
 use crate::nfs4::session::SessionManager;
 use crate::nfs4::state::{
     ClientManager, GracePeriodManager, GracePeriodReaper, LockManager, OpenManager,
     StatePersistenceManager,
 };
 use crate::nfs4::types::*;
+use crate::server::context::OutboundTx;
 use curvine_common::executor::ScheduledExecutor;
-use std::sync::Arc;
+use curvine_common::state::WorkerAddress;
+use std::sync::{Arc, RwLock};
 
 // ============================================================================
 // NFSv4.1 Operation Codes
@@ -169,6 +172,8 @@ impl From<u32> for Nfs4Op {
 // ============================================================================
 
 /// Context maintained during COMPOUND execution
+use crate::protocol::rpc::auth_unix;
+
 pub struct CompoundContext {
     /// Current file handle
     pub current_fh: Option<Nfs4FileHandle>,
@@ -184,6 +189,13 @@ pub struct CompoundContext {
     pub clientid: Option<Clientid4>,
     /// Minor version (0 = NFSv4.0, 1 = NFSv4.1)
     pub minor_version: u32,
+    pub cachethis: bool,
+    /// Total number of operations in this COMPOUND (for validation)
+    pub op_count: usize,
+    /// RPC authentication info (for uid/gid in CREATE/OPEN/SETATTR)
+    pub auth: auth_unix,
+    /// Outbound transport sender for server-initiated callbacks on this connection.
+    pub outbound_tx: Option<OutboundTx>,
 }
 
 impl CompoundContext {
@@ -196,6 +208,16 @@ impl CompoundContext {
             slot_id: None,
             clientid: None,
             minor_version: 1, // Default to NFSv4.1
+            cachethis: false,
+            op_count: 0,
+            auth: auth_unix {
+                stamp: 0,
+                machinename: Vec::new(),
+                uid: 0,
+                gid: 0,
+                gids: Vec::new(),
+            },
+            outbound_tx: None,
         }
     }
 
@@ -209,6 +231,16 @@ impl CompoundContext {
             slot_id: None,
             clientid: None,
             minor_version,
+            cachethis: false,
+            op_count: 0,
+            auth: auth_unix {
+                stamp: 0,
+                machinename: Vec::new(),
+                uid: 0,
+                gid: 0,
+                gids: Vec::new(),
+            },
+            outbound_tx: None,
         }
     }
 
@@ -256,6 +288,10 @@ pub struct CompoundHandler {
     pub backchannel: Arc<BackchannelManager>,
     /// Delegation manager
     pub delegations: Arc<DelegationManager>,
+    /// pNFS metadata-plane manager
+    pub pnfs: Arc<PnfsManager>,
+    /// Optional worker-side pNFS data-server role
+    pub pnfs_ds: Arc<RwLock<Option<Arc<PnfsDataServer>>>>,
     /// Grace period manager
     pub grace: Arc<GracePeriodManager>,
     /// State persistence manager
@@ -287,6 +323,8 @@ impl CompoundHandler {
             backchannel.clone(),
             deleg_config.clone(),
         ));
+        let pnfs = Arc::new(PnfsManager::new());
+        let pnfs_ds = Arc::new(RwLock::new(None));
 
         let grace = Arc::new(GracePeriodManager::with_default_config());
 
@@ -296,8 +334,6 @@ impl CompoundHandler {
         let scheduler = ScheduledExecutor::new("grace-period-reaper", 5000);
         if let Err(e) = scheduler.start(reaper) {
             tracing::error!("Failed to start grace period reaper: {}", e);
-        } else {
-            tracing::info!("Grace period reaper started (check interval: 5s)");
         }
 
         // Start delegation recall timeout reaper only if delegations are enabled
@@ -307,11 +343,7 @@ impl CompoundHandler {
             let deleg_scheduler = ScheduledExecutor::new("delegation-reaper", 5000);
             if let Err(e) = deleg_scheduler.start(deleg_reaper) {
                 tracing::error!("Failed to start delegation reaper: {}", e);
-            } else {
-                tracing::info!("Delegation reaper started (check interval: 5s)");
             }
-        } else {
-            tracing::debug!("Delegation reaper not started (delegations disabled)");
         }
 
         Self {
@@ -322,6 +354,8 @@ impl CompoundHandler {
             fs,
             backchannel,
             delegations,
+            pnfs,
+            pnfs_ds,
             grace,
             persistence,
             boot_time: std::time::SystemTime::now()
@@ -329,6 +363,39 @@ impl CompoundHandler {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         }
+    }
+
+    pub fn enable_pnfs_ds(&self, local_worker: WorkerAddress) -> bool {
+        let Some(verifier) = self.fs.config().pnfs_ds_secret.clone() else {
+            tracing::warn!(
+                "pNFS DS mode requested for worker {} but pnfs_ds_secret is not configured",
+                local_worker.worker_id
+            );
+            return false;
+        };
+        let fs_context = self.fs.ufs().fs_context().clone();
+        let ds = Arc::new(PnfsDataServer::new(
+            local_worker,
+            fs_context,
+            verifier.into_bytes(),
+        ));
+        self.pnfs_ds.write().unwrap().replace(ds);
+        true
+    }
+
+    pub fn pnfs_block_handle(
+        &self,
+        fh: &Nfs4FileHandle,
+    ) -> Nfs4Result<Option<(Arc<PnfsDataServer>, PnfsBlockHandle)>> {
+        if !is_block_fh(fh) {
+            return Ok(None);
+        }
+
+        let Some(ds) = self.pnfs_ds.read().unwrap().clone() else {
+            return Err(Nfs4Status::Stale.into());
+        };
+        let handle = ds.resolve_handle(fh)?.ok_or(Nfs4Status::Stale)?;
+        Ok(Some((ds, handle)))
     }
 
     /// Check if operation requires SEQUENCE to be called first (NFSv4.1 only)
@@ -358,5 +425,69 @@ impl CompoundHandler {
             return Err(Nfs4Status::OpNotInSession.into());
         }
         Ok(())
+    }
+
+    /// Cleanup all state for a client (NFS-Ganesha: nfs41_single_client_cleanup)
+    ///
+    /// This method coordinates cleanup across all managers to prevent resource leaks.
+    /// Called when:
+    /// - Client lease expires
+    /// - DESTROY_CLIENTID is received
+    /// - Client reconnects with different verifier
+    ///
+    /// # Cleanup Order (following NFS-Ganesha)
+    /// 1. Revoke delegations (CB_RECALL not needed, just revoke)
+    /// 2. Close all open files (release OpenFile resources)
+    /// 3. Release all locks
+    /// 4. Destroy all sessions
+    /// 5. Remove client state
+    pub async fn cleanup_client(&self, clientid: Clientid4) {
+        tracing::info!("CLEANUP_CLIENT: Starting cleanup for client {}", clientid);
+
+        // Step 1: Revoke all delegations for this client
+        self.delegations.revoke_all_for_client(clientid);
+        tracing::info!(
+            "CLEANUP_CLIENT: Revoked delegations for client {}",
+            clientid
+        );
+
+        // Step 2: Close all open files for this client
+        // First get all fileids that need to be closed
+        let open_states = self.opens.get_client_opens(clientid);
+        for state in &open_states {
+            // Close the OpenFile (decrement ref_count, complete if last)
+            if let Err(e) = self.fs.close_file(state.fileid).await {
+                tracing::warn!(
+                    "CLEANUP_CLIENT: Failed to close file {} for client {}: {:?}",
+                    state.fileid,
+                    clientid,
+                    e
+                );
+            }
+        }
+        // Then remove all open states from OpenManager
+        self.opens.close_all_for_client(clientid);
+        tracing::info!(
+            "CLEANUP_CLIENT: Closed {} opens for client {}",
+            open_states.len(),
+            clientid
+        );
+
+        // Step 3: Release all locks for this client
+        self.locks.release_all_for_client(clientid);
+        tracing::info!("CLEANUP_CLIENT: Released locks for client {}", clientid);
+
+        // Step 4: Destroy all sessions for this client
+        self.pnfs.release_client(clientid);
+        tracing::info!(
+            "CLEANUP_CLIENT: Released pNFS layouts for client {}",
+            clientid
+        );
+        self.backchannel.unregister_client(clientid);
+        self.sessions.destroy_client_sessions(clientid);
+        tracing::info!("CLEANUP_CLIENT: Destroyed sessions for client {}", clientid);
+
+        // Step 5: Remove client state (done by caller or ClientManager)
+        tracing::info!("CLEANUP_CLIENT: Completed cleanup for client {}", clientid);
     }
 }

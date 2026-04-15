@@ -30,6 +30,7 @@ use crate::server::tcp::{NFSTcp, NFSTcpListener};
 use curvine_common::conf::{ClusterConf, NfsGatewayConf};
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
+use curvine_common::state::WorkerAddress;
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -58,6 +59,15 @@ impl NfsGatewayServer {
         gateway_config: NfsGatewayConf,
         runtime: Arc<Runtime>,
     ) -> Result<Self, FsError> {
+        Self::new_with_pnfs_ds(cluster_conf, gateway_config, runtime, None).await
+    }
+
+    pub async fn new_with_pnfs_ds(
+        cluster_conf: ClusterConf,
+        gateway_config: NfsGatewayConf,
+        runtime: Arc<Runtime>,
+        pnfs_ds_worker: Option<WorkerAddress>,
+    ) -> Result<Self, FsError> {
         // Create the Curvine NFS filesystem (for NFSv3)
         let fs = CurvineNfsFileSystem::new(
             cluster_conf.clone(),
@@ -84,8 +94,13 @@ impl NfsGatewayServer {
 
         // Initialize NFSv4.1 handler
         info!("  Initializing NFSv4.1 handler...");
-        let nfs4_handler =
-            Self::create_nfs4_handler(cluster_conf, gateway_config.clone(), runtime).await?;
+        let nfs4_handler = Self::create_nfs4_handler(
+            cluster_conf,
+            gateway_config.clone(),
+            runtime,
+            pnfs_ds_worker,
+        )
+        .await?;
         listener.with_nfs4_handler(nfs4_handler);
 
         info!("  ✓ NFSv4.1 support enabled");
@@ -101,6 +116,7 @@ impl NfsGatewayServer {
         cluster_conf: ClusterConf,
         gateway_config: NfsGatewayConf,
         runtime: Arc<Runtime>,
+        pnfs_ds_worker: Option<WorkerAddress>,
     ) -> Result<Arc<CompoundHandler>, FsError> {
         // Create NFSv4.1 file system
         let nfs4_fs = Arc::new(Nfs4FileSystem::new(
@@ -152,6 +168,20 @@ impl NfsGatewayServer {
             persistence.clone(),
             &gateway_config, // Pass NFS config for delegation settings
         ));
+
+        if let Some(worker) = pnfs_ds_worker {
+            if handler.enable_pnfs_ds(worker.clone()) {
+                info!(
+                    "  ✓ pNFS DS read-only mode enabled for worker {}",
+                    worker.worker_id
+                );
+            } else {
+                info!(
+                    "  ⚠ pNFS DS mode not enabled for worker {} (pnfs_ds_secret missing)",
+                    worker.worker_id
+                );
+            }
+        }
 
         // Start periodic state saver (following NFS-Ganesha design)
         // Saves state every 30 seconds (configurable)

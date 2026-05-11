@@ -11,23 +11,29 @@
 //! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
 //! `copy` (source retained, destination overwritten when present), `copy_if_not_exists`,
 //! `delete`, recursive `list`, `list_with_delimiter` (directory prefix is not listed as a file
-//! object), and multipart staging invisibility / complete / abort.
+//! object), and multipart staging invisibility / complete / abort / out-of-order completion /
+//! same-path race behavior. `PutMode::Update` remains intentionally unsupported until Curvine
+//! exposes a real conditional-write primitive beyond weak synthetic e-tags.
 
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::Duration;
+use curvine_common::conf::ClusterConf;
 use futures::StreamExt;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::ObjectStoreProvider;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, MultipartUpload};
+use object_store::{Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode, PutOptions};
 use url::Url;
 
 #[tokio::test]
 #[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_semantics_live_cluster() {
-    let conf = match std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE) {
+    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("Skipping live object-store semantics test: CURVINE_CONF_FILE is not set");
@@ -35,8 +41,8 @@ async fn curvine_object_store_semantics_live_cluster() {
         }
     };
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
 
@@ -69,6 +75,7 @@ async fn curvine_object_store_semantics_live_cluster() {
     let meta = store.inner.head(&key).await.unwrap();
     assert_eq!(meta.size, payload.len() as u64);
     assert!(meta.e_tag.is_some());
+    let etag = meta.e_tag.clone().unwrap();
 
     let head_get = store
         .inner
@@ -82,6 +89,111 @@ async fn curvine_object_store_semantics_live_cluster() {
         .await
         .unwrap();
     assert_eq!(head_get.meta.size, meta.size);
+
+    let if_match_ok = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_match: Some(etag.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        if_match_ok.is_ok(),
+        "if_match with current e_tag should pass"
+    );
+
+    let if_match_bad = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_match: Some("W/\"cv:invalid:0\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(if_match_bad, Err(OsError::Precondition { .. })));
+
+    let if_none_match_same = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_none_match: Some(etag.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(
+        if_none_match_same,
+        Err(OsError::NotModified { .. })
+    ));
+
+    let if_none_match_other = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_none_match: Some("W/\"cv:other:1\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(if_none_match_other.is_ok());
+
+    let if_unmodified_same = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_unmodified_since: Some(meta.last_modified),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(if_unmodified_same.is_ok());
+
+    let if_unmodified_old = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_unmodified_since: Some(meta.last_modified - Duration::hours(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(
+        if_unmodified_old,
+        Err(OsError::Precondition { .. })
+    ));
+
+    let if_modified_same = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_modified_since: Some(meta.last_modified),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(if_modified_same, Err(OsError::NotModified { .. })));
+
+    let if_modified_old = store
+        .inner
+        .get_opts(
+            &key,
+            GetOptions {
+                if_modified_since: Some(meta.last_modified - Duration::hours(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(if_modified_old.is_ok());
 
     let slice = store.read_one_range(&key, 1..5).await.unwrap();
     assert_eq!(slice.as_ref(), b"ello");
@@ -97,6 +209,60 @@ async fn curvine_object_store_semantics_live_cluster() {
         )
         .await;
     assert!(bad_range.is_err());
+
+    let create_only = Path::parse(format!("{pfx}/create_only.bin")).unwrap();
+    store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v1"[..]).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let create_res = store
+        .inner
+        .put_opts(
+            &Path::parse(format!("{pfx}/create_once.bin")).unwrap(),
+            Vec::from(&b"create-v1"[..]).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        create_res.e_tag.is_some(),
+        "create put_opts should return an e_tag"
+    );
+    let create_again = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v2"[..]).into(),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(create_again, Err(OsError::AlreadyExists { .. })));
+    let update_attempt = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v3"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(create_res.into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(update_attempt, Err(OsError::NotImplemented)));
 
     store.put(&key, b"overwrite").await.unwrap();
     let full = store.read_one_all(&key).await.unwrap();
@@ -211,10 +377,60 @@ async fn curvine_object_store_semantics_live_cluster() {
         "copy_if_not_exists creates destination when absent"
     );
     let copy_if_exists = store.inner.copy_if_not_exists(&key, &copy_if_missing).await;
+    assert!(matches!(copy_if_exists, Err(OsError::AlreadyExists { .. })));
+
+    let rename_src = Path::parse(format!("{pfx}/nested/rename_src.bin")).unwrap();
+    let rename_dst = Path::parse(format!("{pfx}/nested/rename_dst.bin")).unwrap();
+    store.put(&rename_src, b"rename-me").await.unwrap();
+    store.inner.rename(&rename_src, &rename_dst).await.unwrap();
+    assert_eq!(
+        store.read_one_all(&rename_dst).await.unwrap().as_ref(),
+        b"rename-me",
+        "rename should move contents to destination"
+    );
+    assert!(
+        store.inner.head(&rename_src).await.is_err(),
+        "rename should remove source object"
+    );
+
+    let rename_if_src = Path::parse(format!("{pfx}/nested/rename_if_src.bin")).unwrap();
+    let rename_if_dst = Path::parse(format!("{pfx}/nested/rename_if_dst.bin")).unwrap();
+    store.put(&rename_if_src, b"rename-if").await.unwrap();
+    store
+        .inner
+        .rename_if_not_exists(&rename_if_src, &rename_if_dst)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_one_all(&rename_if_dst).await.unwrap().as_ref(),
+        b"rename-if",
+        "rename_if_not_exists should create destination when absent"
+    );
+    assert!(store.inner.head(&rename_if_src).await.is_err());
+
+    let rename_if_exists_src =
+        Path::parse(format!("{pfx}/nested/rename_if_exists_src.bin")).unwrap();
+    let rename_if_exists_dst =
+        Path::parse(format!("{pfx}/nested/rename_if_exists_dst.bin")).unwrap();
+    store.put(&rename_if_exists_src, b"source").await.unwrap();
+    store.put(&rename_if_exists_dst, b"dest").await.unwrap();
+    let rename_if_exists = store
+        .inner
+        .rename_if_not_exists(&rename_if_exists_src, &rename_if_exists_dst)
+        .await;
     assert!(matches!(
-        copy_if_exists,
-        Err(object_store::Error::AlreadyExists { .. })
+        rename_if_exists,
+        Err(OsError::AlreadyExists { .. })
     ));
+    assert_eq!(
+        store
+            .read_one_all(&rename_if_exists_src)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"source",
+        "failed rename_if_not_exists must keep source object"
+    );
 
     let multipart_key = Path::parse(format!("{pfx}/multipart/final.bin")).unwrap();
     let mut upload = store.inner.put_multipart(&multipart_key).await.unwrap();
@@ -260,6 +476,24 @@ async fn curvine_object_store_semantics_live_cluster() {
         "multipart complete must concatenate parts in order"
     );
 
+    let multipart_order_key = Path::parse(format!("{pfx}/multipart/out_of_order.bin")).unwrap();
+    let mut out_of_order = store
+        .inner
+        .put_multipart(&multipart_order_key)
+        .await
+        .unwrap();
+    let p1 = out_of_order.put_part(vec![b'1'; 1024].into());
+    let p2 = out_of_order.put_part(vec![b'2'; 1024].into());
+    let p3 = out_of_order.put_part(vec![b'3'; 1024].into());
+    p3.await.unwrap();
+    p2.await.unwrap();
+    p1.await.unwrap();
+    out_of_order.complete().await.unwrap();
+    let order_bytes = store.read_one_all(&multipart_order_key).await.unwrap();
+    assert_eq!(&order_bytes[..4], b"1111");
+    assert_eq!(&order_bytes[1024..1028], b"2222");
+    assert_eq!(&order_bytes[2048..2052], b"3333");
+
     let abort_key = Path::parse(format!("{pfx}/multipart/aborted.bin")).unwrap();
     let mut abort_upload = store.inner.put_multipart(&abort_key).await.unwrap();
     abort_upload
@@ -268,4 +502,69 @@ async fn curvine_object_store_semantics_live_cluster() {
         .unwrap();
     abort_upload.abort().await.unwrap();
     assert!(store.inner.head(&abort_key).await.is_err());
+
+    let race_key = Path::parse(format!("{pfx}/multipart/race.bin")).unwrap();
+    let mut upload1 = store.inner.put_multipart(&race_key).await.unwrap();
+    let mut upload2 = store.inner.put_multipart(&race_key).await.unwrap();
+
+    fn make_payload(prefix: u8, part: u8) -> Vec<u8> {
+        let mut payload = vec![b'0'; 5_300_002];
+        payload[0] = prefix;
+        payload[1] = b':';
+        payload[2] = part;
+        payload
+    }
+
+    upload1
+        .put_part(make_payload(b'1', 0).into())
+        .await
+        .unwrap();
+    upload2
+        .put_part(make_payload(b'2', 0).into())
+        .await
+        .unwrap();
+    upload2
+        .put_part(make_payload(b'2', 1).into())
+        .await
+        .unwrap();
+    upload1
+        .put_part(make_payload(b'1', 1).into())
+        .await
+        .unwrap();
+    upload1
+        .put_part(make_payload(b'1', 2).into())
+        .await
+        .unwrap();
+    upload2
+        .put_part(make_payload(b'2', 2).into())
+        .await
+        .unwrap();
+    upload2
+        .put_part(make_payload(b'2', 3).into())
+        .await
+        .unwrap();
+    upload1
+        .put_part(make_payload(b'1', 3).into())
+        .await
+        .unwrap();
+    upload1
+        .put_part(make_payload(b'1', 4).into())
+        .await
+        .unwrap();
+    upload2
+        .put_part(make_payload(b'2', 4).into())
+        .await
+        .unwrap();
+
+    upload1.complete().await.unwrap();
+    upload2.complete().await.unwrap();
+    let raced = store.read_one_all(&race_key).await.unwrap();
+    let mut expected_prefix = Vec::new();
+    for part in 0..5 {
+        expected_prefix.extend_from_slice(&make_payload(b'2', part));
+    }
+    assert!(
+        raced.starts_with(&expected_prefix),
+        "last completed multipart upload should win for same-path race"
+    );
 }

@@ -2081,7 +2081,6 @@ dependencies = [
  "lance-io",
  "lancedb",
  "object_store",
- "orpc",
  "tempfile",
  "tokio",
  "url",

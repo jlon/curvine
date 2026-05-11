@@ -8,11 +8,11 @@
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// WITHOUT WARRANTIES OR ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_stream::stream;
@@ -21,12 +21,15 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
+use curvine_common::error::FsError;
 use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
-use lancedb_upstream::error::Error;
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM,
+};
 use lancedb_upstream::ObjectStoreRegistry;
 use lancedb_upstream::Session;
 use object_store::path::Path;
@@ -37,7 +40,10 @@ use object_store::{
 use url::Url;
 
 pub const CURVINE_SCHEME: &str = "curvine";
-const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
+
+pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
+
+const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -89,60 +95,93 @@ impl CurvineObjectStoreProvider {
         base_path: &Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<CurvineContext>> {
-        let conf_path = params
-            .storage_options()
-            .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
-            .cloned()
-            .or_else(|| std::env::var(ClusterConf::ENV_CONF_FILE).ok())
-            .ok_or_else(|| {
-                lance_core::Error::invalid_input(format!(
-                    "Missing Curvine config path. Set storage option `{CURVINE_CONF_FILE_KEY}` or env `{}`",
-                    ClusterConf::ENV_CONF_FILE
-                ))
-            })?;
+        let conf_path =
+            resolve_curvine_conf_path(params).ok_or_else(missing_curvine_config_error)?;
 
-        let conf = ClusterConf::from(&conf_path)
-            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
+        let conf = ClusterConf::from(&conf_path).map_err(|e| {
+            lance_core::Error::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        })?;
+
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-        let fs = CurvineFileSystem::with_rt(conf, rt)
-            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
-        let workspace_root = curvine_path_from_url(base_path)
-            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
+        let fs = CurvineFileSystem::with_rt(conf, rt).map_err(|e| {
+            lance_core::Error::invalid_input(format!(
+                "Failed to initialize Curvine filesystem (config '{}'): {e}",
+                conf_path
+            ))
+        })?;
+
+        let workspace_root = curvine_workspace_root_from_uri(base_path).map_err(|e| {
+            lance_core::Error::invalid_input(format!(
+                "Invalid curvine:// workspace URI '{}': {e}",
+                base_path
+            ))
+        })?;
 
         Ok(Arc::new(CurvineContext { fs, workspace_root }))
     }
+}
+
+fn resolve_curvine_conf_path(params: &ObjectStoreParams) -> Option<String> {
+    params
+        .storage_options()
+        .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
+        .cloned()
+        .or_else(|| std::env::var(ClusterConf::ENV_CONF_FILE).ok())
+}
+
+fn missing_curvine_config_error() -> lance_core::Error {
+    lance_core::Error::invalid_input(format!(
+        "Missing Curvine cluster configuration: set storage option `{CURVINE_CONF_FILE_KEY}` \
+         (highest priority) or environment variable `{}` to the Curvine client configuration file path.",
+        ClusterConf::ENV_CONF_FILE
+    ))
 }
 
 #[async_trait]
 impl ObjectStoreProvider for CurvineObjectStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let context = self.create_context(&base_path, params)?;
+        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let download_retry_count = storage_options.download_retry_count();
+
         Ok(ObjectStore::new(
             Arc::new(CurvineObjectStore { context }),
             base_path,
             params.block_size,
-            params.object_store_wrapper.clone(),
+            None,
             params.use_constant_size_upload_parts,
-            params.list_is_lexically_ordered.unwrap_or(true),
-            lance_io::object_store::DEFAULT_CLOUD_IO_PARALLELISM,
-            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            params.list_is_lexically_ordered.unwrap_or(false),
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            download_retry_count,
             params.storage_options(),
         ))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        let path = curvine_path_from_url(url)
-            .map_err(|e| lance_core::Error::invalid_input(e.to_string()))?;
-        relative_object_path(&path, path.full_path())
-            .map_err(|e| lance_core::Error::invalid_input(format!("Invalid curvine path: {e}")))
+        let trimmed = url.path().trim_start_matches('/');
+        if trimmed.is_empty() {
+            Ok(Path::default())
+        } else {
+            Path::parse(trimmed).map_err(|e| {
+                lance_core::Error::invalid_input(format!(
+                    "Invalid curvine object path in URL `{}`: {e}",
+                    url.path()
+                ))
+            })
+        }
     }
 
     fn calculate_object_store_prefix(
         &self,
         url: &Url,
-        _storage_options: Option<&HashMap<String, String>>,
+        _storage_options: Option<&std::collections::HashMap<String, String>>,
     ) -> Result<String> {
-        Ok(format!("{}${}", url.scheme(), url.path()))
+        let host = url.host_str().unwrap_or("");
+        let path = url.path().trim_end_matches('/');
+        Ok(format!("curvine${host}{path}"))
     }
 }
 
@@ -154,7 +193,10 @@ impl object_store::ObjectStore for CurvineObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
-        if !matches!(opts.mode, object_store::PutMode::Overwrite) || !opts.attributes.is_empty() {
+        if !matches!(opts.mode, object_store::PutMode::Overwrite) {
+            return Err(object_store::Error::NotImplemented);
+        }
+        if !opts.attributes.is_empty() {
             return Err(object_store::Error::NotImplemented);
         }
 
@@ -197,6 +239,23 @@ impl object_store::ObjectStore for CurvineObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        if options.version.is_some() {
+            return Err(object_store::Error::NotImplemented);
+        }
+
+        if options.head {
+            let meta = self.head(location).await?;
+            options.check_preconditions(&meta)?;
+            let stream =
+                stream::once(async move { Ok::<Bytes, object_store::Error>(Bytes::new()) }).boxed();
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(stream),
+                meta,
+                range: 0..0,
+                attributes: Attributes::default(),
+            });
+        }
+
         let cv_path = self.object_path(location)?;
         let meta = self.head(location).await?;
         options.check_preconditions(&meta)?;
@@ -227,7 +286,8 @@ impl object_store::ObjectStore for CurvineObjectStore {
                 .map_err(|e| fs_error_to_object_store(location, e))?;
         }
 
-        let mut buf = vec![0u8; (range.end - range.start) as usize];
+        let len = (range.end - range.start) as usize;
+        let mut buf = vec![0u8; len];
         let read_len = reader
             .read_full(&mut buf)
             .await
@@ -275,16 +335,15 @@ impl object_store::ObjectStore for CurvineObjectStore {
         let store = self.clone();
         let prefix = prefix.cloned();
         Box::pin(stream! {
-            let list = match store.list_objects(prefix.as_ref()).await {
-                Ok(list) => list,
+            let metas = match store.collect_under_prefix(prefix.as_ref()).await {
+                Ok(m) => m,
                 Err(err) => {
                     yield Err(err);
                     return;
                 }
             };
-
-            for item in list {
-                yield item;
+            for meta in metas {
+                yield Ok(meta);
             }
         })
     }
@@ -302,20 +361,40 @@ impl object_store::ObjectStore for CurvineObjectStore {
             .await
             .map_err(|e| fs_error_to_object_store(prefix.unwrap_or(&Path::default()), e))?;
 
+        let base_prefix = prefix.cloned().unwrap_or_default();
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
+
         for status in statuses {
-            let path =
-                relative_object_path(&self.context.workspace_root, &status.path).map_err(|e| {
-                    object_store::Error::Generic {
-                        store: CURVINE_SCHEME,
-                        source: e.into(),
-                    }
-                })?;
+            let entry_location = relative_object_path(&self.context.workspace_root, &status.path)
+                .map_err(|msg| object_store::Error::Generic {
+                store: CURVINE_SCHEME,
+                source: msg.into(),
+            })?;
+
+            let (first, nested) = {
+                let mut parts = match entry_location.prefix_match(&base_prefix) {
+                    Some(parts) => parts,
+                    None => continue,
+                };
+
+                let first = match parts.next() {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let nested = parts.next().is_some();
+                (first, nested)
+            };
+
+            if nested {
+                continue;
+            }
+
             if status.is_dir {
-                common_prefixes.insert(path);
+                common_prefixes.insert(base_prefix.child(first));
             } else {
-                objects.push(file_status_to_object_meta(path, status));
+                objects.push(file_status_to_object_meta(entry_location, status));
             }
         }
 
@@ -326,13 +405,59 @@ impl object_store::ObjectStore for CurvineObjectStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let from = self.object_path(from)?;
-        let to = self.object_path(to)?;
-        self.context
+        let from_cv = self.object_path(from)?;
+        let to_cv = self.object_path(to)?;
+        let meta = self.head(from).await?;
+        let size = meta.size;
+
+        let mut reader = self
+            .context
             .fs
-            .rename(&from, &to)
+            .open(&from_cv)
             .await
-            .map_err(|e| fs_error_to_object_store(&Path::from(from.full_path()), e))?;
+            .map_err(|e| fs_error_to_object_store(from, e))?;
+
+        let mut writer = self
+            .context
+            .fs
+            .create(&to_cv, true)
+            .await
+            .map_err(|e| fs_error_to_object_store(to, e))?;
+
+        let mut offset = 0u64;
+        while offset < size {
+            let take = ((size - offset).min(COPY_CHUNK_BYTES as u64)) as usize;
+            if offset > 0 {
+                reader
+                    .seek(offset as i64)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(from, e))?;
+            }
+
+            let mut buf = vec![0u8; take];
+            let n = reader
+                .read_full(&mut buf)
+                .await
+                .map_err(|e| fs_error_to_object_store(from, e))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write(&buf[..n])
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+            offset += n as u64;
+        }
+
+        reader
+            .complete()
+            .await
+            .map_err(|e| fs_error_to_object_store(from, e))?;
+        writer
+            .complete()
+            .await
+            .map_err(|e| fs_error_to_object_store(to, e))?;
+
         Ok(())
     }
 
@@ -361,34 +486,52 @@ impl CurvineObjectStore {
         })
     }
 
-    async fn list_objects(
+    async fn collect_under_prefix(
         &self,
         prefix: Option<&Path>,
-    ) -> object_store::Result<Vec<object_store::Result<ObjectMeta>>> {
+    ) -> object_store::Result<Vec<ObjectMeta>> {
         let root_path = match prefix {
             Some(prefix) => self.object_path(prefix)?,
             None => self.context.workspace_root.clone(),
         };
 
+        let mut out = Vec::new();
+        self.collect_files_recursive(&root_path, &mut out).await?;
+        Ok(out)
+    }
+
+    async fn collect_files_recursive(
+        &self,
+        dir: &CurvinePath,
+        out: &mut Vec<ObjectMeta>,
+    ) -> object_store::Result<()> {
         let statuses = self
             .context
             .fs
-            .list_status(&root_path)
+            .list_status(dir)
             .await
-            .map_err(|e| fs_error_to_object_store(prefix.unwrap_or(&Path::default()), e))?;
+            .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
 
-        Ok(statuses
-            .into_iter()
-            .filter(|status| !status.is_dir)
-            .map(|status| {
-                let path = relative_object_path(&self.context.workspace_root, &status.path)
-                    .map_err(|e| object_store::Error::Generic {
+        for status in statuses {
+            if status.is_dir {
+                let child = CurvinePath::from_str(&status.path).map_err(|e| {
+                    object_store::Error::Generic {
                         store: CURVINE_SCHEME,
-                        source: e.into(),
+                        source: e.to_string().into(),
+                    }
+                })?;
+                Box::pin(self.collect_files_recursive(&child, out)).await?;
+            } else {
+                let path = relative_object_path(&self.context.workspace_root, &status.path)
+                    .map_err(|msg| object_store::Error::Generic {
+                        store: CURVINE_SCHEME,
+                        source: msg.into(),
                     })?;
-                Ok(file_status_to_object_meta(path, status))
-            })
-            .collect())
+                out.push(file_status_to_object_meta(path, status));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -402,16 +545,7 @@ pub fn curvine_session() -> Arc<Session> {
     Arc::new(Session::new(0, 0, curvine_registry()))
 }
 
-pub fn unsupported_curvine_uri(uri: impl Into<String>) -> Error {
-    Error::NotSupported {
-        message: format!(
-            "Curvine object store, uri={} is not implemented",
-            uri.into()
-        ),
-    }
-}
-
-fn curvine_path_from_url(url: &Url) -> std::result::Result<CurvinePath, String> {
+fn curvine_workspace_root_from_uri(url: &Url) -> std::result::Result<CurvinePath, String> {
     let authority = url.host_str().unwrap_or_default();
     let raw_path = url.path();
     let full = if authority.is_empty() {
@@ -450,17 +584,43 @@ fn relative_object_path(root: &CurvinePath, full_path: &str) -> std::result::Res
     Path::parse(relative).map_err(|e| e.to_string())
 }
 
-fn fs_error_to_object_store(location: &Path, error: impl std::fmt::Display) -> object_store::Error {
-    let msg = error.to_string();
-    if msg.contains("not found") || msg.contains("NotFound") {
-        object_store::Error::NotFound {
+fn fs_error_to_object_store(location: &Path, error: FsError) -> object_store::Error {
+    match error {
+        e @ FsError::FileNotFound(_) => object_store::Error::NotFound {
             path: location.to_string(),
-            source: msg.into(),
-        }
-    } else {
-        object_store::Error::Generic {
+            source: Box::new(e),
+        },
+        e => object_store::Error::Generic {
             store: CURVINE_SCHEME,
-            source: msg.into(),
-        }
+            source: e.to_string().into(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ObjectStoreProvider;
+    use super::*;
+
+    #[test]
+    fn workspace_uri_three_slashes_maps_path_only() {
+        let url = Url::parse("curvine:///data/lancedb/demo").unwrap();
+        let p = curvine_workspace_root_from_uri(&url).unwrap();
+        assert_eq!(p.full_path(), "/data/lancedb/demo");
+    }
+
+    #[test]
+    fn workspace_uri_host_and_path_merge() {
+        let url = Url::parse("curvine://tenant/data/db").unwrap();
+        let p = curvine_workspace_root_from_uri(&url).unwrap();
+        assert_eq!(p.full_path(), "/tenant/data/db");
+    }
+
+    #[test]
+    fn extract_path_strips_leading_slash() {
+        let provider = CurvineObjectStoreProvider::new();
+        let url = Url::parse("curvine:///data/db/key.bin").unwrap();
+        let path = ObjectStoreProvider::extract_path(&provider, &url).unwrap();
+        assert_eq!(path.as_ref(), "data/db/key.bin");
     }
 }

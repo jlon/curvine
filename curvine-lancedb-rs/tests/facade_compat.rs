@@ -66,37 +66,59 @@ async fn namespace_connect_stays_compatible() {
 }
 
 #[tokio::test]
-async fn curvine_uri_reports_explicit_unsupported_boundary() {
-    let err = match lancedb::connect("curvine:///data/lancedb/demo")
+async fn facade_boundary_curvine_connect_fails_without_config() {
+    let saved = std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).ok();
+    std::env::remove_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE);
+
+    let result = lancedb::connect("curvine:///data/lancedb/demo")
         .execute()
-        .await
-    {
-        Ok(_) => panic!("curvine:// should be an explicit unsupported boundary"),
+        .await;
+
+    if let Some(val) = saved {
+        std::env::set_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected connect to fail without Curvine configuration"),
         Err(err) => err,
     };
 
     let rendered = err.to_string();
-    assert!(rendered.contains("Missing Curvine config path"));
+    assert!(
+        rendered.contains("Missing Curvine cluster configuration"),
+        "unexpected error message: {rendered}"
+    );
     assert!(rendered.contains("CURVINE_CONF_FILE"));
 }
 
 #[tokio::test]
-async fn curvine_namespace_uri_reports_explicit_unsupported_boundary() {
+async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
+    let saved = std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).ok();
+    std::env::remove_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE);
+
     let mut properties = HashMap::new();
     properties.insert(
         "root".to_string(),
         "curvine:///data/lancedb/demo".to_string(),
     );
 
-    let err = match lancedb::connect_namespace("dir", properties)
+    let result = lancedb::connect_namespace("dir", properties)
         .execute()
-        .await
-    {
-        Ok(_) => panic!("curvine namespace uri should be an explicit unsupported boundary"),
+        .await;
+
+    if let Some(val) = saved {
+        std::env::set_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected namespace connect to fail without Curvine configuration"),
         Err(err) => err,
     };
 
     let rendered = err.to_string();
-    assert!(rendered.contains("Missing Curvine config path"));
+    assert!(
+        rendered.contains("Missing Curvine cluster configuration"),
+        "unexpected error message: {rendered}"
+    );
     assert!(rendered.contains("CURVINE_CONF_FILE"));
 }

@@ -32,18 +32,22 @@ use lance_io::object_store::{
 };
 use lancedb_upstream::ObjectStoreRegistry;
 use lancedb_upstream::Session;
+use md5::{Digest, Md5};
 use object_store::path::Path;
 use object_store::{
     Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart,
 };
+use tokio::sync::Mutex;
 use url::Url;
+use uuid::Uuid;
 
 pub const CURVINE_SCHEME: &str = "curvine";
 
 pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
+const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -62,6 +66,22 @@ impl std::fmt::Debug for CurvineContext {
 #[derive(Clone)]
 pub struct CurvineObjectStore {
     context: Arc<CurvineContext>,
+}
+
+#[derive(Debug)]
+struct CurvineMultipartUpload {
+    store: CurvineObjectStore,
+    upload_id: String,
+    dest: Path,
+    next_part: usize,
+    completed_parts: Arc<Mutex<Vec<CompletedPart>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedPart {
+    part_idx: usize,
+    etag: String,
+    path: CurvinePath,
 }
 
 impl std::fmt::Debug for CurvineObjectStore {
@@ -241,10 +261,28 @@ impl object_store::ObjectStore for CurvineObjectStore {
 
     async fn put_multipart_opts(
         &self,
-        _location: &Path,
-        _opts: PutMultipartOptions,
+        location: &Path,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        Err(object_store::Error::NotImplemented)
+        if !opts.attributes.is_empty() {
+            return Err(object_store::Error::NotImplemented);
+        }
+
+        let upload_id = Uuid::new_v4().to_string();
+        let upload_dir = self.multipart_dir(&upload_id)?;
+        self.context
+            .fs
+            .mkdir(&upload_dir, true)
+            .await
+            .map_err(|e| fs_error_to_object_store(location, e))?;
+
+        Ok(Box::new(CurvineMultipartUpload {
+            store: self.clone(),
+            upload_id,
+            dest: location.clone(),
+            next_part: 0,
+            completed_parts: Arc::new(Mutex::new(Vec::new())),
+        }))
     }
 
     async fn get_opts(
@@ -388,6 +426,9 @@ impl object_store::ObjectStore for CurvineObjectStore {
                 store: CURVINE_SCHEME,
                 source: msg.into(),
             })?;
+            if is_multipart_internal_location(&entry_location) {
+                continue;
+            }
 
             let (first, nested) = {
                 let mut parts = match entry_location.prefix_match(&base_prefix) {
@@ -444,31 +485,8 @@ impl object_store::ObjectStore for CurvineObjectStore {
             .await
             .map_err(|e| fs_error_to_object_store(to, e))?;
 
-        let mut offset = 0u64;
-        while offset < size {
-            let take = ((size - offset).min(COPY_CHUNK_BYTES as u64)) as usize;
-            if offset > 0 {
-                reader
-                    .seek(offset as i64)
-                    .await
-                    .map_err(|e| fs_error_to_object_store(from, e))?;
-            }
-
-            let mut buf = vec![0u8; take];
-            let n = reader
-                .read_full(&mut buf)
-                .await
-                .map_err(|e| fs_error_to_object_store(from, e))?;
-            if n == 0 {
-                break;
-            }
-            writer
-                .write(&buf[..n])
-                .await
-                .map_err(|e| fs_error_to_object_store(to, e))?;
-            offset += n as u64;
-        }
-
+        self.stream_copy_contents(from, to, size, &mut reader, &mut writer)
+            .await?;
         reader
             .complete()
             .await
@@ -477,12 +495,52 @@ impl object_store::ObjectStore for CurvineObjectStore {
             .complete()
             .await
             .map_err(|e| fs_error_to_object_store(to, e))?;
-
         Ok(())
     }
 
-    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotImplemented)
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        let from_cv = self.object_path(from)?;
+        let to_cv = self.object_path(to)?;
+        let meta = self.head(from).await?;
+        let size = meta.size;
+
+        let mut reader = self
+            .context
+            .fs
+            .open(&from_cv)
+            .await
+            .map_err(|e| fs_error_to_object_store(from, e))?;
+
+        let mut writer = self
+            .context
+            .fs
+            .create(&to_cv, false)
+            .await
+            .map_err(|e| fs_error_to_object_store(to, e))?;
+
+        let copy_result = self
+            .stream_copy_contents(from, to, size, &mut reader, &mut writer)
+            .await;
+
+        let finalize_result = async {
+            copy_result?;
+            reader
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(from, e))?;
+            writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+            Ok(())
+        }
+        .await;
+
+        if finalize_result.is_err() {
+            let _ = self.context.fs.delete(&to_cv, false).await;
+        }
+
+        finalize_result
     }
 }
 
@@ -557,6 +615,9 @@ impl CurvineObjectStore {
                         source: e.to_string().into(),
                     }
                 })?;
+                if self.is_multipart_internal_dir(&child) {
+                    continue;
+                }
                 Box::pin(self.collect_files_recursive(&child, out)).await?;
             } else {
                 let path = relative_object_path(&self.context.workspace_root, &status.path)
@@ -564,11 +625,205 @@ impl CurvineObjectStore {
                         store: CURVINE_SCHEME,
                         source: msg.into(),
                     })?;
+                if is_multipart_internal_location(&path) {
+                    continue;
+                }
                 out.push(file_status_to_object_meta(path, status));
             }
         }
 
         Ok(())
+    }
+
+    fn multipart_dir(&self, upload_id: &str) -> object_store::Result<CurvinePath> {
+        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+        CurvinePath::from_str(format!(
+            "{}/{}/{}",
+            MULTIPART_STAGING_ROOT, workspace_id, upload_id
+        ))
+        .map_err(|e| object_store::Error::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })
+    }
+
+    fn multipart_part_path(
+        &self,
+        upload_id: &str,
+        part_idx: usize,
+    ) -> object_store::Result<CurvinePath> {
+        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+        CurvinePath::from_str(format!(
+            "{}/{}/{}/part-{:08}",
+            MULTIPART_STAGING_ROOT, workspace_id, upload_id, part_idx
+        ))
+        .map_err(|e| object_store::Error::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })
+    }
+
+    async fn cleanup_multipart(&self, upload_id: &str) -> object_store::Result<()> {
+        let dir = self.multipart_dir(upload_id)?;
+        match self.context.fs.delete(&dir, true).await {
+            Ok(_) => Ok(()),
+            Err(FsError::FileNotFound(_))
+            | Err(FsError::Expired(_))
+            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) => Err(fs_error_to_object_store(&Path::default(), e)),
+        }
+    }
+
+    async fn stream_copy_contents(
+        &self,
+        from: &Path,
+        to: &Path,
+        size: u64,
+        reader: &mut impl Reader,
+        writer: &mut impl Writer,
+    ) -> object_store::Result<()> {
+        let mut offset = 0u64;
+        while offset < size {
+            let take = ((size - offset).min(COPY_CHUNK_BYTES as u64)) as usize;
+            if offset > 0 {
+                reader
+                    .seek(offset as i64)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(from, e))?;
+            }
+
+            let mut buf = vec![0u8; take];
+            let n = reader
+                .read_full(&mut buf)
+                .await
+                .map_err(|e| fs_error_to_object_store(from, e))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .write(&buf[..n])
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+            offset += n as u64;
+        }
+
+        Ok(())
+    }
+
+    fn is_multipart_internal_dir(&self, dir: &CurvinePath) -> bool {
+        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+        let mp_root = format!("{}/{workspace_id}", MULTIPART_STAGING_ROOT);
+        let dir = dir.full_path();
+        dir == mp_root || dir.starts_with(&format!("{mp_root}/"))
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for CurvineMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let store = self.store.clone();
+        let upload_id = self.upload_id.clone();
+        let part_idx = self.next_part;
+        self.next_part += 1;
+        let completed_parts = Arc::clone(&self.completed_parts);
+
+        Box::pin(async move {
+            let path = store.multipart_part_path(&upload_id, part_idx)?;
+            let mut writer = store
+                .context
+                .fs
+                .create(&path, true)
+                .await
+                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+
+            let mut hasher = Md5::new();
+            for chunk in data.iter() {
+                hasher.update(chunk);
+                writer
+                    .write(chunk)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+            }
+            writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+
+            let etag = format!("\"{:x}\"", hasher.finalize());
+            let mut guard = completed_parts.lock().await;
+            guard.push(CompletedPart {
+                part_idx,
+                etag,
+                path,
+            });
+            Ok(())
+        })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let mut parts = self.completed_parts.lock().await.clone();
+        parts.sort_by_key(|p| p.part_idx);
+
+        let dest = self.store.object_path(&self.dest)?;
+        let mut writer = self
+            .store
+            .context
+            .fs
+            .create(&dest, true)
+            .await
+            .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+
+        let mut etag_inputs = String::new();
+        let write_result: object_store::Result<()> = async {
+            for part in parts {
+                let part_meta = self
+                    .store
+                    .context
+                    .fs
+                    .get_status(&part.path)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+                let mut reader = self
+                    .store
+                    .context
+                    .fs
+                    .open(&part.path)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+                self.store
+                    .stream_copy_contents(
+                        &self.dest,
+                        &self.dest,
+                        part_meta.len as u64,
+                        &mut reader,
+                        &mut writer,
+                    )
+                    .await?;
+                reader
+                    .complete()
+                    .await
+                    .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+                etag_inputs.push_str(&part.etag);
+            }
+            writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+            Ok(())
+        }
+        .await;
+
+        self.store.cleanup_multipart(&self.upload_id).await?;
+        write_result?;
+
+        Ok(PutResult {
+            e_tag: Some(etag_inputs),
+            version: None,
+        })
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.store.cleanup_multipart(&self.upload_id).await
     }
 }
 
@@ -633,6 +888,18 @@ fn relative_object_path(root: &CurvinePath, full_path: &str) -> std::result::Res
         .unwrap_or(full_path)
         .trim_start_matches('/');
     Path::parse(relative).map_err(|e| e.to_string())
+}
+
+fn is_multipart_internal_location(location: &Path) -> bool {
+    let rel = location.as_ref();
+    rel == MULTIPART_STAGING_ROOT || rel.starts_with(&format!("{MULTIPART_STAGING_ROOT}/"))
+}
+
+fn workspace_staging_id(workspace_root: &CurvinePath) -> String {
+    workspace_root
+        .full_path()
+        .trim_start_matches('/')
+        .replace('/', "__")
 }
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> object_store::Error {

@@ -2082,10 +2082,12 @@ dependencies = [
  "lance-core",
  "lance-io",
  "lancedb",
+ "md-5",
  "object_store",
  "tempfile",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

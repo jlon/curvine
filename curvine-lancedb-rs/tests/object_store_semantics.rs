@@ -9,8 +9,9 @@
 //! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored`
 //!
 //! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
-//! `copy` (source retained, destination overwritten when present), `delete`, recursive `list`,
-//! `list_with_delimiter` (directory prefix is not listed as a file object).
+//! `copy` (source retained, destination overwritten when present), `copy_if_not_exists`,
+//! `delete`, recursive `list`, `list_with_delimiter` (directory prefix is not listed as a file
+//! object), and multipart staging invisibility / complete / abort.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::ObjectStoreProvider;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange};
+use object_store::{GetOptions, GetRange, MultipartUpload};
 use url::Url;
 
 #[tokio::test]
@@ -197,4 +198,74 @@ async fn curvine_object_store_semantics_live_cluster() {
         !listed_after.iter().any(|p| ends(p, &rel_copy)),
         "delete must remove object from recursive list results"
     );
+
+    let copy_if_missing = Path::parse(format!("{pfx}/nested/copy_if_missing.bin")).unwrap();
+    store
+        .inner
+        .copy_if_not_exists(&key, &copy_if_missing)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_one_all(&copy_if_missing).await.unwrap().as_ref(),
+        b"overwrite",
+        "copy_if_not_exists creates destination when absent"
+    );
+    let copy_if_exists = store.inner.copy_if_not_exists(&key, &copy_if_missing).await;
+    assert!(matches!(
+        copy_if_exists,
+        Err(object_store::Error::AlreadyExists { .. })
+    ));
+
+    let multipart_key = Path::parse(format!("{pfx}/multipart/final.bin")).unwrap();
+    let mut upload = store.inner.put_multipart(&multipart_key).await.unwrap();
+    upload
+        .put_part(Vec::from(&b"hello "[..]).into())
+        .await
+        .unwrap();
+    upload
+        .put_part(Vec::from(&b"multipart"[..]).into())
+        .await
+        .unwrap();
+    let listed_during_multipart: Vec<Path> = store
+        .list(None)
+        .map(|r| r.expect("list entry").location)
+        .collect()
+        .await;
+    assert!(
+        listed_during_multipart
+            .iter()
+            .all(|p| !p.as_ref().contains(".curvine/lancedb/multipart")),
+        "internal multipart staging must stay invisible to object listing"
+    );
+    let lr_root_during_multipart = store.inner.list_with_delimiter(None).await.unwrap();
+    assert!(
+        lr_root_during_multipart
+            .objects
+            .iter()
+            .all(|o| !o.location.as_ref().contains(".curvine/lancedb/multipart")),
+        "root objects must not expose multipart staging files"
+    );
+    assert!(
+        lr_root_during_multipart
+            .common_prefixes
+            .iter()
+            .all(|p| !p.as_ref().contains(".curvine/lancedb/multipart")),
+        "root prefixes must not expose multipart staging directories"
+    );
+    let mp_res = upload.complete().await.unwrap();
+    assert!(mp_res.e_tag.is_some());
+    assert_eq!(
+        store.read_one_all(&multipart_key).await.unwrap().as_ref(),
+        b"hello multipart",
+        "multipart complete must concatenate parts in order"
+    );
+
+    let abort_key = Path::parse(format!("{pfx}/multipart/aborted.bin")).unwrap();
+    let mut abort_upload = store.inner.put_multipart(&abort_key).await.unwrap();
+    abort_upload
+        .put_part(Vec::from(&b"temp-data"[..]).into())
+        .await
+        .unwrap();
+    abort_upload.abort().await.unwrap();
+    assert!(store.inner.head(&abort_key).await.is_err());
 }

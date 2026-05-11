@@ -20,9 +20,11 @@ futures = { workspace = true }
 lance-core = "4.0.0"
 lance-io = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
+md-5 = { workspace = true }
 object_store = "0.12.5"
 tokio = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 arrow-array = "57.2"

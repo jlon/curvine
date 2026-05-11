@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::curvine_database::CurvineIntegrityDatabase;
 use crate::object_store::curvine_session;
+use lancedb_upstream::embeddings::{EmbeddingRegistry, MemoryRegistry};
 
 pub use lancedb_upstream::connection::{CloneTableBuilder, OpenTableBuilder, TableNamesBuilder};
 pub use lancedb_upstream::connection::{ConnectRequest, Connection, LanceFileVersion};
@@ -22,6 +25,13 @@ pub use lancedb_upstream::connection::{ConnectRequest, Connection, LanceFileVers
 #[derive(Debug)]
 enum ConnectBuilderInner {
     Upstream(Box<lancedb_upstream::connection::ConnectBuilder>),
+    Curvine {
+        uri: String,
+        storage_options: HashMap<String, String>,
+        read_consistency_interval: Option<std::time::Duration>,
+        embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
+        session: Option<Arc<lancedb_upstream::Session>>,
+    },
 }
 
 #[derive(Debug)]
@@ -31,12 +41,18 @@ pub struct ConnectBuilder {
 
 impl ConnectBuilder {
     pub fn new(uri: &str) -> Self {
-        let builder = lancedb_upstream::connect(uri);
         if is_curvine_uri(uri) {
             Self {
-                inner: ConnectBuilderInner::Upstream(Box::new(builder.session(curvine_session()))),
+                inner: ConnectBuilderInner::Curvine {
+                    uri: uri.to_string(),
+                    storage_options: HashMap::new(),
+                    read_consistency_interval: None,
+                    embedding_registry: None,
+                    session: Some(curvine_session()),
+                },
             }
         } else {
+            let builder = lancedb_upstream::connect(uri);
             Self {
                 inner: ConnectBuilderInner::Upstream(Box::new(builder)),
             }
@@ -53,6 +69,21 @@ impl ConnectBuilder {
             ConnectBuilderInner::Upstream(builder) => Self {
                 inner: ConnectBuilderInner::Upstream(Box::new(f(*builder))),
             },
+            ConnectBuilderInner::Curvine {
+                uri,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+            } => Self {
+                inner: ConnectBuilderInner::Curvine {
+                    uri,
+                    storage_options,
+                    read_consistency_interval,
+                    embedding_registry,
+                    session,
+                },
+            },
         }
     }
 
@@ -60,33 +91,166 @@ impl ConnectBuilder {
         self,
         database_options: &dyn lancedb_upstream::database::DatabaseOptions,
     ) -> Self {
-        self.map_upstream(|builder| builder.database_options(database_options))
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(
+                    builder.database_options(database_options),
+                )),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                mut storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+            } => {
+                database_options.serialize_into_map(&mut storage_options);
+                Self {
+                    inner: ConnectBuilderInner::Curvine {
+                        uri,
+                        storage_options,
+                        read_consistency_interval,
+                        embedding_registry,
+                        session,
+                    },
+                }
+            }
+        }
     }
 
     pub fn embedding_registry(
         self,
         registry: std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>,
     ) -> Self {
-        self.map_upstream(|builder| builder.embedding_registry(registry))
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(
+                    builder.embedding_registry(registry),
+                )),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                storage_options,
+                read_consistency_interval,
+                session,
+                ..
+            } => Self {
+                inner: ConnectBuilderInner::Curvine {
+                    uri,
+                    storage_options,
+                    read_consistency_interval,
+                    embedding_registry: Some(registry),
+                    session,
+                },
+            },
+        }
     }
 
     pub fn storage_option(self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.map_upstream(|builder| builder.storage_option(key, value))
+        let key = key.into();
+        let value = value.into();
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(builder.storage_option(key, value))),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                mut storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+            } => {
+                storage_options.insert(key, value);
+                Self {
+                    inner: ConnectBuilderInner::Curvine {
+                        uri,
+                        storage_options,
+                        read_consistency_interval,
+                        embedding_registry,
+                        session,
+                    },
+                }
+            }
+        }
     }
 
     pub fn storage_options(
         self,
         pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
-        self.map_upstream(|builder| builder.storage_options(pairs))
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(builder.storage_options(pairs))),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                mut storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+            } => {
+                for (key, value) in pairs {
+                    storage_options.insert(key.into(), value.into());
+                }
+                Self {
+                    inner: ConnectBuilderInner::Curvine {
+                        uri,
+                        storage_options,
+                        read_consistency_interval,
+                        embedding_registry,
+                        session,
+                    },
+                }
+            }
+        }
     }
 
     pub fn read_consistency_interval(self, read_consistency_interval: std::time::Duration) -> Self {
-        self.map_upstream(|builder| builder.read_consistency_interval(read_consistency_interval))
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(
+                    builder.read_consistency_interval(read_consistency_interval),
+                )),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                storage_options,
+                embedding_registry,
+                session,
+                ..
+            } => Self {
+                inner: ConnectBuilderInner::Curvine {
+                    uri,
+                    storage_options,
+                    read_consistency_interval: Some(read_consistency_interval),
+                    embedding_registry,
+                    session,
+                },
+            },
+        }
     }
 
     pub fn session(self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
-        self.map_upstream(|builder| builder.session(session))
+        match self.inner {
+            ConnectBuilderInner::Upstream(builder) => Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(builder.session(session))),
+            },
+            ConnectBuilderInner::Curvine {
+                uri,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                ..
+            } => Self {
+                inner: ConnectBuilderInner::Curvine {
+                    uri,
+                    storage_options,
+                    read_consistency_interval,
+                    embedding_registry,
+                    session: Some(session),
+                },
+            },
+        }
     }
 
     #[cfg(feature = "remote")]
@@ -112,6 +276,25 @@ impl ConnectBuilder {
     pub async fn execute(self) -> lancedb_upstream::Result<Connection> {
         match self.inner {
             ConnectBuilderInner::Upstream(builder) => builder.execute().await,
+            ConnectBuilderInner::Curvine {
+                uri,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+            } => {
+                let db = CurvineIntegrityDatabase::connect(
+                    &uri,
+                    storage_options,
+                    read_consistency_interval,
+                    session,
+                )
+                .await?;
+                Ok(Connection::new(
+                    Arc::new(db),
+                    embedding_registry.unwrap_or_else(|| Arc::new(MemoryRegistry::new())),
+                ))
+            }
         }
     }
 }

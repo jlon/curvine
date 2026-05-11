@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-
 #[test]
 fn error_module_reexports_upstream_error_types() {
     let err = lancedb::error::Error::NotSupported {

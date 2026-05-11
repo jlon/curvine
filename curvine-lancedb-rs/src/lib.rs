@@ -14,6 +14,7 @@
 
 pub use lancedb_upstream::arrow;
 pub mod connection;
+pub mod curvine_database;
 pub mod error;
 pub mod object_store;
 pub use lancedb_upstream::data;

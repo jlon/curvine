@@ -174,6 +174,12 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         Ok(store)
     }
 
+    /// The opening `curvine://...` URI identifies the workspace root, not an object key.
+    ///
+    /// We therefore validate the URI with the same absolute-path merger used for
+    /// `workspace_root`, and then return an empty relative [`Path`]. All later
+    /// `head/get/put/list/...` calls operate on keys that are relative to that
+    /// workspace root.
     fn extract_path(&self, url: &Url) -> Result<Path> {
         curvine_workspace_root_from_uri(url).map_err(|e| {
             lance_core::Error::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
@@ -729,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_path_empty_dataset_paths_use_workspace_root_only() {
+    fn extract_path_returns_empty_relative_key_for_workspace_uri() {
         let provider = CurvineObjectStoreProvider::new();
         for uri in [
             "curvine:///data/db",

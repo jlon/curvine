@@ -82,6 +82,12 @@ impl std::fmt::Display for CurvineObjectStore {
     }
 }
 
+/// [`ObjectStoreProvider`] for `curvine://` URIs.
+///
+/// The opening URI is turned into one absolute Curvine workspace path (authority, when present,
+/// is the first path segment: `curvine://tenant/a` → `/tenant/a`). [`ObjectStoreProvider::extract_path`]
+/// applies the same validation and returns an empty [`object_store::path::Path`] because Lance object
+/// keys are relative to that workspace root.
 #[derive(Debug, Clone, Default)]
 pub struct CurvineObjectStoreProvider;
 
@@ -169,17 +175,10 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        let trimmed = url.path().trim_start_matches('/');
-        if trimmed.is_empty() {
-            Ok(Path::default())
-        } else {
-            Path::parse(trimmed).map_err(|e| {
-                lance_core::Error::invalid_input(format!(
-                    "Invalid curvine object path in URL `{}`: {e}",
-                    url.path()
-                ))
-            })
-        }
+        curvine_workspace_root_from_uri(url).map_err(|e| {
+            lance_core::Error::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
+        })?;
+        Ok(Path::default())
     }
 
     fn calculate_object_store_prefix(
@@ -409,6 +408,9 @@ impl object_store::ObjectStore for CurvineObjectStore {
         })
     }
 
+/// Read object `from` fully and write to `to`. The destination is opened with replace semantics
+/// (`create(..., overwrite = true)`): an existing object at `to` is replaced. The source object
+/// is left unchanged (copy, not move).
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         let from_cv = self.object_path(from)?;
         let to_cv = self.object_path(to)?;
@@ -572,7 +574,9 @@ pub fn curvine_session() -> Arc<Session> {
     Arc::new(Session::new(0, 0, curvine_registry()))
 }
 
-fn curvine_workspace_root_from_uri(url: &Url) -> std::result::Result<CurvinePath, String> {
+/// Absolute Curvine filesystem path for `url`: uses `url.path()`, and when `authority` is non-empty
+/// inserts it as the first segment (`curvine://tenant/foo` → `/tenant/foo`; `curvine:///foo` → `/foo`).
+fn curvine_absolute_path_str_from_uri(url: &Url) -> std::result::Result<String, String> {
     let authority = url.host_str().unwrap_or_default();
     let raw_path = url.path();
     let full = if authority.is_empty() {
@@ -582,8 +586,12 @@ fn curvine_workspace_root_from_uri(url: &Url) -> std::result::Result<CurvinePath
     } else {
         format!("/{authority}{raw_path}")
     };
+    Ok(full)
+}
 
-    CurvinePath::from_str(full).map_err(|e| e.to_string())
+fn curvine_workspace_root_from_uri(url: &Url) -> std::result::Result<CurvinePath, String> {
+    let full = curvine_absolute_path_str_from_uri(url)?;
+    CurvinePath::from_str(&full).map_err(|e| e.to_string())
 }
 
 /// Curvine [`FileStatus`] → [`ObjectMeta`].
@@ -714,10 +722,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_path_strips_leading_slash() {
+    fn workspace_uri_tenant_only() {
+        let url = Url::parse("curvine://tenant").unwrap();
+        let p = curvine_workspace_root_from_uri(&url).unwrap();
+        assert_eq!(p.full_path(), "/tenant");
+    }
+
+    #[test]
+    fn extract_path_empty_dataset_paths_use_workspace_root_only() {
         let provider = CurvineObjectStoreProvider::new();
-        let url = Url::parse("curvine:///data/db/key.bin").unwrap();
-        let path = ObjectStoreProvider::extract_path(&provider, &url).unwrap();
-        assert_eq!(path.as_ref(), "data/db/key.bin");
+        for uri in [
+            "curvine:///data/db",
+            "curvine://tenant/data/db",
+            "curvine://tenant",
+            "curvine:///data/lancedb/demo",
+        ] {
+            let url = Url::parse(uri).unwrap();
+            let workspace = curvine_workspace_root_from_uri(&url).unwrap();
+            assert!(
+                !workspace.full_path().is_empty(),
+                "workspace root must be non-empty: {uri}"
+            );
+            let extracted = ObjectStoreProvider::extract_path(&provider, &url).unwrap();
+            assert!(
+                extracted.as_ref().is_empty(),
+                "extract_path must be empty; object keys are relative to workspace root (merged absolute path `{}`): {uri}",
+                workspace.full_path()
+            );
+        }
     }
 }

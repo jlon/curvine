@@ -95,6 +95,32 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
         "copy must retain source object"
     );
 
+    let dst_existing = Path::parse(format!("{pfx}/nested/copy_overwrite_dst.bin")).unwrap();
+    let src_for_overwrite = Path::parse(format!("{pfx}/nested/copy_overwrite_src.bin")).unwrap();
+    store
+        .put(&dst_existing, b"stale-destination")
+        .await
+        .unwrap();
+    store
+        .put(&src_for_overwrite, b"fresh-source-payload")
+        .await
+        .unwrap();
+    store.copy(&src_for_overwrite, &dst_existing).await.unwrap();
+    assert_eq!(
+        store.read_one_all(&dst_existing).await.unwrap().as_ref(),
+        b"fresh-source-payload",
+        "copy replaces an existing destination object"
+    );
+    assert_eq!(
+        store
+            .read_one_all(&src_for_overwrite)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"fresh-source-payload",
+        "copy overwrite must keep the source object"
+    );
+
     let prefix_path = Path::parse(format!("{pfx}/")).unwrap();
     let mut listed: Vec<Path> = store
         .list(Some(prefix_path.clone()))

@@ -87,7 +87,7 @@ impl std::fmt::Display for CurvineObjectStore {
 /// The opening URI is turned into one absolute Curvine workspace path (authority, when present,
 /// is the first path segment: `curvine://tenant/a` → `/tenant/a`). [`ObjectStoreProvider::extract_path`]
 /// applies the same validation and returns an empty [`object_store::path::Path`] because Lance object
-/// keys are relative to that workspace root. See `PHASE4-CURVINE-OBJECT-STORE.md` in this crate.
+/// keys are relative to that workspace root. See `docs/phase4-curvine-object-store-and-lancedb.md` in this crate.
 #[derive(Debug, Clone, Default)]
 pub struct CurvineObjectStoreProvider;
 

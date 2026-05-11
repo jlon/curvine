@@ -147,7 +147,13 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
 
-        Ok(ObjectStore::new(
+        let prefix = ObjectStoreProvider::calculate_object_store_prefix(
+            self,
+            &base_path,
+            params.storage_options(),
+        )?;
+
+        let mut store = ObjectStore::new(
             Arc::new(CurvineObjectStore { context }),
             base_path,
             params.block_size,
@@ -157,7 +163,9 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
             DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             params.storage_options(),
-        ))
+        );
+        store.store_prefix = prefix;
+        Ok(store)
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -273,7 +281,7 @@ impl object_store::ObjectStore for CurvineObjectStore {
                     .as_range(meta.size)
                     .map_err(|source| object_store::Error::Generic {
                         store: CURVINE_SCHEME,
-                        source: source.to_string().into(),
+                        source: Box::new(source),
                     })?
             }
             None => 0..meta.size,
@@ -355,11 +363,8 @@ impl object_store::ObjectStore for CurvineObjectStore {
         };
 
         let statuses = self
-            .context
-            .fs
-            .list_status(&root_path)
-            .await
-            .map_err(|e| fs_error_to_object_store(prefix.unwrap_or(&Path::default()), e))?;
+            .list_curvine_dir_or_empty(&root_path, prefix.unwrap_or(&Path::default()))
+            .await?;
 
         let base_prefix = prefix.cloned().unwrap_or_default();
         let mut common_prefixes = BTreeSet::new();
@@ -468,12 +473,18 @@ impl object_store::ObjectStore for CurvineObjectStore {
 
 impl CurvineObjectStore {
     fn object_path(&self, location: &Path) -> object_store::Result<CurvinePath> {
-        let rel = location.as_ref().trim_start_matches('/');
+        let rel_raw = location.as_ref().trim_start_matches('/');
         let base = self
             .context
             .workspace_root
             .full_path()
             .trim_end_matches('/');
+        let base_tail = base.trim_start_matches('/');
+        let rel = rel_raw
+            .strip_prefix(base_tail)
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or(rel_raw);
+
         let full = if rel.is_empty() {
             base.to_string()
         } else {
@@ -484,6 +495,25 @@ impl CurvineObjectStore {
             store: CURVINE_SCHEME,
             source: e.to_string().into(),
         })
+    }
+
+    async fn list_curvine_dir_or_empty(
+        &self,
+        dir: &CurvinePath,
+        err_location: &Path,
+    ) -> object_store::Result<Vec<curvine_common::state::FileStatus>> {
+        match self.context.fs.list_status(dir).await {
+            Ok(entries) => Ok(entries),
+            Err(e)
+                if matches!(
+                    &e,
+                    FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
+                ) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(fs_error_to_object_store(err_location, e)),
+        }
     }
 
     async fn collect_under_prefix(
@@ -506,11 +536,8 @@ impl CurvineObjectStore {
         out: &mut Vec<ObjectMeta>,
     ) -> object_store::Result<()> {
         let statuses = self
-            .context
-            .fs
-            .list_status(dir)
-            .await
-            .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+            .list_curvine_dir_or_empty(dir, &Path::default())
+            .await?;
 
         for status in statuses {
             if status.is_dir {
@@ -559,18 +586,26 @@ fn curvine_workspace_root_from_uri(url: &Url) -> std::result::Result<CurvinePath
     CurvinePath::from_str(full).map_err(|e| e.to_string())
 }
 
+/// Curvine [`FileStatus`] → [`ObjectMeta`].
+///
+/// - **size / last_modified**: from `len` and `mtime` (ms since epoch on wire).
+/// - **e_tag**: weak synthetic tag `W/"cv:{inode}:{mtime_ms}"` for stable referential
+///   identity; **not** a content digest. Do not use for byte-accurate conditional semantics
+///   until a content hash is wired through the filesystem.
+/// - **version**: always `None` (no object-version id exposed yet).
 fn file_status_to_object_meta(
     location: Path,
     status: curvine_common::state::FileStatus,
 ) -> ObjectMeta {
     let secs = status.mtime.div_euclid(1000);
     let millis = status.mtime.rem_euclid(1000) as u32;
+    let weak_etag = Some(format!("W/\"cv:{}:{}\"", status.id, status.mtime));
     ObjectMeta {
         location,
         last_modified: DateTime::<Utc>::from_timestamp(secs, millis * 1_000_000)
             .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
         size: status.len as u64,
-        e_tag: None,
+        e_tag: weak_etag,
         version: None,
     }
 }
@@ -586,21 +621,83 @@ fn relative_object_path(root: &CurvinePath, full_path: &str) -> std::result::Res
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> object_store::Error {
     match error {
-        e @ FsError::FileNotFound(_) => object_store::Error::NotFound {
+        e @ FsError::FileNotFound(_) | e @ FsError::Expired(_) | e @ FsError::JobNotFound(_) => {
+            object_store::Error::NotFound {
+                path: location.to_string(),
+                source: Box::new(e),
+            }
+        }
+        e @ FsError::FileAlreadyExists(_) => object_store::Error::AlreadyExists {
             path: location.to_string(),
             source: Box::new(e),
         },
+        e @ FsError::Unsupported(_) | e @ FsError::UnsupportedUfsRead(_) => {
+            object_store::Error::NotSupported {
+                source: Box::new(e),
+            }
+        }
         e => object_store::Error::Generic {
             store: CURVINE_SCHEME,
-            source: e.to_string().into(),
+            source: Box::new(e),
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use curvine_common::state::FileStatus;
+
     use super::ObjectStoreProvider;
     use super::*;
+
+    #[test]
+    fn fs_error_maps_variants_predictably() {
+        let loc = Path::from("k");
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::file_not_found("/a")),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::file_expired("/a")),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::job_not_found("j")),
+            object_store::Error::NotFound { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::file_exists("/a")),
+            object_store::Error::AlreadyExists { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::unsupported("x")),
+            object_store::Error::NotSupported { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::unsupported_ufs_read("/a")),
+            object_store::Error::NotSupported { .. }
+        ));
+        assert!(matches!(
+            fs_error_to_object_store(&loc, FsError::invalid_path("/a", "bad")),
+            object_store::Error::Generic { .. }
+        ));
+    }
+
+    #[test]
+    fn object_meta_carries_size_mtime_and_weak_etag() {
+        let st = FileStatus {
+            id: 7,
+            mtime: 1_700_000_000_123,
+            len: 4096,
+            ..Default::default()
+        };
+        let m = file_status_to_object_meta(Path::from("p/obj"), st);
+        assert_eq!(m.size, 4096);
+        assert!(m.e_tag.as_ref().unwrap().contains("7"));
+        assert!(m.e_tag.as_ref().unwrap().contains("1700000000123"));
+        assert!(m.e_tag.as_ref().unwrap().starts_with("W/\""));
+        assert!(m.version.is_none());
+    }
 
     #[test]
     fn workspace_uri_three_slashes_maps_path_only() {

@@ -76,8 +76,8 @@ async fn curvine_uri_reports_explicit_unsupported_boundary() {
     };
 
     let rendered = err.to_string();
-    assert!(rendered.contains("curvine://"));
-    assert!(rendered.contains("not implemented"));
+    assert!(rendered.contains("Missing Curvine config path"));
+    assert!(rendered.contains("CURVINE_CONF_FILE"));
 }
 
 #[tokio::test]
@@ -97,6 +97,6 @@ async fn curvine_namespace_uri_reports_explicit_unsupported_boundary() {
     };
 
     let rendered = err.to_string();
-    assert!(rendered.contains("curvine://"));
-    assert!(rendered.contains("not implemented"));
+    assert!(rendered.contains("Missing Curvine config path"));
+    assert!(rendered.contains("CURVINE_CONF_FILE"));
 }

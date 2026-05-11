@@ -2070,6 +2070,8 @@ dependencies = [
 name = "curvine-lancedb-rs"
 version = "0.2.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "async-stream",
  "async-trait",
  "bytes",

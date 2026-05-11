@@ -3,7 +3,14 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
-//! Integration checks for Curvine-backed [`object_store`] semantics (requires live cluster).
+//! Phase 4B — live Curvine [`object_store`] semantics (one integration test).
+//!
+//! Run (requires a reachable Curvine cluster and `CURVINE_CONF_FILE`):
+//! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored`
+//!
+//! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
+//! `copy` (source retained, destination overwritten when present), `delete`, recursive `list`,
+//! `list_with_delimiter` (directory prefix is not listed as a file object).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,8 +24,8 @@ use object_store::{GetOptions, GetRange};
 use url::Url;
 
 #[tokio::test]
-#[ignore = "requires Curvine cluster + CURVINE_CONF_FILE; run with cargo test -- --ignored"]
-async fn curvine_object_store_head_range_put_list_copy_delete() {
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+async fn curvine_object_store_semantics_live_cluster() {
     let conf =
         std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).expect("CURVINE_CONF_FILE");
 
@@ -40,10 +47,16 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
     let store = provider.new_store(url, &params).await.expect("new_store");
 
     let pfx = format!("pfx_{unique}");
-    let root_key = Path::parse("root_marker.txt").unwrap();
+    let rel_root = "root_marker.txt";
+    let rel_key = format!("{pfx}/nested/obj.bin");
+    let rel_copy = format!("{pfx}/nested/obj_copy.bin");
+    let rel_dst = format!("{pfx}/nested/copy_overwrite_dst.bin");
+    let rel_src = format!("{pfx}/nested/copy_overwrite_src.bin");
+
+    let root_key = Path::parse(rel_root).unwrap();
     store.put(&root_key, b"root").await.unwrap();
 
-    let key = Path::parse(format!("{pfx}/nested/obj.bin")).unwrap();
+    let key = Path::parse(&rel_key).unwrap();
     let payload: &[u8] = b"hello-range-copy";
     store.put(&key, payload).await.unwrap();
 
@@ -83,7 +96,7 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
     let full = store.read_one_all(&key).await.unwrap();
     assert_eq!(full.as_ref(), b"overwrite");
 
-    let copy_key = Path::parse(format!("{pfx}/nested/obj_copy.bin")).unwrap();
+    let copy_key = Path::parse(&rel_copy).unwrap();
     store.copy(&key, &copy_key).await.unwrap();
     assert_eq!(
         store.read_one_all(&copy_key).await.unwrap().as_ref(),
@@ -95,8 +108,8 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
         "copy must retain source object"
     );
 
-    let dst_existing = Path::parse(format!("{pfx}/nested/copy_overwrite_dst.bin")).unwrap();
-    let src_for_overwrite = Path::parse(format!("{pfx}/nested/copy_overwrite_src.bin")).unwrap();
+    let dst_existing = Path::parse(&rel_dst).unwrap();
+    let src_for_overwrite = Path::parse(&rel_src).unwrap();
     store
         .put(&dst_existing, b"stale-destination")
         .await
@@ -128,14 +141,17 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
         .collect()
         .await;
     listed.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    assert!(listed.iter().any(|p| p.as_ref().ends_with("obj.bin")));
-    assert!(listed.iter().any(|p| p.as_ref().ends_with("obj_copy.bin")));
+    let ends = |p: &Path, s: &str| p.as_ref().ends_with(s);
+    assert!(listed.iter().any(|p| ends(p, &rel_key)));
+    assert!(listed.iter().any(|p| ends(p, &rel_copy)));
+    assert!(listed.iter().any(|p| ends(p, &rel_dst)));
+    assert!(listed.iter().any(|p| ends(p, &rel_src)));
 
     let lr_root = store.inner.list_with_delimiter(None).await.unwrap();
     assert!(lr_root
         .objects
         .iter()
-        .any(|o| o.location.as_ref().ends_with("root_marker.txt")));
+        .any(|o| o.location.as_ref().ends_with(rel_root)));
     assert!(lr_root
         .common_prefixes
         .iter()
@@ -161,4 +177,14 @@ async fn curvine_object_store_head_range_put_list_copy_delete() {
 
     store.delete(&copy_key).await.unwrap();
     assert!(store.inner.head(&copy_key).await.is_err());
+
+    let listed_after: Vec<Path> = store
+        .list(Some(prefix_path))
+        .map(|r| r.expect("list entry").location)
+        .collect()
+        .await;
+    assert!(
+        !listed_after.iter().any(|p| ends(p, &rel_copy)),
+        "delete must remove object from recursive list results"
+    );
 }

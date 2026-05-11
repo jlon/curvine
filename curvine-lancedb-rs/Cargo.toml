@@ -25,6 +25,8 @@ tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+arrow-array = "57.2"
+arrow-schema = "57.2"
 tempfile = { workspace = true }
 
 [features]

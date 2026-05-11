@@ -21,8 +21,13 @@ use lancedb::query::ExecutableQuery;
 #[tokio::test]
 #[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored"]
 async fn lancedb_curvine_smoke_connect_table_query_names() {
-    let conf =
-        std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).expect("CURVINE_CONF_FILE");
+    let conf = match std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("Skipping live LanceDB smoke test: CURVINE_CONF_FILE is not set");
+            return;
+        }
+    };
 
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

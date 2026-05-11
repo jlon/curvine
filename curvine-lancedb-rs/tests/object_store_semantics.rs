@@ -26,8 +26,13 @@ use url::Url;
 #[tokio::test]
 #[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_semantics_live_cluster() {
-    let conf =
-        std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).expect("CURVINE_CONF_FILE");
+    let conf = match std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("Skipping live object-store semantics test: CURVINE_CONF_FILE is not set");
+            return;
+        }
+    };
 
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

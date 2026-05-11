@@ -481,17 +481,12 @@ impl object_store::ObjectStore for CurvineObjectStore {
 
 impl CurvineObjectStore {
     fn object_path(&self, location: &Path) -> object_store::Result<CurvinePath> {
-        let rel_raw = location.as_ref().trim_start_matches('/');
+        let rel = location.as_ref().trim_start_matches('/');
         let base = self
             .context
             .workspace_root
             .full_path()
             .trim_end_matches('/');
-        let base_tail = base.trim_start_matches('/');
-        let rel = rel_raw
-            .strip_prefix(base_tail)
-            .map(|s| s.trim_start_matches('/'))
-            .unwrap_or(rel_raw);
 
         let full = if rel.is_empty() {
             base.to_string()

@@ -3,12 +3,16 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::TryStreamExt;
+use lance_core::Error as LanceCoreError;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, DescribeNamespaceRequest,
@@ -22,8 +26,10 @@ use lancedb_upstream::database::{
 };
 use lancedb_upstream::error::{Error, Result};
 use lancedb_upstream::table::{BaseTable, NativeTable, ReadParams, WriteOptions};
-use lancedb_upstream::utils::validate_namespace_name;
+use lancedb_upstream::utils::{validate_namespace_name, validate_table_name};
+use lancedb_upstream::Session;
 use md5::{Digest, Md5};
+use object_store::path::Path as OsPath;
 use serde::{Deserialize, Serialize};
 
 use crate::object_store::curvine_session;
@@ -56,14 +62,14 @@ struct VersionChecksum {
 pub struct CurvineIntegrityDatabase {
     uri: String,
     object_store: Arc<ObjectStore>,
-    base_path: object_store::path::Path,
-    read_consistency_interval: Option<std::time::Duration>,
+    base_path: OsPath,
+    read_consistency_interval: Option<Duration>,
     storage_options: HashMap<String, String>,
-    session: Arc<lancedb_upstream::Session>,
+    session: Arc<Session>,
 }
 
-impl std::fmt::Display for CurvineIntegrityDatabase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for CurvineIntegrityDatabase {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "CurvineIntegrityDatabase(uri={})", self.uri)
     }
 }
@@ -72,8 +78,8 @@ impl CurvineIntegrityDatabase {
     pub async fn connect(
         uri: &str,
         storage_options: HashMap<String, String>,
-        read_consistency_interval: Option<std::time::Duration>,
-        session: Option<Arc<lancedb_upstream::Session>>,
+        read_consistency_interval: Option<Duration>,
+        session: Option<Arc<Session>>,
     ) -> Result<Self> {
         let session = session.unwrap_or_else(curvine_session);
         let params = ObjectStoreParams {
@@ -98,12 +104,12 @@ impl CurvineIntegrityDatabase {
         })
     }
 
-    fn store_path(&self, rel: &str) -> Result<object_store::path::Path> {
+    fn store_path(&self, rel: &str) -> Result<OsPath> {
         let base = self.base_path.as_ref();
         if base.is_empty() {
-            object_store::path::Path::parse(rel).map_err(Error::from)
+            OsPath::parse(rel).map_err(Error::from)
         } else {
-            object_store::path::Path::parse(format!("{base}/{rel}")).map_err(Error::from)
+            OsPath::parse(format!("{base}/{rel}")).map_err(Error::from)
         }
     }
 
@@ -112,7 +118,7 @@ impl CurvineIntegrityDatabase {
             Ok(vec![ROOT_NAMESPACE_COMPONENT.to_string()])
         } else {
             for component in namespace_path {
-                lancedb_upstream::utils::validate_namespace_name(component)?;
+                validate_namespace_name(component)?;
             }
             Ok(namespace_path.to_vec())
         }
@@ -124,7 +130,7 @@ impl CurvineIntegrityDatabase {
     }
 
     fn table_root(&self, name: &str, namespace_path: &[String]) -> Result<String> {
-        lancedb_upstream::utils::validate_table_name(name)?;
+        validate_table_name(name)?;
         Ok(format!(
             "{}/tables/{name}",
             self.namespace_root(namespace_path)?
@@ -135,11 +141,15 @@ impl CurvineIntegrityDatabase {
         Ok(format!("{}/state", self.table_root(name, namespace_path)?))
     }
 
-    fn latest_path(
-        &self,
-        name: &str,
-        namespace_path: &[String],
-    ) -> Result<object_store::path::Path> {
+    fn namespace_marker_path(&self, namespace_path: &[String]) -> Result<OsPath> {
+        self.store_path(&format!(
+            "{}/{}",
+            self.namespace_root(namespace_path)?,
+            INTERNAL_MARKER_FILE
+        ))
+    }
+
+    fn latest_path(&self, name: &str, namespace_path: &[String]) -> Result<OsPath> {
         self.store_path(&format!(
             "{}/latest.json",
             self.table_state_dir(name, namespace_path)?
@@ -171,12 +181,22 @@ impl CurvineIntegrityDatabase {
         ))
     }
 
+    fn parse_generation(generation: &str) -> Result<u64> {
+        generation.parse::<u64>().map_err(|e| Error::Runtime {
+            message: format!("invalid generation '{generation}': {e}"),
+        })
+    }
+
+    fn format_generation(value: u64) -> String {
+        format!("{value:016}")
+    }
+
     fn manifest_path(
         &self,
         name: &str,
         namespace_path: &[String],
         generation: &str,
-    ) -> Result<object_store::path::Path> {
+    ) -> Result<OsPath> {
         self.store_path(&format!(
             "{}/manifest.json",
             self.version_root(name, namespace_path, generation)?
@@ -188,7 +208,7 @@ impl CurvineIntegrityDatabase {
         name: &str,
         namespace_path: &[String],
         generation: &str,
-    ) -> Result<object_store::path::Path> {
+    ) -> Result<OsPath> {
         self.store_path(&format!(
             "{}/checksum.json",
             self.version_root(name, namespace_path, generation)?
@@ -200,7 +220,7 @@ impl CurvineIntegrityDatabase {
         name: &str,
         namespace_path: &[String],
         generation: &str,
-    ) -> Result<object_store::path::Path> {
+    ) -> Result<OsPath> {
         self.store_path(&format!(
             "{}/dataset",
             self.version_root(name, namespace_path, generation)?
@@ -220,6 +240,16 @@ impl CurvineIntegrityDatabase {
             }
         }
         Ok(())
+    }
+
+    async fn namespace_exists(&self, namespace_path: &[String]) -> Result<bool> {
+        if namespace_path.is_empty() {
+            return Ok(true);
+        }
+        self.object_store
+            .exists(&self.namespace_marker_path(namespace_path)?)
+            .await
+            .map_err(Error::from)
     }
 
     async fn ensure_table_dirs(&self, name: &str, namespace_path: &[String]) -> Result<()> {
@@ -244,11 +274,39 @@ impl CurvineIntegrityDatabase {
         Ok(())
     }
 
-    async fn write_json<T: Serialize>(
+    async fn latest_generation(
         &self,
-        path: &object_store::path::Path,
-        value: &T,
-    ) -> Result<()> {
+        name: &str,
+        namespace_path: &[String],
+    ) -> Result<Option<String>> {
+        let latest_path = self.latest_path(name, namespace_path)?;
+        if !self.object_store.exists(&latest_path).await? {
+            return Ok(None);
+        }
+        let latest: LatestPointer = self.read_json(&latest_path).await?;
+        Ok(Some(latest.generation))
+    }
+
+    async fn read_dir_or_empty(&self, prefix: OsPath) -> Result<Vec<String>> {
+        match self.object_store.read_dir(prefix).await {
+            Ok(listed) => Ok(listed),
+            Err(LanceCoreError::NotFound { .. }) | Err(LanceCoreError::DatasetNotFound { .. }) => {
+                Ok(Vec::new())
+            }
+            Err(err) => Err(Error::from(err)),
+        }
+    }
+
+    async fn next_generation(&self, name: &str, namespace_path: &[String]) -> Result<String> {
+        match self.latest_generation(name, namespace_path).await? {
+            Some(current) => Ok(Self::format_generation(
+                Self::parse_generation(&current)? + 1,
+            )),
+            None => Ok(Self::format_generation(1)),
+        }
+    }
+
+    async fn write_json<T: Serialize>(&self, path: &OsPath, value: &T) -> Result<()> {
         let buf = serde_json::to_vec_pretty(value).map_err(|e| Error::Runtime {
             message: format!("failed to serialize metadata json: {e}"),
         })?;
@@ -256,10 +314,7 @@ impl CurvineIntegrityDatabase {
         Ok(())
     }
 
-    async fn read_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &object_store::path::Path,
-    ) -> Result<T> {
+    async fn read_json<T: for<'de> Deserialize<'de>>(&self, path: &OsPath) -> Result<T> {
         let buf = self.object_store.read_one_all(path).await?;
         serde_json::from_slice(&buf).map_err(|e| Error::Runtime {
             message: format!("failed to decode metadata json '{}': {e}", path.as_ref()),
@@ -370,6 +425,24 @@ impl CurvineIntegrityDatabase {
             .read_json(&self.checksum_path(name, namespace_path, &generation)?)
             .await?;
 
+        if manifest.generation != generation {
+            return Err(Error::Runtime {
+                message: format!(
+                    "manifest generation '{}' does not match latest generation '{}' for table '{name}'",
+                    manifest.generation, generation
+                ),
+            });
+        }
+        let expected_dataset_uri = self.dataset_uri(name, namespace_path, &generation)?;
+        if manifest.dataset_uri != expected_dataset_uri {
+            return Err(Error::Runtime {
+                message: format!(
+                    "manifest dataset_uri '{}' does not match expected '{}' for table '{name}'",
+                    manifest.dataset_uri, expected_dataset_uri
+                ),
+            });
+        }
+
         let manifest_files = manifest.files.iter().cloned().collect::<BTreeSet<_>>();
         let checksum_files = checksum.files.keys().cloned().collect::<BTreeSet<_>>();
         if manifest_files != checksum_files {
@@ -409,8 +482,57 @@ impl CurvineIntegrityDatabase {
         self.dataset_uri(name, namespace_path, &generation)
     }
 
+    async fn remove_table_root(&self, name: &str, namespace_path: &[String]) -> Result<()> {
+        let root = self.store_path(&self.table_root(name, namespace_path)?)?;
+        match self.object_store.remove_dir_all(root).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let latest = self.latest_path(name, namespace_path)?;
+                if !self.object_store.exists(&latest).await? {
+                    Err(Error::TableNotFound {
+                        name: name.to_string(),
+                        source: "table root not found".into(),
+                    })
+                } else {
+                    Err(Error::from(err))
+                }
+            }
+        }
+    }
+
+    async fn namespace_has_tables(&self, namespace_path: &[String]) -> Result<bool> {
+        let root = format!("{}/tables", self.namespace_root(namespace_path)?);
+        let prefix = self.store_path(&root)?;
+        let listed = self.read_dir_or_empty(prefix).await?;
+        Ok(listed
+            .into_iter()
+            .any(|entry| entry != INTERNAL_MARKER_FILE))
+    }
+
+    async fn namespace_has_children(&self, namespace_path: &[String]) -> Result<bool> {
+        let root = self.namespace_root(namespace_path)?;
+        let prefix = self.store_path(&root)?;
+        let listed = self.read_dir_or_empty(prefix).await?;
+        Ok(listed
+            .into_iter()
+            .any(|entry| entry != "tables" && entry != INTERNAL_MARKER_FILE))
+    }
+
+    async fn table_root_has_entries(&self, name: &str, namespace_path: &[String]) -> Result<bool> {
+        let root = self.store_path(&self.table_root(name, namespace_path)?)?;
+        let listed = self.read_dir_or_empty(root).await?;
+        Ok(!listed.is_empty())
+    }
+
     fn inherited_read_params(&self, request: &OpenTableRequest) -> Option<ReadParams> {
-        let mut read_params = request.lance_read_params.clone().unwrap_or_default();
+        let mut read_params = request.lance_read_params.clone().unwrap_or_else(|| {
+            let mut default_params = ReadParams::default();
+            if let Some(index_cache_size) = request.index_cache_size {
+                #[allow(deprecated)]
+                default_params.index_cache_size(index_cache_size as usize);
+            }
+            default_params
+        });
 
         if !self.storage_options.is_empty() {
             let store_params = read_params
@@ -451,6 +573,46 @@ impl CurvineIntegrityDatabase {
         write_params.session = Some(self.session.clone());
         write_options
     }
+
+    async fn handle_exist_ok(&self, request: CreateTableRequest) -> Result<Arc<dyn BaseTable>> {
+        let data_schema = request.data.schema();
+        let callback = match request.mode {
+            CreateTableMode::ExistOk(callback) => callback,
+            _ => unreachable!(),
+        };
+        let open_request = callback(OpenTableRequest {
+            name: request.name.clone(),
+            namespace: request.namespace.clone(),
+            index_cache_size: None,
+            lance_read_params: None,
+            location: request.location.clone(),
+            namespace_client: request.namespace_client.clone(),
+            managed_versioning: None,
+        });
+        let table = self.open_table(open_request).await?;
+        let table_schema = table.schema().await?;
+        if table_schema.as_ref() != data_schema.as_ref() {
+            return Err(Error::Schema {
+                message: "Provided schema does not match existing table schema".to_string(),
+            });
+        }
+        Ok(table)
+    }
+
+    async fn rewrite_manifest_for_table(
+        &self,
+        name: &str,
+        namespace_path: &[String],
+    ) -> Result<()> {
+        let latest: LatestPointer = self
+            .read_json(&self.latest_path(name, namespace_path)?)
+            .await?;
+        let manifest_path = self.manifest_path(name, namespace_path, &latest.generation)?;
+        let mut manifest: VersionManifest = self.read_json(&manifest_path).await?;
+        manifest.generation = latest.generation.clone();
+        manifest.dataset_uri = self.dataset_uri(name, namespace_path, &latest.generation)?;
+        self.write_json(&manifest_path, &manifest).await
+    }
 }
 
 #[async_trait]
@@ -478,7 +640,7 @@ impl Database for CurvineIntegrityDatabase {
         let id = request.id.unwrap_or_default();
         let root = self.namespace_root(&id)?;
         let prefix = self.store_path(&root)?;
-        let listed = self.object_store.read_dir(prefix).await.unwrap_or_default();
+        let listed = self.read_dir_or_empty(prefix).await?;
         let mut namespaces = listed
             .into_iter()
             .filter(|entry| entry != "tables" && entry != INTERNAL_MARKER_FILE)
@@ -499,14 +661,37 @@ impl Database for CurvineIntegrityDatabase {
         Ok(CreateNamespaceResponse::new())
     }
 
-    async fn drop_namespace(
-        &self,
-        _request: DropNamespaceRequest,
-    ) -> Result<DropNamespaceResponse> {
-        Err(Error::NotSupported {
-            message: "drop_namespace is not implemented for Curvine integrity database yet"
-                .to_string(),
-        })
+    async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
+        let namespace = request.id.unwrap_or_default();
+        if namespace.is_empty() {
+            return Err(Error::NotSupported {
+                message: "dropping the root namespace is not supported".to_string(),
+            });
+        }
+        if !self.namespace_exists(&namespace).await? {
+            return Err(Error::Runtime {
+                message: format!("namespace '{}' was not found", namespace.join("/")),
+            });
+        }
+        if self.namespace_has_tables(&namespace).await? {
+            return Err(Error::Runtime {
+                message: format!("namespace '{}' is not empty", namespace.join("/")),
+            });
+        }
+        if self.namespace_has_children(&namespace).await? {
+            return Err(Error::Runtime {
+                message: format!(
+                    "namespace '{}' still has child namespaces",
+                    namespace.join("/")
+                ),
+            });
+        }
+        let root = self.store_path(&self.namespace_root(&namespace)?)?;
+        self.object_store
+            .remove_dir_all(root)
+            .await
+            .map_err(Error::from)?;
+        Ok(DropNamespaceResponse::new())
     }
 
     async fn describe_namespace(
@@ -514,7 +699,11 @@ impl Database for CurvineIntegrityDatabase {
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
         let id = request.id.unwrap_or_default();
-        self.ensure_namespace_path(&id).await?;
+        if !self.namespace_exists(&id).await? {
+            return Err(Error::Runtime {
+                message: format!("namespace '{}' was not found", id.join("/")),
+            });
+        }
         Ok(DescribeNamespaceResponse {
             properties: Some(HashMap::new()),
         })
@@ -537,7 +726,7 @@ impl Database for CurvineIntegrityDatabase {
         let namespace_path = request.id.unwrap_or_default();
         let root = format!("{}/tables", self.namespace_root(&namespace_path)?);
         let prefix = self.store_path(&root)?;
-        let listed = self.object_store.read_dir(prefix).await.unwrap_or_default();
+        let listed = self.read_dir_or_empty(prefix).await?;
         let mut tables = listed
             .into_iter()
             .filter(|entry| entry != INTERNAL_MARKER_FILE)
@@ -570,33 +759,27 @@ impl Database for CurvineIntegrityDatabase {
     async fn create_table(&self, request: CreateTableRequest) -> Result<Arc<dyn BaseTable>> {
         let name = request.name.clone();
         let namespace_path = request.namespace.clone();
+        let table_exists = self
+            .object_store
+            .exists(&self.latest_path(&name, &namespace_path)?)
+            .await?;
 
         match request.mode {
             CreateTableMode::Create => {
-                if self
-                    .object_store
-                    .exists(&self.latest_path(&name, &namespace_path)?)
-                    .await?
-                {
+                if table_exists {
                     return Err(Error::TableAlreadyExists { name });
                 }
             }
-            CreateTableMode::Overwrite => {
-                return Err(Error::NotSupported {
-                    message: "overwrite mode is not implemented for Curvine integrity database yet"
-                        .to_string(),
-                });
-            }
+            CreateTableMode::Overwrite => {}
             CreateTableMode::ExistOk(_) => {
-                return Err(Error::NotSupported {
-                    message: "exist_ok mode is not implemented for Curvine integrity database yet"
-                        .to_string(),
-                });
+                if table_exists {
+                    return self.handle_exist_ok(request).await;
+                }
             }
         }
 
         self.ensure_table_dirs(&name, &namespace_path).await?;
-        let generation = "0000000000000001".to_string();
+        let generation = self.next_generation(&name, &namespace_path).await?;
         let dataset_uri = self.dataset_uri(&name, &namespace_path, &generation)?;
         let write_options = self.inherited_write_options(&request);
         let table = NativeTable::create(
@@ -608,7 +791,7 @@ impl Database for CurvineIntegrityDatabase {
             Some(write_options.lance_write_params.unwrap_or_default()),
             self.read_consistency_interval,
             request.namespace_client,
-            false,
+            matches!(request.mode, CreateTableMode::Overwrite),
         )
         .await?;
 
@@ -646,31 +829,66 @@ impl Database for CurvineIntegrityDatabase {
 
     async fn rename_table(
         &self,
-        _cur_name: &str,
-        _new_name: &str,
-        _cur_namespace_path: &[String],
-        _new_namespace_path: &[String],
+        cur_name: &str,
+        new_name: &str,
+        cur_namespace_path: &[String],
+        new_namespace_path: &[String],
     ) -> Result<()> {
-        Err(Error::NotSupported {
-            message: "rename_table is not implemented for Curvine integrity database yet"
-                .to_string(),
-        })
+        if cur_name == new_name && cur_namespace_path == new_namespace_path {
+            return Ok(());
+        }
+        let src = self.store_path(&self.table_root(cur_name, cur_namespace_path)?)?;
+        let dst = self.store_path(&self.table_root(new_name, new_namespace_path)?)?;
+        let src_latest = self.latest_path(cur_name, cur_namespace_path)?;
+        if !self.object_store.exists(&src_latest).await? {
+            return Err(Error::TableNotFound {
+                name: cur_name.to_string(),
+                source: "latest pointer not found".into(),
+            });
+        }
+        if self
+            .object_store
+            .exists(&self.latest_path(new_name, new_namespace_path)?)
+            .await?
+            || self
+                .table_root_has_entries(new_name, new_namespace_path)
+                .await?
+        {
+            return Err(Error::TableAlreadyExists {
+                name: new_name.to_string(),
+            });
+        }
+        self.validate_integrity(cur_name, cur_namespace_path)
+            .await?;
+        self.ensure_namespace_path(new_namespace_path).await?;
+        self.object_store
+            .inner
+            .rename(&src, &dst)
+            .await
+            .map_err(Error::from)?;
+        self.rewrite_manifest_for_table(new_name, new_namespace_path)
+            .await
     }
 
     async fn drop_table(&self, _name: &str, _namespace_path: &[String]) -> Result<()> {
-        Err(Error::NotSupported {
-            message: "drop_table is not implemented for Curvine integrity database yet".to_string(),
-        })
+        self.remove_table_root(_name, _namespace_path).await
     }
 
     async fn drop_all_tables(&self, _namespace_path: &[String]) -> Result<()> {
-        Err(Error::NotSupported {
-            message: "drop_all_tables is not implemented for Curvine integrity database yet"
-                .to_string(),
-        })
+        let names = self
+            .list_tables(ListTablesRequest {
+                id: Some(_namespace_path.to_vec()),
+                ..ListTablesRequest::new()
+            })
+            .await?
+            .tables;
+        for name in names {
+            self.remove_table_root(&name, _namespace_path).await?;
+        }
+        Ok(())
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 

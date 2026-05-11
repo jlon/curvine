@@ -13,9 +13,17 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::env;
+
+use curvine_common::conf::ClusterConf;
+use lancedb::connect;
+use lancedb::connect_namespace;
+use lancedb::error::Error as LanceDbError;
+use lancedb::object_store::{curvine_registry, curvine_session};
+
 #[test]
 fn error_module_reexports_upstream_error_types() {
-    let err = lancedb::error::Error::NotSupported {
+    let err = LanceDbError::NotSupported {
         message: "example".to_string(),
     };
 
@@ -24,13 +32,13 @@ fn error_module_reexports_upstream_error_types() {
 
 #[test]
 fn curvine_registry_registers_curvine_scheme() {
-    let registry = lancedb::object_store::curvine_registry();
+    let registry = curvine_registry();
     assert!(registry.get_provider("curvine").is_some());
 }
 
 #[test]
 fn curvine_session_uses_registry_with_curvine_scheme() {
-    let session = lancedb::object_store::curvine_session();
+    let session = curvine_session();
     assert!(session.store_registry().get_provider("curvine").is_some());
 }
 
@@ -38,7 +46,7 @@ fn curvine_session_uses_registry_with_curvine_scheme() {
 async fn local_connect_passes_through_to_upstream() {
     let tmpdir = tempfile::tempdir().unwrap();
 
-    let conn = lancedb::connect(tmpdir.path().to_str().unwrap())
+    let conn = connect(tmpdir.path().to_str().unwrap())
         .execute()
         .await
         .unwrap();
@@ -55,7 +63,7 @@ async fn namespace_connect_stays_compatible() {
         tmpdir.path().to_str().unwrap().to_string(),
     );
 
-    let conn = lancedb::connect_namespace("dir", properties)
+    let conn = connect_namespace("dir", properties)
         .execute()
         .await
         .unwrap();
@@ -66,15 +74,13 @@ async fn namespace_connect_stays_compatible() {
 
 #[tokio::test]
 async fn facade_boundary_curvine_connect_fails_without_config() {
-    let saved = std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).ok();
-    std::env::remove_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE);
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
 
-    let result = lancedb::connect("curvine:///data/lancedb/demo")
-        .execute()
-        .await;
+    let result = connect("curvine:///data/lancedb/demo").execute().await;
 
     if let Some(val) = saved {
-        std::env::set_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE, val);
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
     }
 
     let err = match result {
@@ -92,8 +98,8 @@ async fn facade_boundary_curvine_connect_fails_without_config() {
 
 #[tokio::test]
 async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
-    let saved = std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE).ok();
-    std::env::remove_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE);
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
 
     let mut properties = HashMap::new();
     properties.insert(
@@ -101,12 +107,10 @@ async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
         "curvine:///data/lancedb/demo".to_string(),
     );
 
-    let result = lancedb::connect_namespace("dir", properties)
-        .execute()
-        .await;
+    let result = connect_namespace("dir", properties).execute().await;
 
     if let Some(val) = saved {
-        std::env::set_var(curvine_common::conf::ClusterConf::ENV_CONF_FILE, val);
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
     }
 
     let err = match result {

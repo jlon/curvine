@@ -10,18 +10,22 @@
 //!   cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored
 //! ```
 
+use std::env;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use curvine_common::conf::ClusterConf;
 use futures::TryStreamExt;
+use lancedb::connect;
 use lancedb::object_store::CURVINE_CONF_FILE_KEY;
 use lancedb::query::ExecutableQuery;
 
 #[tokio::test]
 #[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored"]
 async fn lancedb_curvine_smoke_connect_table_query_names() {
-    let conf = match std::env::var(curvine_common::conf::ClusterConf::ENV_CONF_FILE) {
+    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("Skipping live LanceDB smoke test: CURVINE_CONF_FILE is not set");
@@ -29,14 +33,14 @@ async fn lancedb_curvine_smoke_connect_table_query_names() {
         }
     };
 
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let table_name = format!("lancedb_smoke_{unique}");
     let db_uri = format!("curvine:///tmp/{table_name}");
 
-    let conn = lancedb::connect(&db_uri)
+    let conn = connect(&db_uri)
         .storage_option(CURVINE_CONF_FILE_KEY, conf.clone())
         .execute()
         .await

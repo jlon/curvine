@@ -87,7 +87,7 @@ impl std::fmt::Display for CurvineObjectStore {
 /// The opening URI is turned into one absolute Curvine workspace path (authority, when present,
 /// is the first path segment: `curvine://tenant/a` → `/tenant/a`). [`ObjectStoreProvider::extract_path`]
 /// applies the same validation and returns an empty [`object_store::path::Path`] because Lance object
-/// keys are relative to that workspace root.
+/// keys are relative to that workspace root. See `PHASE4-CURVINE-OBJECT-STORE.md` in this crate.
 #[derive(Debug, Clone, Default)]
 pub struct CurvineObjectStoreProvider;
 
@@ -408,9 +408,9 @@ impl object_store::ObjectStore for CurvineObjectStore {
         })
     }
 
-/// Read object `from` fully and write to `to`. The destination is opened with replace semantics
-/// (`create(..., overwrite = true)`): an existing object at `to` is replaced. The source object
-/// is left unchanged (copy, not move).
+    /// Read object `from` fully and write to `to`. The destination is opened with replace semantics
+    /// (`create(..., overwrite = true)`): an existing object at `to` is replaced. The source object
+    /// is left unchanged (copy, not move).
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         let from_cv = self.object_path(from)?;
         let to_cv = self.object_path(to)?;
@@ -750,5 +750,24 @@ mod tests {
                 workspace.full_path()
             );
         }
+    }
+
+    #[test]
+    fn extract_path_must_not_echo_url_path_without_authority() {
+        let provider = CurvineObjectStoreProvider::new();
+        let url = Url::parse("curvine://tenant/data/db").unwrap();
+        let naive = url.path().trim_start_matches('/');
+        assert_eq!(naive, "data/db");
+        assert_eq!(
+            curvine_workspace_root_from_uri(&url).unwrap().full_path(),
+            "/tenant/data/db"
+        );
+        let extracted = ObjectStoreProvider::extract_path(&provider, &url).unwrap();
+        assert_ne!(
+            extracted.as_ref(),
+            naive,
+            "extract_path must not mirror Url::path() alone; tenant lives in workspace merge, not in object key prefix"
+        );
+        assert!(extracted.as_ref().is_empty());
     }
 }

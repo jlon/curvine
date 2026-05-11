@@ -331,6 +331,13 @@ impl object_store::ObjectStore for CurvineObjectStore {
             .await
             .map_err(|e| fs_error_to_object_store(location, e))?;
 
+        if status.is_dir {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "directory prefixes are not object heads".into(),
+            });
+        }
+
         Ok(file_status_to_object_meta(location.clone(), status))
     }
 

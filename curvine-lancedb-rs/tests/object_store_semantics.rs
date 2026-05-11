@@ -179,6 +179,11 @@ async fn curvine_object_store_semantics_live_cluster() {
         !lr_pfx.objects.iter().any(|o| o.location == flat_name),
         "directory prefix must not appear as a file object"
     );
+    let nested_dir = Path::parse(format!("{pfx}/nested")).unwrap();
+    assert!(
+        store.inner.head(&nested_dir).await.is_err(),
+        "directory prefixes must not produce object metadata in head()"
+    );
 
     store.delete(&copy_key).await.unwrap();
     assert!(store.inner.head(&copy_key).await.is_err());

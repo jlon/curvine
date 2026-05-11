@@ -2163,12 +2163,15 @@ dependencies = [
 name = "curvine-tests"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "awaitility",
  "bytes",
  "clap",
  "curvine-client",
  "curvine-common",
  "curvine-fuse",
+ "curvine-lancedb-rs",
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",

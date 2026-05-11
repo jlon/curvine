@@ -64,6 +64,7 @@ async fn curvine_object_store_semantics_live_cluster() {
     let rel_copy = format!("{pfx}/nested/obj_copy.bin");
     let rel_dst = format!("{pfx}/nested/copy_overwrite_dst.bin");
     let rel_src = format!("{pfx}/nested/copy_overwrite_src.bin");
+    let rel_workspace_curvine = format!("{pfx}/.curvine/user-visible.bin");
 
     let root_key = Path::parse(rel_root).unwrap();
     store.put(&root_key, b"root").await.unwrap();
@@ -71,6 +72,12 @@ async fn curvine_object_store_semantics_live_cluster() {
     let key = Path::parse(&rel_key).unwrap();
     let payload: &[u8] = b"hello-range-copy";
     store.put(&key, payload).await.unwrap();
+
+    let workspace_curvine_key = Path::parse(&rel_workspace_curvine).unwrap();
+    store
+        .put(&workspace_curvine_key, b"workspace-local-curvine")
+        .await
+        .unwrap();
 
     let meta = store.inner.head(&key).await.unwrap();
     assert_eq!(meta.size, payload.len() as u64);
@@ -315,6 +322,7 @@ async fn curvine_object_store_semantics_live_cluster() {
     listed.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
     let ends = |p: &Path, s: &str| p.as_ref().ends_with(s);
     assert!(listed.iter().any(|p| ends(p, &rel_key)));
+    assert!(listed.iter().any(|p| ends(p, &rel_workspace_curvine)));
     assert!(listed.iter().any(|p| ends(p, &rel_copy)));
     assert!(listed.iter().any(|p| ends(p, &rel_dst)));
     assert!(listed.iter().any(|p| ends(p, &rel_src)));
@@ -334,6 +342,13 @@ async fn curvine_object_store_semantics_live_cluster() {
         .list_with_delimiter(Some(&prefix_path))
         .await
         .unwrap();
+    assert!(
+        lr_pfx
+            .common_prefixes
+            .iter()
+            .any(|p| p.as_ref().contains(".curvine")),
+        "workspace-local .curvine directory is user data outside the root workspace"
+    );
     assert!(
         lr_pfx
             .common_prefixes
@@ -559,12 +574,104 @@ async fn curvine_object_store_semantics_live_cluster() {
     upload1.complete().await.unwrap();
     upload2.complete().await.unwrap();
     let raced = store.read_one_all(&race_key).await.unwrap();
-    let mut expected_prefix = Vec::new();
+    let mut expected = Vec::new();
     for part in 0..5 {
-        expected_prefix.extend_from_slice(&make_payload(b'2', part));
+        expected.extend_from_slice(&make_payload(b'2', part));
     }
     assert!(
-        raced.starts_with(&expected_prefix),
-        "last completed multipart upload should win for same-path race"
+        raced.starts_with(&expected),
+        "last completed same-path multipart upload should win"
     );
+}
+
+#[tokio::test]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+async fn curvine_object_store_root_workspace_hides_multipart_staging() {
+    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!(
+                "Skipping root-workspace object-store semantics test: CURVINE_CONF_FILE is not set"
+            );
+            return;
+        }
+    };
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    let mut opts = HashMap::new();
+    opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf);
+    let params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
+        ..Default::default()
+    };
+
+    let url = Url::parse("curvine:///").unwrap();
+    let provider = CurvineObjectStoreProvider::new();
+    let store = provider.new_store(url, &params).await.expect("new_store");
+
+    let reserved_key = Path::parse(".curvine/user.bin").unwrap();
+    let reserved_put = store
+        .inner
+        .put(&reserved_key, (&b"forbidden"[..]).into())
+        .await;
+    assert!(matches!(reserved_put, Err(OsError::NotSupported { .. })));
+
+    let key = Path::parse(format!("root_ws_{unique}/multipart/final.bin")).unwrap();
+    let mut upload = store.inner.put_multipart(&key).await.unwrap();
+    upload
+        .put_part(Vec::from(&b"root "[..]).into())
+        .await
+        .unwrap();
+    upload
+        .put_part(Vec::from(&b"workspace"[..]).into())
+        .await
+        .unwrap();
+
+    let listed: Vec<Path> = store
+        .list(None)
+        .map(|r| r.expect("list entry").location)
+        .collect()
+        .await;
+    assert!(
+        listed.iter().all(|p| !p.as_ref().starts_with(".curvine")),
+        "root workspace must not leak multipart staging paths into list()"
+    );
+
+    let lr_root = store.inner.list_with_delimiter(None).await.unwrap();
+    assert!(
+        lr_root
+            .objects
+            .iter()
+            .all(|o| !o.location.as_ref().starts_with(".curvine")),
+        "root workspace objects must not expose multipart staging files"
+    );
+    assert!(
+        lr_root
+            .common_prefixes
+            .iter()
+            .all(|p| !p.as_ref().starts_with(".curvine")),
+        "root workspace prefixes must not expose multipart staging directories"
+    );
+    assert!(
+        !lr_root.common_prefixes.is_empty() || !lr_root.objects.is_empty() || listed.is_empty(),
+        "root workspace visibility check should only see user data or no entries, never internal staging"
+    );
+
+    upload.complete().await.unwrap();
+    let full = store.read_one_all(&key).await.unwrap();
+    assert_eq!(full.as_ref(), b"root workspace");
+
+    let top_key = Path::parse(format!("root_ws_top_{unique}.bin")).unwrap();
+    let mut top_upload = store.inner.put_multipart(&top_key).await.unwrap();
+    top_upload
+        .put_part(Vec::from(&b"top-level"[..]).into())
+        .await
+        .unwrap();
+    top_upload.complete().await.unwrap();
+    let top_full = store.read_one_all(&top_key).await.unwrap();
+    assert_eq!(top_full.as_ref(), b"top-level");
 }

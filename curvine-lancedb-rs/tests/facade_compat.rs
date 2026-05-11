@@ -14,12 +14,17 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use curvine_common::conf::ClusterConf;
 use lancedb::connect;
 use lancedb::connect_namespace;
 use lancedb::error::Error as LanceDbError;
 use lancedb::object_store::{curvine_registry, curvine_session};
+use lancedb::{ObjectStoreRegistry, Session};
+use tokio::sync::Mutex;
+
+static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[test]
 fn error_module_reexports_upstream_error_types() {
@@ -74,6 +79,7 @@ async fn namespace_connect_stays_compatible() {
 
 #[tokio::test]
 async fn facade_boundary_curvine_connect_fails_without_config() {
+    let _guard = ENV_MUTEX.lock().await;
     let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
     env::remove_var(ClusterConf::ENV_CONF_FILE);
 
@@ -98,6 +104,7 @@ async fn facade_boundary_curvine_connect_fails_without_config() {
 
 #[tokio::test]
 async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
+    let _guard = ENV_MUTEX.lock().await;
     let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
     env::remove_var(ClusterConf::ENV_CONF_FILE);
 
@@ -124,4 +131,42 @@ async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
         "unexpected error message: {rendered}"
     );
     assert!(rendered.contains("CURVINE_CONF_FILE"));
+}
+
+#[tokio::test]
+async fn curvine_namespace_connect_preserves_explicit_session() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
+
+    let custom = Arc::new(Session::new(0, 0, Arc::new(ObjectStoreRegistry::empty())));
+    let mut properties = HashMap::new();
+    properties.insert(
+        "root".to_string(),
+        "curvine:///data/lancedb/demo".to_string(),
+    );
+
+    let result = connect_namespace("dir", properties)
+        .session(custom)
+        .execute()
+        .await;
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected namespace connect to fail with custom empty registry"),
+        Err(err) => err,
+    };
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("No object store provider found for scheme: 'curvine'"),
+        "custom session should be preserved; unexpected error message: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Missing Curvine cluster configuration"),
+        "fallback curvine_session unexpectedly replaced the explicit session: {rendered}"
+    );
 }

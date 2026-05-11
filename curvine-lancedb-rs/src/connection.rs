@@ -366,10 +366,10 @@ impl ConnectNamespaceBuilder {
                     builder = builder.embedding_registry(embedding_registry);
                 }
 
-                if wants_curvine {
-                    builder = builder.session(curvine_session());
-                } else if let Some(session) = session {
+                if let Some(session) = session {
                     builder = builder.session(session);
+                } else if wants_curvine {
+                    builder = builder.session(curvine_session());
                 }
 
                 builder.server_side_query(server_side_query).execute().await

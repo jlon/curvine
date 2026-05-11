@@ -54,6 +54,7 @@ pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
+const INTERNAL_RESERVED_ROOT: &str = ".curvine";
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -388,6 +389,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
             .delete(&cv_path, false)
             .await
             .map_err(|e| fs_error_to_object_store(location, e))?;
+        let _ = self.prune_empty_parents(&cv_path, location).await;
         Ok(())
     }
 
@@ -428,7 +430,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 store: CURVINE_SCHEME,
                 source: msg.into(),
             })?;
-            if is_multipart_internal_location(&entry_location) {
+            if self.is_internal_reserved_location(&entry_location) {
                 continue;
             }
 
@@ -452,7 +454,11 @@ impl ObjectStoreTrait for CurvineObjectStore {
             }
 
             if status.is_dir {
-                common_prefixes.insert(base_prefix.child(first));
+                let prefix = base_prefix.child(first);
+                if self.is_internal_reserved_location(&prefix) {
+                    continue;
+                }
+                common_prefixes.insert(prefix);
             } else {
                 objects.push(file_status_to_object_meta(entry_location, status));
             }
@@ -549,6 +555,15 @@ impl ObjectStoreTrait for CurvineObjectStore {
 impl CurvineObjectStore {
     fn object_path(&self, location: &Path) -> OsResult<CurvinePath> {
         let rel = location.as_ref().trim_start_matches('/');
+        if self.is_root_workspace() && is_internal_reserved_relative_path(rel) {
+            return Err(OsError::NotSupported {
+                source: format!(
+                    "`{INTERNAL_RESERVED_ROOT}` is a reserved Curvine namespace for root workspaces"
+                )
+                .into(),
+            });
+        }
+
         let base = self
             .context
             .workspace_root
@@ -622,7 +637,7 @@ impl CurvineObjectStore {
                         store: CURVINE_SCHEME,
                         source: msg.into(),
                     })?;
-                if is_multipart_internal_location(&path) {
+                if self.is_internal_reserved_location(&path) {
                     continue;
                 }
                 out.push(file_status_to_object_meta(path, status));
@@ -656,6 +671,18 @@ impl CurvineObjectStore {
         })
     }
 
+    fn multipart_final_path(&self, upload_id: &str) -> OsResult<CurvinePath> {
+        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+        CurvinePath::from_str(format!(
+            "{}/{}/{}/final",
+            MULTIPART_STAGING_ROOT, workspace_id, upload_id
+        ))
+        .map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })
+    }
+
     async fn cleanup_multipart(&self, upload_id: &str) -> OsResult<()> {
         let dir = self.multipart_dir(upload_id)?;
         match self.context.fs.delete(&dir, true).await {
@@ -665,6 +692,79 @@ impl CurvineObjectStore {
             | Err(FsError::JobNotFound(_)) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(&Path::default(), e)),
         }
+    }
+
+    async fn prepare_multipart_destination(
+        &self,
+        dest: &CurvinePath,
+        location: &Path,
+    ) -> OsResult<()> {
+        match self.context.fs.get_status(dest).await {
+            Ok(status) if status.is_dir => {
+                return Err(OsError::AlreadyExists {
+                    path: location.to_string(),
+                    source: "multipart destination is a directory prefix".into(),
+                });
+            }
+            Ok(_) => {}
+            Err(FsError::FileNotFound(_))
+            | Err(FsError::Expired(_))
+            | Err(FsError::JobNotFound(_)) => {}
+            Err(e) => return Err(fs_error_to_object_store(location, e)),
+        }
+
+        if let Some(parent) = dest.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })? {
+            if !parent.is_root() {
+                self.context
+                    .fs
+                    .mkdir(&parent, true)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(location, e))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn prune_empty_parents(&self, path: &CurvinePath, location: &Path) -> OsResult<()> {
+        let workspace_root = self
+            .context
+            .workspace_root
+            .full_path()
+            .trim_end_matches('/');
+        let mut current = path.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })?;
+
+        while let Some(dir) = current {
+            let full_path = dir.full_path().trim_end_matches('/').to_string();
+            if full_path.is_empty() || full_path == "/" || full_path == workspace_root {
+                break;
+            }
+            if !full_path.starts_with(&format!("{workspace_root}/")) {
+                break;
+            }
+
+            match self.context.fs.delete(&dir, false).await {
+                Ok(()) => {
+                    current = dir.parent().map_err(|e| OsError::Generic {
+                        store: CURVINE_SCHEME,
+                        source: e.to_string().into(),
+                    })?;
+                }
+                Err(FsError::DirNotEmpty(_))
+                | Err(FsError::FileNotFound(_))
+                | Err(FsError::Expired(_))
+                | Err(FsError::JobNotFound(_)) => break,
+                Err(e) => return Err(fs_error_to_object_store(location, e)),
+            }
+        }
+
+        Ok(())
     }
 
     async fn stream_copy_contents(
@@ -704,10 +804,22 @@ impl CurvineObjectStore {
     }
 
     fn is_multipart_internal_dir(&self, dir: &CurvinePath) -> bool {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
-        let mp_root = format!("{}/{workspace_id}", MULTIPART_STAGING_ROOT);
-        let dir = dir.full_path();
-        dir == mp_root || dir.starts_with(&format!("{mp_root}/"))
+        if !self.is_root_workspace() {
+            return false;
+        }
+
+        let dir = dir.full_path().trim_end_matches('/');
+        dir == format!("/{INTERNAL_RESERVED_ROOT}")
+            || dir.starts_with(&format!("/{INTERNAL_RESERVED_ROOT}/"))
+    }
+
+    fn is_internal_reserved_location(&self, location: &Path) -> bool {
+        self.is_root_workspace()
+            && is_internal_reserved_relative_path(location.as_ref().trim_start_matches('/'))
+    }
+
+    fn is_root_workspace(&self) -> bool {
+        self.context.workspace_root.full_path() == "/"
     }
 }
 
@@ -758,11 +870,15 @@ impl MultipartUpload for CurvineMultipartUpload {
         parts.sort_by_key(|p| p.part_idx);
 
         let dest = self.store.object_path(&self.dest)?;
+        self.store
+            .prepare_multipart_destination(&dest, &self.dest)
+            .await?;
+        let staging_final = self.store.multipart_final_path(&self.upload_id)?;
         let mut writer = self
             .store
             .context
             .fs
-            .create(&dest, true)
+            .create(&staging_final, true)
             .await
             .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
 
@@ -785,7 +901,7 @@ impl MultipartUpload for CurvineMultipartUpload {
                     .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
                 self.store
                     .stream_copy_contents(
-                        &self.dest,
+                        &Path::default(),
                         &self.dest,
                         part_meta.len as u64,
                         &mut reader,
@@ -802,17 +918,36 @@ impl MultipartUpload for CurvineMultipartUpload {
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+            self.store
+                .context
+                .fs
+                .rename(&staging_final, &dest)
+                .await
+                .map_err(|e| fs_error_to_object_store(&self.dest, e))
+                .and_then(|renamed| {
+                    if renamed {
+                        Ok(())
+                    } else {
+                        Err(OsError::Generic {
+                            store: CURVINE_SCHEME,
+                            source: "multipart final rename reported no-op".into(),
+                        })
+                    }
+                })?;
             Ok(())
         }
         .await;
 
-        self.store.cleanup_multipart(&self.upload_id).await?;
-        write_result?;
-
-        Ok(PutResult {
-            e_tag: Some(etag_inputs),
-            version: None,
-        })
+        match write_result {
+            Ok(()) => {
+                let _ = self.store.cleanup_multipart(&self.upload_id).await;
+                Ok(PutResult {
+                    e_tag: Some(etag_inputs),
+                    version: None,
+                })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn abort(&mut self) -> OsResult<()> {
@@ -880,9 +1015,8 @@ fn relative_object_path(root: &CurvinePath, full_path: &str) -> StdResult<Path, 
     Path::parse(relative).map_err(|e| e.to_string())
 }
 
-fn is_multipart_internal_location(location: &Path) -> bool {
-    let rel = location.as_ref();
-    rel == MULTIPART_STAGING_ROOT || rel.starts_with(&format!("{MULTIPART_STAGING_ROOT}/"))
+fn is_internal_reserved_relative_path(rel: &str) -> bool {
+    rel == INTERNAL_RESERVED_ROOT || rel.starts_with(&format!("{INTERNAL_RESERVED_ROOT}/"))
 }
 
 fn workspace_staging_id(workspace_root: &CurvinePath) -> String {

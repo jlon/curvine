@@ -1229,29 +1229,22 @@ impl CurvineObjectStore {
         reader: &mut impl Reader,
         writer: &mut impl Writer,
     ) -> OsResult<()> {
-        let mut offset = 0u64;
-        while offset < size {
-            let take = ((size - offset).min(COPY_CHUNK_BYTES as u64)) as usize;
-            if offset > 0 {
-                reader
-                    .seek(offset as i64)
-                    .await
-                    .map_err(|e| fs_error_to_object_store(from, e))?;
-            }
-
-            let mut buf = vec![0u8; take];
-            let n = reader
-                .read_full(&mut buf)
+        let mut remaining = size as usize;
+        while remaining > 0 {
+            let take = remaining.min(COPY_CHUNK_BYTES);
+            let chunk = reader
+                .async_read(Some(take))
                 .await
                 .map_err(|e| fs_error_to_object_store(from, e))?;
-            if n == 0 {
+            if chunk.is_empty() {
                 break;
             }
+            let len = chunk.len();
             writer
-                .write(&buf[..n])
+                .async_write(chunk)
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
-            offset += n as u64;
+            remaining = remaining.saturating_sub(len);
         }
 
         Ok(())

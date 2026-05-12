@@ -17,6 +17,7 @@ use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -46,6 +47,7 @@ use object_store::{
     MultipartUpload, ObjectMeta, ObjectStore as ObjectStoreTrait, PutMode, PutMultipartOptions,
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
+use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;
@@ -63,6 +65,9 @@ const CONDITIONAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const CONDITIONAL_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const OBJECT_STORE_ATTR_PREFIX: &str = "lancedb.object_store.attr.";
 const OBJECT_STORE_METADATA_ATTR_PREFIX: &str = "lancedb.object_store.attr.metadata.";
+
+static PROCESS_WRITE_LOCKS: Lazy<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| StdMutex::new(HashMap::new()));
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -535,6 +540,8 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
+            let process_lock = process_write_lock(&self.context.workspace_root, to);
+            let _process_guard = process_lock.lock().await;
             let lock = self.acquire_object_write_lock(to).await?;
             let replace = self
                 .replace_from_staging(to, &staging, attributes)
@@ -596,6 +603,8 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
+            let process_lock = process_write_lock(&self.context.workspace_root, to);
+            let _process_guard = process_lock.lock().await;
             let lock = self.acquire_object_write_lock(to).await?;
             let replace = match self.head(to).await {
                 Ok(_) => Err(OsError::AlreadyExists {
@@ -619,6 +628,41 @@ impl ObjectStoreTrait for CurvineObjectStore {
 
         finalize_result
     }
+
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
+        let from_cv = self.object_path(from)?;
+        let to_cv = self.object_path(to)?;
+        let process_lock = process_write_lock(&self.context.workspace_root, to);
+        let _process_guard = process_lock.lock().await;
+        let lock = self.acquire_object_write_lock(to).await?;
+        let result = match self.head(to).await {
+            Ok(_) => Err(OsError::AlreadyExists {
+                path: to.to_string(),
+                source: "object already exists".into(),
+            }),
+            Err(OsError::NotFound { .. }) => {
+                self.prepare_multipart_destination(&to_cv, to).await?;
+                self.context
+                    .fs
+                    .rename(&from_cv, &to_cv)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(to, e))
+                    .and_then(|renamed| {
+                        if renamed {
+                            Ok(())
+                        } else {
+                            Err(OsError::Generic {
+                                store: CURVINE_SCHEME,
+                                source: "rename_if_not_exists rename reported no-op".into(),
+                            })
+                        }
+                    })
+            }
+            Err(err) => Err(err),
+        };
+        let _ = self.release_object_write_lock(&lock).await;
+        result
+    }
 }
 
 impl CurvineObjectStore {
@@ -629,6 +673,8 @@ impl CurvineObjectStore {
         attributes: Attributes,
     ) -> OsResult<PutResult> {
         let staging = self.write_payload_to_staging(location, payload).await?;
+        let process_lock = process_write_lock(&self.context.workspace_root, location);
+        let _process_guard = process_lock.lock().await;
         let lock = self.acquire_object_write_lock(location).await?;
         let result = self
             .replace_from_staging(location, &staging, attributes)
@@ -647,6 +693,8 @@ impl CurvineObjectStore {
         attributes: Attributes,
     ) -> OsResult<PutResult> {
         let staging = self.write_payload_to_staging(location, payload).await?;
+        let process_lock = process_write_lock(&self.context.workspace_root, location);
+        let _process_guard = process_lock.lock().await;
         let lock = self.acquire_object_write_lock(location).await?;
         let result = match self.head(location).await {
             Ok(_) => Err(OsError::AlreadyExists {
@@ -679,6 +727,8 @@ impl CurvineObjectStore {
         })?;
 
         let staging = self.write_payload_to_staging(location, payload).await?;
+        let process_lock = process_write_lock(&self.context.workspace_root, location);
+        let _process_guard = process_lock.lock().await;
         let lock = self.acquire_object_write_lock(location).await?;
         let result = async {
             let current = self.head_for_update(location).await?;
@@ -1277,6 +1327,8 @@ impl MultipartUpload for CurvineMultipartUpload {
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
+            let process_lock = process_write_lock(&self.store.context.workspace_root, &self.dest);
+            let _process_guard = process_lock.lock().await;
             let lock = self.store.acquire_object_write_lock(&self.dest).await?;
             let replace = self
                 .store
@@ -1475,6 +1527,17 @@ fn conditional_unlock(owner_id: u64) -> FileLock {
 fn conditional_lock_owner() -> u64 {
     let uuid = Uuid::new_v4();
     u64::from_le_bytes(uuid.as_bytes()[..8].try_into().unwrap_or_default())
+}
+
+fn process_write_lock(workspace_root: &CurvinePath, location: &Path) -> Arc<Mutex<()>> {
+    let key = format!("{}:{}", workspace_root.full_path(), location);
+    let mut locks = PROCESS_WRITE_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn conditional_lock(owner_id: u64, lock_type: LockType) -> FileLock {

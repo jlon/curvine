@@ -2087,6 +2087,7 @@ dependencies = [
  "lancedb",
  "md-5",
  "object_store",
+ "once_cell",
  "tempfile",
  "tokio",
  "url",

@@ -111,10 +111,11 @@ impl Display for CurvineObjectStore {
 
 /// [`ObjectStoreProvider`] for `curvine://` URIs.
 ///
-/// The opening URI is turned into one absolute Curvine workspace path (authority, when present,
-/// is the first path segment: `curvine://tenant/a` → `/tenant/a`). [`ObjectStoreProvider::extract_path`]
-/// applies the same validation and returns an empty [`Path`] because Lance object
-/// keys are relative to that workspace root. See `docs/phase4-curvine-object-store-and-lancedb.md` in this crate.
+/// The store is rooted at Curvine `/`, while [`ObjectStoreProvider::extract_path`]
+/// turns the full URI into a relative Lance object key (for example,
+/// `curvine://tenant/a` -> `tenant/a`, `curvine:///tmp/db` -> `tmp/db`).
+/// This matches Lance's object store contract and lets one Curvine store address
+/// multiple dataset base paths during shallow clone.
 #[derive(Debug, Clone, Default)]
 pub struct CurvineObjectStoreProvider;
 
@@ -146,11 +147,14 @@ impl CurvineObjectStoreProvider {
             ))
         })?;
 
-        let workspace_root = curvine_workspace_root_from_uri(base_path).map_err(|e| {
+        curvine_workspace_root_from_uri(base_path).map_err(|e| {
             LanceError::invalid_input(format!(
                 "Invalid curvine:// workspace URI '{}': {e}",
                 base_path
             ))
+        })?;
+        let workspace_root = CurvinePath::from_str("/").map_err(|e| {
+            LanceError::invalid_input(format!("Failed to initialize Curvine root path: {e}"))
         })?;
 
         Ok(Arc::new(CurvineContext { fs, workspace_root }))
@@ -201,27 +205,39 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         Ok(store)
     }
 
-    /// The opening `curvine://...` URI identifies the workspace root, not an object key.
-    ///
-    /// We therefore validate the URI with the same absolute-path merger used for
-    /// `workspace_root`, and then return an empty relative [`Path`]. All later
-    /// `head/get/put/list/...` calls operate on keys that are relative to that
-    /// workspace root.
+    /// Convert the full `curvine://...` URI into a Lance object key.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        curvine_workspace_root_from_uri(url).map_err(|e| {
+        if url.host_str() == Some(INTERNAL_RESERVED_ROOT) {
+            return Err(LanceError::invalid_input(format!(
+                "`{INTERNAL_RESERVED_ROOT}` is a reserved Curvine namespace and cannot be used as a curvine:// authority"
+            )));
+        }
+        let absolute = curvine_absolute_path_str_from_uri(url).map_err(|e| {
             LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
         })?;
-        Ok(Path::default())
+        let relative = absolute.trim_start_matches('/');
+        Path::parse(relative).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Invalid curvine:// URI path `{}` from `{}`: {e}",
+                absolute, url
+            ))
+        })
     }
 
     fn calculate_object_store_prefix(
         &self,
         url: &Url,
-        _storage_options: Option<&HashMap<String, String>>,
+        storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        let host = url.host_str().unwrap_or("");
-        let path = url.path().trim_end_matches('/');
-        Ok(format!("curvine${host}{path}"))
+        curvine_workspace_root_from_uri(url).map_err(|e| {
+            LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
+        })?;
+        let conf_path = storage_options
+            .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
+            .cloned()
+            .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+            .ok_or_else(missing_curvine_config_error)?;
+        Ok(format!("{CURVINE_SCHEME}${conf_path}"))
     }
 }
 
@@ -280,7 +296,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
         }
 
         let upload_id = Uuid::new_v4().to_string();
-        let upload_dir = self.multipart_dir(&upload_id)?;
+        let upload_dir = self.multipart_dir(location, &upload_id)?;
         self.context
             .fs
             .mkdir(&upload_dir, true)
@@ -389,7 +405,9 @@ impl ObjectStoreTrait for CurvineObjectStore {
             .delete(&cv_path, false)
             .await
             .map_err(|e| fs_error_to_object_store(location, e))?;
-        let _ = self.prune_empty_parents(&cv_path, location).await;
+        if !self.is_root_workspace() {
+            let _ = self.prune_empty_parents(&cv_path, location).await;
+        }
         Ok(())
     }
 
@@ -458,7 +476,13 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 if self.is_internal_reserved_location(&prefix) {
                     continue;
                 }
-                common_prefixes.insert(prefix);
+                let child = CurvinePath::from_str(&status.path).map_err(|e| OsError::Generic {
+                    store: CURVINE_SCHEME,
+                    source: e.to_string().into(),
+                })?;
+                if self.dir_contains_visible_file(&child).await? {
+                    common_prefixes.insert(prefix);
+                }
             } else {
                 objects.push(file_status_to_object_meta(entry_location, status));
             }
@@ -570,7 +594,9 @@ impl CurvineObjectStore {
             .full_path()
             .trim_end_matches('/');
 
-        let full = if rel.is_empty() {
+        let full = if rel.is_empty() && base.is_empty() {
+            "/".to_string()
+        } else if rel.is_empty() {
             base.to_string()
         } else {
             format!("{base}/{rel}")
@@ -647,8 +673,40 @@ impl CurvineObjectStore {
         Ok(())
     }
 
-    fn multipart_dir(&self, upload_id: &str) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    async fn dir_contains_visible_file(&self, dir: &CurvinePath) -> OsResult<bool> {
+        let statuses = self
+            .list_curvine_dir_or_empty(dir, &Path::default())
+            .await?;
+
+        for status in statuses {
+            if status.is_dir {
+                let child = CurvinePath::from_str(&status.path).map_err(|e| OsError::Generic {
+                    store: CURVINE_SCHEME,
+                    source: e.to_string().into(),
+                })?;
+                if self.is_multipart_internal_dir(&child) {
+                    continue;
+                }
+                if Box::pin(self.dir_contains_visible_file(&child)).await? {
+                    return Ok(true);
+                }
+            } else {
+                let path = relative_object_path(&self.context.workspace_root, &status.path)
+                    .map_err(|msg| OsError::Generic {
+                        store: CURVINE_SCHEME,
+                        source: msg.into(),
+                    })?;
+                if !self.is_internal_reserved_location(&path) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn multipart_dir(&self, location: &Path, upload_id: &str) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id
@@ -659,8 +717,13 @@ impl CurvineObjectStore {
         })
     }
 
-    fn multipart_part_path(&self, upload_id: &str, part_idx: usize) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    fn multipart_part_path(
+        &self,
+        location: &Path,
+        upload_id: &str,
+        part_idx: usize,
+    ) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}/part-{:08}",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id, part_idx
@@ -671,8 +734,8 @@ impl CurvineObjectStore {
         })
     }
 
-    fn multipart_final_path(&self, upload_id: &str) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    fn multipart_final_path(&self, location: &Path, upload_id: &str) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}/final",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id
@@ -683,8 +746,8 @@ impl CurvineObjectStore {
         })
     }
 
-    async fn cleanup_multipart(&self, upload_id: &str) -> OsResult<()> {
-        let dir = self.multipart_dir(upload_id)?;
+    async fn cleanup_multipart(&self, location: &Path, upload_id: &str) -> OsResult<()> {
+        let dir = self.multipart_dir(location, upload_id)?;
         match self.context.fs.delete(&dir, true).await {
             Ok(_) => Ok(()),
             Err(FsError::FileNotFound(_))
@@ -828,18 +891,19 @@ impl MultipartUpload for CurvineMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let store = self.store.clone();
         let upload_id = self.upload_id.clone();
+        let dest = self.dest.clone();
         let part_idx = self.next_part;
         self.next_part += 1;
         let completed_parts = Arc::clone(&self.completed_parts);
 
         Box::pin(async move {
-            let path = store.multipart_part_path(&upload_id, part_idx)?;
+            let path = store.multipart_part_path(&dest, &upload_id, part_idx)?;
             let mut writer = store
                 .context
                 .fs
                 .create(&path, true)
                 .await
-                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                .map_err(|e| fs_error_to_object_store(&dest, e))?;
 
             let mut hasher = Md5::new();
             for chunk in data.iter() {
@@ -847,12 +911,12 @@ impl MultipartUpload for CurvineMultipartUpload {
                 writer
                     .write(chunk)
                     .await
-                    .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                    .map_err(|e| fs_error_to_object_store(&dest, e))?;
             }
             writer
                 .complete()
                 .await
-                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                .map_err(|e| fs_error_to_object_store(&dest, e))?;
 
             let etag = format!("\"{:x}\"", hasher.finalize());
             let mut guard = completed_parts.lock().await;
@@ -873,7 +937,9 @@ impl MultipartUpload for CurvineMultipartUpload {
         self.store
             .prepare_multipart_destination(&dest, &self.dest)
             .await?;
-        let staging_final = self.store.multipart_final_path(&self.upload_id)?;
+        let staging_final = self
+            .store
+            .multipart_final_path(&self.dest, &self.upload_id)?;
         let mut writer = self
             .store
             .context
@@ -940,7 +1006,10 @@ impl MultipartUpload for CurvineMultipartUpload {
 
         match write_result {
             Ok(()) => {
-                let _ = self.store.cleanup_multipart(&self.upload_id).await;
+                let _ = self
+                    .store
+                    .cleanup_multipart(&self.dest, &self.upload_id)
+                    .await;
                 Ok(PutResult {
                     e_tag: Some(etag_inputs),
                     version: None,
@@ -951,7 +1020,9 @@ impl MultipartUpload for CurvineMultipartUpload {
     }
 
     async fn abort(&mut self) -> OsResult<()> {
-        self.store.cleanup_multipart(&self.upload_id).await
+        self.store
+            .cleanup_multipart(&self.dest, &self.upload_id)
+            .await
     }
 }
 
@@ -1019,11 +1090,14 @@ fn is_internal_reserved_relative_path(rel: &str) -> bool {
     rel == INTERNAL_RESERVED_ROOT || rel.starts_with(&format!("{INTERNAL_RESERVED_ROOT}/"))
 }
 
-fn workspace_staging_id(workspace_root: &CurvinePath) -> String {
-    workspace_root
-        .full_path()
-        .trim_start_matches('/')
-        .replace('/', "__")
+fn multipart_staging_id(workspace_root: &CurvinePath, location: Option<&Path>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(workspace_root.full_path().as_bytes());
+    if let Some(location) = location {
+        hasher.update([0]);
+        hasher.update(location.as_ref().as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {

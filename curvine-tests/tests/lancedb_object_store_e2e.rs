@@ -415,7 +415,7 @@ fn lancedb_table_names_create_modes_and_drop_all_tables() -> CommonResult<()> {
 }
 
 #[test]
-fn lancedb_clone_table_is_tracked_curvine_session_gap() -> CommonResult<()> {
+fn lancedb_clone_table_shallow_clone_roundtrip() -> CommonResult<()> {
     let (cluster, rt) = start_minicluster()?;
     let conf = cluster.conf_path.clone();
     let ns = unique_ns();
@@ -468,11 +468,25 @@ fn lancedb_clone_table_is_tracked_curvine_session_gap() -> CommonResult<()> {
             .clone_table("clone_t", source_uri)
             .execute()
             .await
-            .map_err(|e| e.to_string());
-        let err = cloned.expect_err("clone_table must remain a tracked Curvine session gap");
-        assert!(
-            err.contains("Unknown scheme: curvine"),
-            "unexpected clone_table failure; expected Curvine session/object-store registry propagation gap, got: {err}"
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            cloned
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        cloned
+            .add(int32_batch("id", vec![40]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            cloned
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            4
         );
         assert_eq!(
             source
@@ -489,7 +503,161 @@ fn lancedb_clone_table_is_tracked_curvine_session_gap() -> CommonResult<()> {
             .map_err(|e| CommonError::from(e.to_string()))?;
         assert!(names.contains(&"empty_t".to_string()));
         assert!(names.contains(&"source_t".to_string()));
-        assert!(!names.contains(&"clone_t".to_string()));
+        assert!(names.contains(&"clone_t".to_string()));
+
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let reopened_clone = reopened
+            .open_table("clone_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened_clone
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            4
+        );
+        let reopened_source = reopened
+            .open_table("source_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened_source
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_clone_table_shallow_clone_source_refs() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/clone_refs_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let source = conn
+            .create_table("source_t", int32_batch("id", vec![1, 2]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let v1 = source
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        source
+            .add(int32_batch("id", vec![3, 4]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let v2 = source
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        {
+            let mut tags = source
+                .tags()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?;
+            tags.create("v1", v1)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?;
+        }
+        source
+            .add(int32_batch("id", vec![5, 6]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            source
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            6
+        );
+
+        let source_uri = source
+            .uri()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let cloned_v1 = conn
+            .clone_table("clone_v1", source_uri.clone())
+            .source_version(v1)
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            cloned_v1
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            2
+        );
+
+        let cloned_tag = conn
+            .clone_table("clone_tag", source_uri.clone())
+            .source_tag("v1")
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            cloned_tag
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            2
+        );
+
+        let cloned_v2 = conn
+            .clone_table("clone_v2", source_uri.clone())
+            .source_version(v2)
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            cloned_v2
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            4
+        );
+
+        let both_ref_err = conn
+            .clone_table("clone_both_ref", source_uri)
+            .source_version(v1)
+            .source_tag("v1")
+            .execute()
+            .await;
+        assert!(
+            matches!(both_ref_err, Err(LanceDbError::InvalidInput { .. })),
+            "clone_table with source_version and source_tag should fail before writing target, got {both_ref_err:?}"
+        );
+        let names = conn
+            .table_names()
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(!names.contains(&"clone_both_ref".to_string()));
 
         Ok::<(), CommonError>(())
     })?;

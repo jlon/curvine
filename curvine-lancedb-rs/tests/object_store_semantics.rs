@@ -20,11 +20,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Duration;
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
+use curvine_common::fs::Path as CurvinePath;
 use futures::StreamExt;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::ObjectStoreProvider;
+use md5::{Digest, Md5};
 use object_store::path::Path;
 use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode,
@@ -35,7 +38,7 @@ use url::Url;
 #[tokio::test]
 #[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_semantics_live_cluster() {
-    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
+    let conf_path = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("Skipping live object-store semantics test: CURVINE_CONF_FILE is not set");
@@ -49,7 +52,7 @@ async fn curvine_object_store_semantics_live_cluster() {
         .as_nanos();
 
     let mut opts = HashMap::new();
-    opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf);
+    opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf_path.clone());
     let params = ObjectStoreParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
         ..Default::default()
@@ -732,6 +735,35 @@ async fn curvine_object_store_semantics_live_cluster() {
     abort_upload.abort().await.unwrap();
     assert!(store.inner.head(&abort_key).await.is_err());
 
+    let failed_complete_key = Path::parse(format!("{pfx}/multipart/fails_as_dir")).unwrap();
+    let failed_complete_child =
+        Path::parse(format!("{pfx}/multipart/fails_as_dir/child.bin")).unwrap();
+    store.put(&failed_complete_child, b"child").await.unwrap();
+    let mut failed_upload = store
+        .inner
+        .put_multipart(&failed_complete_key)
+        .await
+        .unwrap();
+    failed_upload
+        .put_part(Vec::from(&b"will-not-commit"[..]).into())
+        .await
+        .unwrap();
+    let failed_complete = failed_upload.complete().await;
+    assert!(matches!(
+        failed_complete,
+        Err(OsError::AlreadyExists { .. })
+    ));
+    assert_eq!(
+        store
+            .read_one_all(&failed_complete_child)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"child",
+        "failed multipart complete must not disturb existing prefix children"
+    );
+    assert_staging_clean(&conf_path, &failed_complete_key).await;
+
     let race_key = Path::parse(format!("{pfx}/multipart/race.bin")).unwrap();
     let mut upload1 = store.inner.put_multipart(&race_key).await.unwrap();
     let mut upload2 = store.inner.put_multipart(&race_key).await.unwrap();
@@ -888,4 +920,30 @@ async fn curvine_object_store_root_workspace_hides_multipart_staging() {
     top_upload.complete().await.unwrap();
     let top_full = store.read_one_all(&top_key).await.unwrap();
     assert_eq!(top_full.as_ref(), b"top-level");
+}
+
+async fn assert_staging_clean(conf_path: &str, location: &Path) {
+    let conf = ClusterConf::from(conf_path).expect("load Curvine cluster configuration");
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = CurvineFileSystem::with_rt(conf, rt).expect("create Curvine filesystem");
+    let staging_dir = CurvinePath::from_str(format!(
+        "/.curvine/lancedb/multipart/{}",
+        multipart_staging_id("/", location)
+    ))
+    .expect("valid staging path");
+
+    let statuses = fs.list_status(&staging_dir).await.unwrap_or_default();
+    assert!(
+        statuses.is_empty(),
+        "multipart failure cleanup should remove staging directory entries under {}",
+        staging_dir.full_path()
+    );
+}
+
+fn multipart_staging_id(workspace_root: &str, location: &Path) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(workspace_root.as_bytes());
+    hasher.update([0]);
+    hasher.update(location.as_ref().as_bytes());
+    format!("{:x}", hasher.finalize())
 }

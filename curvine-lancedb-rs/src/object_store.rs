@@ -1295,7 +1295,13 @@ impl MultipartUpload for CurvineMultipartUpload {
                     .await;
                 Ok(result)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let _ = self
+                    .store
+                    .cleanup_multipart(&self.dest, &self.upload_id)
+                    .await;
+                Err(err)
+            }
         }
     }
 

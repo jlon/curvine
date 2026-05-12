@@ -23,19 +23,23 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use common::{row_count, start_minicluster, unique_ns};
 use curvine_common::conf::ClusterConf;
-use futures::TryStreamExt;
+use futures::{stream::FuturesUnordered, TryStreamExt};
+use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::connect;
 use lancedb::database::{CreateTableMode, ReadConsistency};
 use lancedb::error::Error as LanceDbError;
 use lancedb::expr::{col, lit};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::{Index, IndexType};
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::table::{AddDataMode, ColumnAlteration, NewColumnTransform, OptimizeAction};
-use lancedb::DistanceType;
+use lancedb::{DistanceType, ObjectStoreProvider};
+use object_store::path::Path as ObjectPath;
+use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use orpc::{CommonError, CommonResult};
 use std::env;
+use url::Url;
 
 static ENV_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1035,6 +1039,352 @@ fn lancedb_update_delete_and_merge_insert_semantics() -> CommonResult<()> {
                 .map_err(|e| CommonError::from(e.to_string()))?,
             2
         );
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn curvine_object_store_put_update_conditional_etag_semantics() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let mut opts = HashMap::new();
+        opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                opts,
+            ))),
+            ..Default::default()
+        };
+        let provider = CurvineObjectStoreProvider::new();
+        let store = provider
+            .new_store(
+                Url::parse(&format!("curvine:///tmp/put_update_{ns}")).unwrap(),
+                &params,
+            )
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let key = ObjectPath::parse(format!("obj_{ns}.bin")).unwrap();
+        let created = store
+            .inner
+            .put_opts(
+                &key,
+                Vec::from(&b"v1"[..]).into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(created.e_tag.is_some());
+
+        let updated = store
+            .inner
+            .put_opts(
+                &key,
+                Vec::from(&b"v2"[..]).into(),
+                PutOptions {
+                    mode: PutMode::Update(created.clone().into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_ne!(updated.e_tag, created.e_tag);
+        assert_eq!(
+            store
+                .inner
+                .get(&key)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                .bytes()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                .as_ref(),
+            b"v2"
+        );
+
+        let stale = store
+            .inner
+            .put_opts(
+                &key,
+                Vec::from(&b"stale"[..]).into(),
+                PutOptions {
+                    mode: PutMode::Update(created.into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(ObjectStoreError::Precondition { .. })),
+            "stale PutMode::Update must not overwrite the current object, got {stale:?}"
+        );
+        let missing = store
+            .inner
+            .put_opts(
+                &ObjectPath::parse(format!("missing_{ns}.bin")).unwrap(),
+                Vec::from(&b"missing"[..]).into(),
+                PutOptions {
+                    mode: PutMode::Update(updated.clone().into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(missing, Err(ObjectStoreError::Precondition { .. })),
+            "conditional update of a missing object must report Precondition, got {missing:?}"
+        );
+        let version_only = store
+            .inner
+            .put_opts(
+                &key,
+                Vec::from(&b"version-only"[..]).into(),
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: None,
+                        version: Some("1".to_string()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(version_only, Err(ObjectStoreError::Generic { .. })),
+            "Curvine exposes e_tag but no object version, got {version_only:?}"
+        );
+        assert_eq!(
+            store
+                .inner
+                .get(&key)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                .bytes()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                .as_ref(),
+            b"v2"
+        );
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn curvine_object_store_put_update_concurrent_retries_preserve_all_writes() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        const WORKERS: usize = 5;
+        const INCREMENTS: usize = 10;
+
+        let mut opts = HashMap::new();
+        opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                opts,
+            ))),
+            ..Default::default()
+        };
+        let provider = CurvineObjectStoreProvider::new();
+        let store = provider
+            .new_store(
+                Url::parse(&format!("curvine:///tmp/put_update_race_{ns}")).unwrap(),
+                &params,
+            )
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .inner;
+        let key = ObjectPath::parse(format!("counter_{ns}.txt")).unwrap();
+
+        let mut tasks = (0..WORKERS)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let key = key.clone();
+                async move {
+                    for _ in 0..INCREMENTS {
+                        loop {
+                            match store.get(&key).await {
+                                Ok(result) => {
+                                    let version = UpdateVersion {
+                                        e_tag: result.meta.e_tag.clone(),
+                                        version: result.meta.version.clone(),
+                                    };
+                                    let bytes = result.bytes().await?;
+                                    let value = std::str::from_utf8(bytes.as_ref())
+                                        .map_err(|source| ObjectStoreError::Generic {
+                                            store: "curvine-test",
+                                            source: Box::new(source),
+                                        })?
+                                        .parse::<usize>()
+                                        .map_err(|source| ObjectStoreError::Generic {
+                                            store: "curvine-test",
+                                            source: Box::new(source),
+                                        })?;
+                                    let next = (value + 1).to_string();
+                                    match store
+                                        .put_opts(
+                                            &key,
+                                            next.into_bytes().into(),
+                                            PutOptions {
+                                                mode: PutMode::Update(version),
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => break,
+                                        Err(ObjectStoreError::Precondition { .. }) => continue,
+                                        Err(err) => return Err(err),
+                                    }
+                                }
+                                Err(ObjectStoreError::NotFound { .. }) => {
+                                    match store
+                                        .put_opts(
+                                            &key,
+                                            Vec::from(&b"1"[..]).into(),
+                                            PutOptions {
+                                                mode: PutMode::Create,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => break,
+                                        Err(ObjectStoreError::AlreadyExists { .. }) => continue,
+                                        Err(err) => return Err(err),
+                                    }
+                                }
+                                Err(err) => return Err(err),
+                            }
+                        }
+                    }
+                    Ok::<(), ObjectStoreError>(())
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while tasks
+            .try_next()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .is_some()
+        {}
+
+        let bytes = store
+            .get(&key)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .bytes()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let final_value = std::str::from_utf8(bytes.as_ref())
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .parse::<usize>()
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(final_value, WORKERS * INCREMENTS);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_stale_table_handle_append_rebases_on_curvine() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/concurrent_append_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        conn.create_table("append_t", int32_batch("id", vec![0]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let t1 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let t2 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let initial_v1 = t1
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let initial_v2 = t2
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(initial_v1, initial_v2);
+
+        t1.add(int32_batch("id", vec![1]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        t2.add(int32_batch("id", vec![2]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let batches: Vec<RecordBatch> = reopened
+            .query()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
 
         Ok::<(), CommonError>(())
     })?;

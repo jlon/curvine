@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use lance::dataset::{ReadParams, WriteParams};
 use lance_namespace::models::{
     CreateNamespaceRequest, CreateNamespaceResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DropNamespaceRequest, DropNamespaceResponse, ListNamespacesRequest,
-    ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
+    DescribeNamespaceResponse, DescribeTableRequest, DropNamespaceRequest, DropNamespaceResponse,
+    ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest, ListTablesResponse,
 };
 use lance_table::io::commit::{CommitHandler, ConditionalPutCommitHandler};
 use lancedb_upstream::arrow::arrow_schema::SchemaRef;
@@ -66,15 +66,32 @@ fn ensure_open_request_has_commit_handler(mut req: OpenTableRequest) -> OpenTabl
     req
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SafeCommitScope {
+    Listing,
+    Namespace,
+}
+
 /// Wraps the upstream database. Before `create_table` / `open_table`, sets `ConditionalPutCommitHandler`
 /// when the request did not set `commit_handler`.
 pub(crate) struct CurvineSafeCommitDatabase {
     upstream: Arc<dyn Database>,
+    scope: SafeCommitScope,
 }
 
 impl CurvineSafeCommitDatabase {
     pub(crate) fn new(upstream: Arc<dyn Database>) -> Self {
-        Self { upstream }
+        Self {
+            upstream,
+            scope: SafeCommitScope::Listing,
+        }
+    }
+
+    pub(crate) fn new_namespace(upstream: Arc<dyn Database>) -> Self {
+        Self {
+            upstream,
+            scope: SafeCommitScope::Namespace,
+        }
     }
 
     async fn open_existing_table_for_create(
@@ -101,6 +118,22 @@ impl CurvineSafeCommitDatabase {
             });
         }
         Ok(table)
+    }
+
+    async fn namespace_uses_managed_versioning(&self, req: &OpenTableRequest) -> Result<bool> {
+        let namespace = self.upstream.namespace_client().await?;
+        let mut table_id = req.namespace.clone();
+        table_id.push(req.name.clone());
+        let response = namespace
+            .describe_table(DescribeTableRequest {
+                id: Some(table_id),
+                ..Default::default()
+            })
+            .await
+            .map_err(|source| Error::Runtime {
+                message: format!("Failed to describe namespace table: {source}"),
+            })?;
+        Ok(response.managed_versioning == Some(true))
     }
 }
 
@@ -219,7 +252,16 @@ impl Database for CurvineSafeCommitDatabase {
     }
 
     async fn open_table(&self, request: OpenTableRequest) -> Result<Arc<dyn BaseTable>> {
-        let request = ensure_open_request_has_commit_handler(request);
+        let request = match self.scope {
+            SafeCommitScope::Listing => ensure_open_request_has_commit_handler(request),
+            SafeCommitScope::Namespace => {
+                if self.namespace_uses_managed_versioning(&request).await? {
+                    request
+                } else {
+                    ensure_open_request_has_commit_handler(request)
+                }
+            }
+        };
         self.upstream.open_table(request).await
     }
 

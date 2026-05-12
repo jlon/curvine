@@ -236,7 +236,7 @@ fn wrap_upstream_connection_for_curvine(
     upstream: UpstreamConnection,
     options: &ConnectionOptions,
 ) -> UpstreamConnection {
-    if !is_curvine_uri(&options.uri) || options.namespace_backed {
+    if !is_curvine_uri(&options.uri) {
         return upstream;
     }
     let embedding_registry = options
@@ -244,7 +244,11 @@ fn wrap_upstream_connection_for_curvine(
         .clone()
         .unwrap_or_else(|| Arc::new(MemoryRegistry::new()));
     let inner_db = upstream.database().clone();
-    let wrapped: Arc<dyn Database> = Arc::new(CurvineSafeCommitDatabase::new(inner_db));
+    let wrapped: Arc<dyn Database> = if options.namespace_backed {
+        Arc::new(CurvineSafeCommitDatabase::new_namespace(inner_db))
+    } else {
+        Arc::new(CurvineSafeCommitDatabase::new(inner_db))
+    };
     UpstreamConnection::new(wrapped, embedding_registry)
 }
 

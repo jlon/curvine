@@ -1486,12 +1486,12 @@ fn lancedb_concurrent_append_rebases_on_curvine() -> CommonResult<()> {
 }
 
 #[test]
-fn lancedb_connect_namespace_curvine_table_roundtrip() -> CommonResult<()> {
+fn lancedb_connect_namespace_curvine_concurrent_append() -> CommonResult<()> {
     let (cluster, rt) = start_minicluster()?;
     let conf = cluster.conf_path.clone();
     let ns = unique_ns();
     rt.block_on(async move {
-        let root = format!("curvine:///tmp/ns_cv_roundtrip_{ns}");
+        let root = format!("curvine:///tmp/ns_cv_append_{ns}");
         let mut properties = HashMap::new();
         properties.insert("root".to_string(), root);
 
@@ -1501,29 +1501,33 @@ fn lancedb_connect_namespace_curvine_table_roundtrip() -> CommonResult<()> {
             .await
             .map_err(|e| CommonError::from(e.to_string()))?;
 
-        conn.create_table("ns_t", int32_batch("id", vec![0]))
+        conn.create_table("ns_append_t", int32_batch("id", vec![0]))
             .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
             .execute()
             .await
             .map_err(|e| CommonError::from(e.to_string()))?;
 
-        let t = conn
-            .open_table("ns_t")
+        let t1 = conn
+            .open_table("ns_append_t")
             .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
             .execute()
             .await
             .map_err(|e| CommonError::from(e.to_string()))?;
-        t.add(int32_batch("id", vec![1]))
+        let t2 = conn
+            .open_table("ns_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
             .execute()
             .await
             .map_err(|e| CommonError::from(e.to_string()))?;
-        t.add(int32_batch("id", vec![2]))
-            .execute()
-            .await
-            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let append1 = t1.add(int32_batch("id", vec![1])).execute();
+        let append2 = t2.add(int32_batch("id", vec![2])).execute();
+        let (r1, r2) = tokio::join!(append1, append2);
+        r1.map_err(|e| CommonError::from(e.to_string()))?;
+        r2.map_err(|e| CommonError::from(e.to_string()))?;
 
         let reopened = conn
-            .open_table("ns_t")
+            .open_table("ns_append_t")
             .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
             .execute()
             .await

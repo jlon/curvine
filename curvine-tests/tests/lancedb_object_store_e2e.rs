@@ -12,11 +12,11 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type, Int32Type};
+use arrow_array::types::{Float32Type, Float64Type, Int32Type, UInt64Type};
 use arrow_array::Array;
 use arrow_array::{
     BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
+    RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use common::{row_count, start_minicluster, unique_ns};
@@ -24,9 +24,11 @@ use curvine_common::conf::ClusterConf;
 use futures::TryStreamExt;
 use lancedb::connect;
 use lancedb::error::Error as LanceDbError;
+use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::index::{Index, IndexType};
 use lancedb::object_store::CURVINE_CONF_FILE_KEY;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::table::{AddDataMode, ColumnAlteration, NewColumnTransform, OptimizeAction};
 use lancedb::DistanceType;
 use orpc::{CommonError, CommonResult};
 use std::env;
@@ -66,6 +68,46 @@ fn string_values(batch: &RecordBatch, column: &str) -> Vec<String> {
     (0..array.len())
         .map(|i| array.value(i).to_string())
         .collect()
+}
+
+fn uint64_values(batch: &RecordBatch, column: &str) -> Vec<u64> {
+    let array = batch[column].as_primitive::<UInt64Type>();
+    (0..array.len()).map(|i| array.value(i)).collect()
+}
+
+fn id_age_batch(offset: i32, age: i32, rows: i32) -> Box<dyn RecordBatchReader + Send> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(offset..(offset + rows))),
+            Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(
+                age,
+                rows as usize,
+            ))),
+        ],
+    )
+    .unwrap();
+    Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))
+}
+
+fn collect_id_age_rows(batches: &[RecordBatch]) -> Vec<(i32, i32)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = int32_values(batch, "id");
+        let ages = int32_values(batch, "age");
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids[row].expect("id is non-nullable"),
+                ages[row].expect("age is non-nullable"),
+            ));
+        }
+    }
+    rows.sort_unstable();
+    rows
 }
 
 #[test]
@@ -348,6 +390,223 @@ fn lancedb_write_empty_initial_table_has_zero_rows() -> CommonResult<()> {
 }
 
 #[test]
+fn lancedb_add_overwrite_replaces_existing_rows() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/overwrite_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let table = conn
+            .create_table("overwrite_t", initial)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let replacement =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![9]))]).unwrap();
+        table
+            .add(replacement)
+            .mode(AddDataMode::Overwrite)
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        assert_eq!(
+            table
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            1
+        );
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect();
+        assert_eq!(ids, vec![9]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_update_delete_and_merge_insert_semantics() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/mutation_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let table = conn
+            .create_table("mutation_t", id_age_batch(0, 0, 10))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let update = table
+            .update()
+            .only_if("id < 3")
+            .column("age", "age + 10")
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(update.rows_updated, 3);
+        assert!(update.version > 0);
+        assert_eq!(
+            table
+                .count_rows(Some("age = 10".to_string()))
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+
+        let delete = table
+            .delete("id >= 8")
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(delete.num_deleted_rows, 2);
+        assert_eq!(
+            table
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            8
+        );
+
+        let mut insert_only = table.merge_insert(&["id"]);
+        insert_only.when_not_matched_insert_all();
+        let inserted = insert_only
+            .execute(id_age_batch(5, 20, 10))
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(inserted.num_inserted_rows, 7);
+        assert_eq!(inserted.num_updated_rows, 0);
+        assert_eq!(inserted.num_deleted_rows, 0);
+        assert_eq!(
+            table
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            15
+        );
+
+        let mut update_only = table.merge_insert(&["id"]);
+        update_only.when_matched_update_all(Some("target.age = 0".to_string()));
+        let updated = update_only
+            .execute(id_age_batch(3, 30, 6))
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(updated.num_updated_rows, 5);
+        assert_eq!(updated.num_inserted_rows, 0);
+        assert_eq!(
+            table
+                .count_rows(Some("age = 30".to_string()))
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            5
+        );
+
+        let mut replace_subset = table.merge_insert(&["id"]);
+        replace_subset
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all()
+            .when_not_matched_by_source_delete(Some("id >= 10".to_string()));
+        let replaced = replace_subset
+            .execute(id_age_batch(10, 40, 2))
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(replaced.num_updated_rows, 2);
+        assert_eq!(replaced.num_deleted_rows, 3);
+        assert_eq!(
+            table
+                .count_rows(Some("id >= 10".to_string()))
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            2
+        );
+        assert_eq!(
+            table
+                .count_rows(Some("age = 40".to_string()))
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            2
+        );
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .select(Select::columns(&["id", "age"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let rows = collect_id_age_rows(&batches);
+        assert_eq!(rows.len(), 12);
+        assert!(rows.contains(&(0, 10)));
+        assert!(rows.contains(&(3, 30)));
+        assert!(rows.contains(&(10, 40)));
+        assert!(rows.contains(&(11, 40)));
+        assert!(!rows.iter().any(|(id, _)| *id >= 12));
+
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("mutation_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            12
+        );
+        assert_eq!(
+            reopened
+                .count_rows(Some("age = 40".to_string()))
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            2
+        );
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
 fn lancedb_query_limit_select_filter() -> CommonResult<()> {
     let (cluster, rt) = start_minicluster()?;
     let conf = cluster.conf_path.clone();
@@ -422,6 +681,114 @@ fn lancedb_query_limit_select_filter() -> CommonResult<()> {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![3, 4, 5]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_take_offsets_row_ids_and_table_metadata() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/take_meta_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let table = conn
+            .create_table("take_t", id_age_batch(0, 7, 6))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(table.name(), "take_t");
+        assert_eq!(table.namespace(), &[] as &[String]);
+        assert!(table.id().contains("take_t"));
+        assert!(table
+            .uri()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .contains("take_t"));
+        let initial_options = table
+            .initial_storage_options()
+            .await
+            .expect("storage options should be retained");
+        assert_eq!(initial_options.get(CURVINE_CONF_FILE_KEY), Some(&conf));
+        let latest_options = table
+            .latest_storage_options()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .expect("latest storage options should be retained");
+        assert_eq!(latest_options.get(CURVINE_CONF_FILE_KEY), Some(&conf));
+
+        let offset_batches: Vec<RecordBatch> = table
+            .take_offsets(vec![1, 4])
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut offset_ids: Vec<i32> = offset_batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect();
+        offset_ids.sort_unstable();
+        assert_eq!(offset_ids, vec![1, 4]);
+
+        let row_id_batches: Vec<RecordBatch> = table
+            .query()
+            .with_row_id()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut target_row_ids = Vec::new();
+        for batch in &row_id_batches {
+            let ids = int32_values(batch, "id");
+            let row_ids = uint64_values(batch, "_rowid");
+            for row in 0..batch.num_rows() {
+                if ids[row] == Some(2) || ids[row] == Some(5) {
+                    target_row_ids.push(row_ids[row]);
+                }
+            }
+        }
+        assert_eq!(target_row_ids.len(), 2);
+
+        let taken_by_row_id: Vec<RecordBatch> = table
+            .take_row_ids(target_row_ids)
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids: Vec<i32> = taken_by_row_id
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 5]);
+
+        let stats = table
+            .stats()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(stats.num_rows, 6);
+        assert!(stats.total_bytes > 0);
+        assert_eq!(stats.num_indices, 0);
 
         Ok::<(), CommonError>(())
     })?;
@@ -505,6 +872,194 @@ fn lancedb_schema_mixed_types_roundtrip() -> CommonResult<()> {
                 (1, "a".to_string(), 1.5_f32, 10.1_f64, true, Some(7)),
                 (2, "b".to_string(), 2.5_f32, 20.2_f64, false, None),
             ]
+        );
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_schema_evolution_and_versions_roundtrip() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/schema_version_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Int32, false),
+            Field::new("drop_me", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+        let table = conn
+            .create_table("schema_t", batch)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let v1 = table
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let add_columns = table
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "double_score".into(),
+                    "score * 2".into(),
+                )]),
+                None,
+            )
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(add_columns.version > v1);
+
+        let alter_columns = table
+            .alter_columns(&[ColumnAlteration::new("score".into()).rename("renamed_score".into())])
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(alter_columns.version > add_columns.version);
+
+        let drop_columns = table
+            .drop_columns(&["drop_me"])
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(drop_columns.version > alter_columns.version);
+
+        let schema = table
+            .schema()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(schema.field_with_name("renamed_score").is_ok());
+        assert!(schema.field_with_name("double_score").is_ok());
+        assert!(schema.field_with_name("drop_me").is_err());
+
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .select(Select::columns(&["id", "renamed_score", "double_score"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ids = int32_values(batch, "id");
+            let scores = int32_values(batch, "renamed_score");
+            let doubled = int32_values(batch, "double_score");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    ids[row].expect("id is non-nullable"),
+                    scores[row].expect("renamed_score is non-nullable"),
+                    doubled[row].expect("double_score is non-nullable"),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 10, 20), (2, 20, 40), (3, 30, 60)]);
+
+        let latest = table
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let versions = table
+            .list_versions()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(versions.len() >= 4);
+        table
+            .checkout(v1)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            table
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let old_schema = table
+            .schema()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(old_schema.field_with_name("score").is_ok());
+        assert!(old_schema.field_with_name("double_score").is_err());
+        let checked_out_write = table.update().column("score", "score + 1").execute().await;
+        assert!(
+            checked_out_write.is_err(),
+            "writes should fail while checked out to an old version"
+        );
+
+        table
+            .checkout_latest()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            table
+                .version()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            latest
+        );
+        table
+            .checkout(v1)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        table
+            .restore()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(
+            table
+                .version()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                > latest
+        );
+        let restored_schema = table
+            .schema()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(restored_schema.field_with_name("score").is_ok());
+        assert!(restored_schema.field_with_name("double_score").is_err());
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("schema_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let reopened_schema = reopened
+            .schema()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(reopened_schema.field_with_name("score").is_ok());
+        assert!(reopened_schema.field_with_name("double_score").is_err());
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
         );
 
         Ok::<(), CommonError>(())
@@ -840,7 +1395,7 @@ fn lancedb_vector_column_search_create_index_and_query_again() -> CommonResult<(
         assert_nearest_vector_result(&before)?;
 
         table
-            .create_index(&["vec"], Index::Auto)
+            .create_index(&["vec"], Index::IvfPq(IvfPqIndexBuilder::default()))
             .execute()
             .await
             .map_err(|e| CommonError::from(e.to_string()))?;
@@ -861,6 +1416,88 @@ fn lancedb_vector_column_search_create_index_and_query_again() -> CommonResult<(
         assert_eq!(stats.num_unindexed_rows, 0);
         assert_eq!(stats.index_type, IndexType::IvfPq);
         assert_eq!(stats.distance_type, Some(DistanceType::L2));
+        let table_stats = table
+            .stats()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(table_stats.num_rows, N);
+        assert_eq!(table_stats.num_indices, 1);
+
+        let more_values =
+            Float32Array::from_iter_values((0..DIM as usize).map(|c| 9.0_f32 + (c as f32) * 0.001));
+        let more_list = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM,
+            Arc::new(more_values),
+            None,
+        )
+        .map_err(|e| CommonError::from(e.to_string()))?;
+        let more = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        DIM,
+                    ),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![N as i32])),
+                Arc::new(more_list),
+            ],
+        )
+        .map_err(|e| CommonError::from(e.to_string()))?;
+        table
+            .add(more)
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let unoptimized = table
+            .index_stats(&index_configs[0].name)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .expect("index stats should remain available after append");
+        assert_eq!(unoptimized.num_indexed_rows, N);
+        assert_eq!(unoptimized.num_unindexed_rows, 1);
+
+        table
+            .optimize(OptimizeAction::Index(Default::default()))
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let optimized = table
+            .index_stats(&index_configs[0].name)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .expect("index stats should remain available after optimize");
+        assert_eq!(optimized.num_indexed_rows, N + 1);
+        assert_eq!(optimized.num_unindexed_rows, 0);
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("vec_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let reopened_indices = reopened
+            .list_indices()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert!(reopened_indices.iter().any(|index| {
+            index.name == index_configs[0].name && index.columns == vec!["vec".to_string()]
+        }));
+        let reopened_stats = reopened
+            .index_stats(&index_configs[0].name)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .expect("reopened table should see persisted index stats");
+        assert_eq!(reopened_stats.num_indexed_rows, N + 1);
+        assert_eq!(reopened_stats.num_unindexed_rows, 0);
 
         let stream = table
             .vector_search(qv.clone())
@@ -878,6 +1515,19 @@ fn lancedb_vector_column_search_create_index_and_query_again() -> CommonResult<(
             "vector search after index should return rows"
         );
         assert_nearest_vector_result(&after)?;
+
+        table
+            .drop_index(&index_configs[0].name)
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            table
+                .list_indices()
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?
+                .len(),
+            0
+        );
 
         Ok::<(), CommonError>(())
     })?;

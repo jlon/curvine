@@ -245,6 +245,12 @@ async fn curvine_object_store_semantics_live_cluster() {
         create_res.e_tag.is_some(),
         "create put_opts should return an e_tag"
     );
+    assert_eq!(
+        create_res.version, create_res.e_tag,
+        "Curvine version token should match the synthetic e_tag until a native generation is exposed"
+    );
+    let created_meta = store.inner.head(&create_only).await.unwrap();
+    assert_eq!(created_meta.version, create_res.version);
     let create_again = store
         .inner
         .put_opts(
@@ -279,7 +285,7 @@ async fn curvine_object_store_semantics_live_cluster() {
             &create_only,
             Vec::from(&b"create-stale"[..]).into(),
             PutOptions {
-                mode: PutMode::Update(create_res.into()),
+                mode: PutMode::Update(create_res.clone().into()),
                 ..Default::default()
             },
         )
@@ -301,6 +307,23 @@ async fn curvine_object_store_semantics_live_cluster() {
         store.read_one_all(&create_only).await.unwrap().as_ref(),
         b"create-v4"
     );
+    let overwritten = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v5-longer"[..]).into(),
+            PutOptions {
+                mode: PutMode::Overwrite,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        overwritten.version, create_res.version,
+        "overwrite should produce a different Curvine object version token"
+    );
+    assert_eq!(overwritten.version, overwritten.e_tag);
     let version_update = store
         .inner
         .put_opts(
@@ -543,6 +566,7 @@ async fn curvine_object_store_semantics_live_cluster() {
     );
     let mp_res = upload.complete().await.unwrap();
     assert!(mp_res.e_tag.is_some());
+    assert_eq!(mp_res.version, mp_res.e_tag);
     assert_eq!(
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"hello multipart",
@@ -561,6 +585,7 @@ async fn curvine_object_store_semantics_live_cluster() {
         .await
         .unwrap();
     assert!(mp_update.e_tag.is_some());
+    assert_eq!(mp_update.version, mp_update.e_tag);
     assert_eq!(
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"after multipart",

@@ -1287,22 +1287,27 @@ fn curvine_workspace_root_from_uri(url: &Url) -> StdResult<CurvinePath, String> 
 /// Curvine [`FileStatus`] → [`ObjectMeta`].
 ///
 /// - **size / last_modified**: from `len` and `mtime` (ms since epoch on wire).
-/// - **e_tag**: weak synthetic tag `W/"cv:{inode}:{mtime_ms}"` for stable referential
-///   identity; **not** a content digest. Do not use for byte-accurate conditional semantics
-///   until a content hash is wired through the filesystem.
-/// - **version**: always `None` (no object-version id exposed yet).
+/// - **e_tag / version**: weak synthetic token from Curvine metadata fields currently exposed by
+///   `FileStatus`; **not** a content digest or a server-side generation.
 fn file_status_to_object_meta(location: Path, status: FileStatus) -> ObjectMeta {
     let secs = status.mtime.div_euclid(1000);
     let millis = status.mtime.rem_euclid(1000) as u32;
-    let weak_etag = Some(format!("W/\"cv:{}:{}\"", status.id, status.mtime));
+    let token = Some(curvine_object_version_token(&status));
     ObjectMeta {
         location,
         last_modified: DateTime::<Utc>::from_timestamp(secs, millis * 1_000_000)
             .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
         size: status.len as u64,
-        e_tag: weak_etag,
-        version: None,
+        e_tag: token.clone(),
+        version: token,
     }
+}
+
+fn curvine_object_version_token(status: &FileStatus) -> String {
+    format!(
+        "W/\"cv:{}:{}:{}:{}:{}\"",
+        status.id, status.mtime, status.len, status.is_complete, status.nlink
+    )
 }
 
 fn relative_object_path(root: &CurvinePath, full_path: &str) -> StdResult<Path, String> {

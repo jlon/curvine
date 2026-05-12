@@ -934,6 +934,23 @@ impl CurvineObjectStore {
     }
 
     fn object_path(&self, location: &Path) -> OsResult<CurvinePath> {
+        if let Some(absolute) = curvine_absolute_path_str_from_object_path(location)? {
+            if self.is_root_workspace()
+                && is_internal_reserved_relative_path(absolute.trim_start_matches('/'))
+            {
+                return Err(OsError::NotSupported {
+                    source: format!(
+                        "`{INTERNAL_RESERVED_ROOT}` is a reserved Curvine namespace for root workspaces"
+                    )
+                    .into(),
+                });
+            }
+            return CurvinePath::from_str(absolute).map_err(|e| OsError::Generic {
+                store: CURVINE_SCHEME,
+                source: e.to_string().into(),
+            });
+        }
+
         let rel = location.as_ref().trim_start_matches('/');
         if self.is_root_workspace() && is_internal_reserved_relative_path(rel) {
             return Err(OsError::NotSupported {
@@ -1392,6 +1409,37 @@ fn curvine_absolute_path_str_from_uri(url: &Url) -> StdResult<String, String> {
 fn curvine_workspace_root_from_uri(url: &Url) -> StdResult<CurvinePath, String> {
     let full = curvine_absolute_path_str_from_uri(url)?;
     CurvinePath::from_str(&full).map_err(|e| e.to_string())
+}
+
+fn curvine_absolute_path_str_from_object_path(location: &Path) -> OsResult<Option<String>> {
+    let raw = location.as_ref();
+    let Some(stripped) = raw.strip_prefix("curvine:") else {
+        return Ok(None);
+    };
+
+    let absolute = if let Some(path) = stripped.strip_prefix("///") {
+        format!("/{path}")
+    } else if let Some(path) = stripped.strip_prefix("//") {
+        let mut parts = path.splitn(2, '/');
+        let authority = parts.next().unwrap_or_default();
+        let rest = parts.next().unwrap_or_default();
+        if authority.is_empty() {
+            format!("/{rest}")
+        } else if rest.is_empty() {
+            format!("/{authority}")
+        } else {
+            format!("/{authority}/{rest}")
+        }
+    } else if stripped.starts_with('/') {
+        stripped.to_string()
+    } else {
+        return Err(OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: format!("Invalid Curvine object path `{raw}`").into(),
+        });
+    };
+
+    Ok(Some(absolute))
 }
 
 /// Curvine [`FileStatus`] → [`ObjectMeta`].

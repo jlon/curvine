@@ -196,6 +196,36 @@ fn missing_curvine_config_error() -> LanceError {
     ))
 }
 
+fn curvine_reader_stream(
+    mut reader: impl Reader + Send + 'static,
+    location: Path,
+    range: std::ops::Range<u64>,
+) -> impl futures::Stream<Item = OsResult<Bytes>> {
+    stream! {
+        let mut remaining = range.end.saturating_sub(range.start) as usize;
+        while remaining > 0 {
+            let chunk = match reader.async_read(Some(remaining)).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    yield Err(fs_error_to_object_store(&location, e));
+                    return;
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            remaining = remaining.saturating_sub(chunk.len());
+            yield Ok(chunk.to_bytes());
+        }
+
+        if let Err(e) = reader.complete().await {
+            yield Err(fs_error_to_object_store(&location, e));
+        }
+    }
+}
+
 #[async_trait]
 impl ObjectStoreProvider for CurvineObjectStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
@@ -346,19 +376,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .map_err(|e| fs_error_to_object_store(location, e))?;
         }
 
-        let len = (range.end - range.start) as usize;
-        let mut buf = vec![0u8; len];
-        let read_len = reader
-            .read_full(&mut buf)
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-        reader
-            .complete()
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-        buf.truncate(read_len);
-
-        let stream = stream::once(async move { Ok::<Bytes, OsError>(Bytes::from(buf)) }).boxed();
+        let stream = curvine_reader_stream(reader, location.clone(), range.clone()).boxed();
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream),

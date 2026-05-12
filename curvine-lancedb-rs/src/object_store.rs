@@ -48,6 +48,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
+use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
 use url::Url;
@@ -787,9 +788,9 @@ impl CurvineObjectStore {
             .await
             .map_err(|e| fs_error_to_object_store(location, e))?;
         let write_result: OsResult<()> = async {
-            for chunk in payload.iter() {
+            for chunk in payload {
                 writer
-                    .write(chunk)
+                    .async_write(DataSlice::bytes(chunk))
                     .await
                     .map_err(|e| fs_error_to_object_store(location, e))?;
             }
@@ -1289,9 +1290,9 @@ impl MultipartUpload for CurvineMultipartUpload {
                 .await
                 .map_err(|e| fs_error_to_object_store(&dest, e))?;
 
-            for chunk in data.iter() {
+            for chunk in data {
                 writer
-                    .write(chunk)
+                    .async_write(DataSlice::bytes(chunk))
                     .await
                     .map_err(|e| fs_error_to_object_store(&dest, e))?;
             }

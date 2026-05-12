@@ -26,7 +26,10 @@ use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::ObjectStoreProvider;
 use object_store::path::Path;
-use object_store::{Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode, PutOptions};
+use object_store::{
+    Attribute, Attributes, Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode,
+    PutMultipartOptions, PutOptions, UpdateVersion,
+};
 use url::Url;
 
 #[tokio::test]
@@ -324,13 +327,39 @@ async fn curvine_object_store_semantics_live_cluster() {
         "overwrite should produce a different Curvine object version token"
     );
     assert_eq!(overwritten.version, overwritten.e_tag);
+    let versioned_get = store
+        .inner
+        .get_opts(
+            &create_only,
+            GetOptions {
+                version: overwritten.version.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        versioned_get.bytes().await.unwrap().as_ref(),
+        b"create-v5-longer"
+    );
+    let stale_version_get = store
+        .inner
+        .get_opts(
+            &create_only,
+            GetOptions {
+                version: Some("W/\"cv:stale:0:0:true:1\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(stale_version_get, Err(OsError::NotImplemented)));
     let version_update = store
         .inner
         .put_opts(
             &create_only,
             Vec::from(&b"create-version"[..]).into(),
             PutOptions {
-                mode: PutMode::Update(object_store::UpdateVersion {
+                mode: PutMode::Update(UpdateVersion {
                     e_tag: None,
                     version: Some("1".to_string()),
                 }),
@@ -351,6 +380,46 @@ async fn curvine_object_store_semantics_live_cluster() {
         )
         .await;
     assert!(matches!(missing_update, Err(OsError::Precondition { .. })));
+
+    let attrs = Attributes::from_iter([
+        (Attribute::CacheControl, "max-age=604800"),
+        (
+            Attribute::ContentDisposition,
+            r#"attachment; filename="curvine.bin""#,
+        ),
+        (Attribute::ContentEncoding, "gzip"),
+        (Attribute::ContentLanguage, "en-US"),
+        (Attribute::ContentType, "application/octet-stream"),
+        (Attribute::Metadata("curvine-key".into()), "curvine-value"),
+    ]);
+    let attr_key = Path::parse(format!("{pfx}/attrs/direct.bin")).unwrap();
+    store
+        .inner
+        .put_opts(
+            &attr_key,
+            Vec::from(&b"attr-body"[..]).into(),
+            PutOptions {
+                attributes: attrs.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let attr_get = store.inner.get(&attr_key).await.unwrap();
+    assert_eq!(attr_get.attributes, attrs);
+    assert_eq!(attr_get.bytes().await.unwrap().as_ref(), b"attr-body");
+    let attr_head = store
+        .inner
+        .get_opts(
+            &attr_key,
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(attr_head.attributes, attrs);
 
     store.put(&key, b"overwrite").await.unwrap();
     let full = store.read_one_all(&key).await.unwrap();
@@ -571,6 +640,40 @@ async fn curvine_object_store_semantics_live_cluster() {
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"hello multipart",
         "multipart complete must concatenate parts in order"
+    );
+    let multipart_attrs = Attributes::from_iter([
+        (Attribute::ContentType, "application/x-curvine-multipart"),
+        (
+            Attribute::Metadata("multipart-key".into()),
+            "multipart-value",
+        ),
+    ]);
+    let multipart_attr_key = Path::parse(format!("{pfx}/multipart/attrs.bin")).unwrap();
+    let mut attr_upload = store
+        .inner
+        .put_multipart_opts(
+            &multipart_attr_key,
+            PutMultipartOptions {
+                attributes: multipart_attrs.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    attr_upload
+        .put_part(Vec::from(&b"multipart "[..]).into())
+        .await
+        .unwrap();
+    attr_upload
+        .put_part(Vec::from(&b"attrs"[..]).into())
+        .await
+        .unwrap();
+    attr_upload.complete().await.unwrap();
+    let multipart_attr_get = store.inner.get(&multipart_attr_key).await.unwrap();
+    assert_eq!(multipart_attr_get.attributes, multipart_attrs);
+    assert_eq!(
+        multipart_attr_get.bytes().await.unwrap().as_ref(),
+        b"multipart attrs"
     );
     let mp_update = store
         .inner

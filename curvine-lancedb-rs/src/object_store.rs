@@ -26,7 +26,9 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::{FileLock, FileStatus, LockFlags, LockType};
+use curvine_common::state::{
+    FileLock, FileStatus, LockFlags, LockType, SetAttrOpts, SetAttrOptsBuilder,
+};
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -40,7 +42,7 @@ use lancedb_upstream::Session;
 use md5::{Digest, Md5};
 use object_store::path::Path;
 use object_store::{
-    Attributes, Error as OsError, GetOptions, GetResult, GetResultPayload, ListResult,
+    Attribute, Attributes, Error as OsError, GetOptions, GetResult, GetResultPayload, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore as ObjectStoreTrait, PutMode, PutMultipartOptions,
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
@@ -59,6 +61,8 @@ const CONDITIONAL_LOCK_ROOT: &str = "/.curvine/lancedb/locks";
 const INTERNAL_RESERVED_ROOT: &str = ".curvine";
 const CONDITIONAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const CONDITIONAL_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+const OBJECT_STORE_ATTR_PREFIX: &str = "lancedb.object_store.attr.";
+const OBJECT_STORE_METADATA_ATTR_PREFIX: &str = "lancedb.object_store.attr.metadata.";
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -86,6 +90,7 @@ struct CurvineMultipartUpload {
     dest: Path,
     next_part: usize,
     completed_parts: Arc<Mutex<Vec<CompletedPart>>>,
+    attributes: Attributes,
 }
 
 #[derive(Debug, Clone)]
@@ -258,15 +263,12 @@ impl ObjectStoreTrait for CurvineObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> OsResult<PutResult> {
-        if !opts.attributes.is_empty() {
-            return Err(OsError::NotImplemented);
-        }
-
+        let attributes = opts.attributes;
         match opts.mode {
-            PutMode::Overwrite => return self.put_overwrite(location, payload).await,
-            PutMode::Create => return self.put_create(location, payload).await,
+            PutMode::Overwrite => return self.put_overwrite(location, payload, attributes).await,
+            PutMode::Create => return self.put_create(location, payload, attributes).await,
             PutMode::Update(update) => {
-                return self.put_update(location, payload, update).await;
+                return self.put_update(location, payload, update, attributes).await;
             }
         }
     }
@@ -276,10 +278,6 @@ impl ObjectStoreTrait for CurvineObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OsResult<Box<dyn MultipartUpload>> {
-        if !opts.attributes.is_empty() {
-            return Err(OsError::NotImplemented);
-        }
-
         let upload_id = Uuid::new_v4().to_string();
         let upload_dir = self.multipart_dir(location, &upload_id)?;
         self.context
@@ -294,28 +292,29 @@ impl ObjectStoreTrait for CurvineObjectStore {
             dest: location.clone(),
             next_part: 0,
             completed_parts: Arc::new(Mutex::new(Vec::new())),
+            attributes: opts.attributes,
         }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OsResult<GetResult> {
-        if options.version.is_some() {
-            return Err(OsError::NotImplemented);
-        }
-
         if options.head {
             let meta = self.head(location).await?;
+            ensure_current_version(&meta, options.version.as_deref())?;
+            let attributes = self.get_attributes(location).await?;
             options.check_preconditions(&meta)?;
             let stream = stream::once(async move { Ok::<Bytes, OsError>(Bytes::new()) }).boxed();
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(stream),
                 meta,
                 range: 0..0,
-                attributes: Attributes::default(),
+                attributes,
             });
         }
 
         let cv_path = self.object_path(location)?;
         let meta = self.head(location).await?;
+        ensure_current_version(&meta, options.version.as_deref())?;
+        let attributes = self.get_attributes(location).await?;
         options.check_preconditions(&meta)?;
 
         let mut reader = self
@@ -360,7 +359,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
             payload: GetResultPayload::Stream(stream),
             meta,
             range,
-            attributes: Attributes::default(),
+            attributes,
         })
     }
 
@@ -497,6 +496,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
         let from_cv = self.object_path(from)?;
         let meta = self.head(from).await?;
         let size = meta.size;
+        let attributes = self.get_attributes(from).await?;
         let upload_id = Uuid::new_v4().to_string();
         let staging = self.multipart_final_path(to, &upload_id)?;
         if let Some(parent) = staging.parent().map_err(|e| OsError::Generic {
@@ -536,7 +536,10 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
             let lock = self.acquire_object_write_lock(to).await?;
-            let replace = self.replace_from_staging(to, &staging).await.map(|_| ());
+            let replace = self
+                .replace_from_staging(to, &staging, attributes)
+                .await
+                .map(|_| ());
             let _ = self.release_object_write_lock(&lock).await;
             replace
         }
@@ -551,6 +554,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
         let from_cv = self.object_path(from)?;
         let meta = self.head(from).await?;
         let size = meta.size;
+        let attributes = self.get_attributes(from).await?;
         let upload_id = Uuid::new_v4().to_string();
         let staging = self.multipart_final_path(to, &upload_id)?;
         if let Some(parent) = staging.parent().map_err(|e| OsError::Generic {
@@ -598,9 +602,10 @@ impl ObjectStoreTrait for CurvineObjectStore {
                     path: to.to_string(),
                     source: "object already exists".into(),
                 }),
-                Err(OsError::NotFound { .. }) => {
-                    self.replace_from_staging(to, &staging).await.map(|_| ())
-                }
+                Err(OsError::NotFound { .. }) => self
+                    .replace_from_staging(to, &staging, attributes)
+                    .await
+                    .map(|_| ()),
                 Err(err) => Err(err),
             };
             let _ = self.release_object_write_lock(&lock).await;
@@ -617,10 +622,17 @@ impl ObjectStoreTrait for CurvineObjectStore {
 }
 
 impl CurvineObjectStore {
-    async fn put_overwrite(&self, location: &Path, payload: PutPayload) -> OsResult<PutResult> {
+    async fn put_overwrite(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        attributes: Attributes,
+    ) -> OsResult<PutResult> {
         let staging = self.write_payload_to_staging(location, payload).await?;
         let lock = self.acquire_object_write_lock(location).await?;
-        let result = self.replace_from_staging(location, &staging).await;
+        let result = self
+            .replace_from_staging(location, &staging, attributes)
+            .await;
         let _ = self.release_object_write_lock(&lock).await;
         if result.is_err() {
             let _ = self.context.fs.delete(&staging, false).await;
@@ -628,7 +640,12 @@ impl CurvineObjectStore {
         result
     }
 
-    async fn put_create(&self, location: &Path, payload: PutPayload) -> OsResult<PutResult> {
+    async fn put_create(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        attributes: Attributes,
+    ) -> OsResult<PutResult> {
         let staging = self.write_payload_to_staging(location, payload).await?;
         let lock = self.acquire_object_write_lock(location).await?;
         let result = match self.head(location).await {
@@ -636,7 +653,10 @@ impl CurvineObjectStore {
                 path: location.to_string(),
                 source: "object already exists".into(),
             }),
-            Err(OsError::NotFound { .. }) => self.replace_from_staging(location, &staging).await,
+            Err(OsError::NotFound { .. }) => {
+                self.replace_from_staging(location, &staging, attributes)
+                    .await
+            }
             Err(err) => Err(err),
         };
         let _ = self.release_object_write_lock(&lock).await;
@@ -651,6 +671,7 @@ impl CurvineObjectStore {
         location: &Path,
         payload: PutPayload,
         update: object_store::UpdateVersion,
+        attributes: Attributes,
     ) -> OsResult<PutResult> {
         let expected_etag = update.e_tag.ok_or_else(|| OsError::Generic {
             store: CURVINE_SCHEME,
@@ -662,7 +683,8 @@ impl CurvineObjectStore {
         let result = async {
             let current = self.head_for_update(location).await?;
             ensure_matching_etag(location, current.e_tag.as_deref(), &expected_etag)?;
-            self.replace_from_staging(location, &staging).await
+            self.replace_from_staging(location, &staging, attributes)
+                .await
         }
         .await;
         let _ = self.release_object_write_lock(&lock).await;
@@ -722,9 +744,11 @@ impl CurvineObjectStore {
         &self,
         location: &Path,
         staging: &CurvinePath,
+        attributes: Attributes,
     ) -> OsResult<PutResult> {
         let dest = self.object_path(location)?;
         self.prepare_multipart_destination(&dest, location).await?;
+        self.set_attributes(location, staging, &attributes).await?;
         self.context
             .fs
             .rename(staging, &dest)
@@ -740,12 +764,40 @@ impl CurvineObjectStore {
                     })
                 }
             })?;
-
         let meta = self.head(location).await?;
         Ok(PutResult {
             e_tag: meta.e_tag,
             version: meta.version,
         })
+    }
+
+    async fn get_attributes(&self, location: &Path) -> OsResult<Attributes> {
+        let cv_path = self.object_path(location)?;
+        let status = self
+            .context
+            .fs
+            .get_status(&cv_path)
+            .await
+            .map_err(|e| fs_error_to_object_store(location, e))?;
+        Ok(curvine_x_attrs_to_object_attributes(&status.x_attr))
+    }
+
+    async fn set_attributes(
+        &self,
+        location: &Path,
+        staging: &CurvinePath,
+        attributes: &Attributes,
+    ) -> OsResult<()> {
+        let Some(opts) = object_attributes_to_set_attr_opts(attributes)? else {
+            return Ok(());
+        };
+
+        self.context
+            .fs
+            .set_attr(staging, opts)
+            .await
+            .map(|_| ())
+            .map_err(|e| fs_error_to_object_store(location, e))
     }
 
     async fn head_for_update(&self, location: &Path) -> OsResult<ObjectMeta> {
@@ -1228,7 +1280,7 @@ impl MultipartUpload for CurvineMultipartUpload {
             let lock = self.store.acquire_object_write_lock(&self.dest).await?;
             let replace = self
                 .store
-                .replace_from_staging(&self.dest, &staging_final)
+                .replace_from_staging(&self.dest, &staging_final, self.attributes.clone())
                 .await;
             let _ = self.store.release_object_write_lock(&lock).await;
             replace
@@ -1308,6 +1360,75 @@ fn curvine_object_version_token(status: &FileStatus) -> String {
         "W/\"cv:{}:{}:{}:{}:{}\"",
         status.id, status.mtime, status.len, status.is_complete, status.nlink
     )
+}
+
+fn ensure_current_version(meta: &ObjectMeta, requested: Option<&str>) -> OsResult<()> {
+    match (requested, meta.version.as_deref()) {
+        (Some(requested), Some(current)) if requested == current => Ok(()),
+        (Some(_), _) => Err(OsError::NotImplemented),
+        (None, _) => Ok(()),
+    }
+}
+
+fn object_attributes_to_set_attr_opts(attributes: &Attributes) -> OsResult<Option<SetAttrOpts>> {
+    let mut builder = SetAttrOptsBuilder::new();
+    let mut has_attrs = false;
+
+    for (key, value) in attributes {
+        builder = builder.add_x_attr(
+            object_attribute_x_attr_key(key)?,
+            value.as_ref().as_bytes().to_vec(),
+        );
+        has_attrs = true;
+    }
+
+    Ok(has_attrs.then(|| builder.build()))
+}
+
+fn curvine_x_attrs_to_object_attributes(x_attrs: &HashMap<String, Vec<u8>>) -> Attributes {
+    let mut attributes = Attributes::new();
+
+    for (key, value) in x_attrs {
+        let Some(attribute) = x_attr_key_to_object_attribute(key) else {
+            continue;
+        };
+        let Ok(value) = String::from_utf8(value.clone()) else {
+            continue;
+        };
+        attributes.insert(attribute, value.into());
+    }
+
+    attributes
+}
+
+fn object_attribute_x_attr_key(attribute: &Attribute) -> OsResult<String> {
+    let key = match attribute {
+        Attribute::ContentDisposition => format!("{OBJECT_STORE_ATTR_PREFIX}content_disposition"),
+        Attribute::ContentEncoding => format!("{OBJECT_STORE_ATTR_PREFIX}content_encoding"),
+        Attribute::ContentLanguage => format!("{OBJECT_STORE_ATTR_PREFIX}content_language"),
+        Attribute::ContentType => format!("{OBJECT_STORE_ATTR_PREFIX}content_type"),
+        Attribute::CacheControl => format!("{OBJECT_STORE_ATTR_PREFIX}cache_control"),
+        Attribute::StorageClass => format!("{OBJECT_STORE_ATTR_PREFIX}storage_class"),
+        Attribute::Metadata(key) => format!("{OBJECT_STORE_METADATA_ATTR_PREFIX}{key}"),
+        _ => return Err(OsError::NotImplemented),
+    };
+    Ok(key)
+}
+
+fn x_attr_key_to_object_attribute(key: &str) -> Option<Attribute> {
+    if let Some(metadata_key) = key.strip_prefix(OBJECT_STORE_METADATA_ATTR_PREFIX) {
+        return Some(Attribute::Metadata(metadata_key.to_string().into()));
+    }
+
+    match key.strip_prefix(OBJECT_STORE_ATTR_PREFIX)? {
+        "content_disposition" => Some(Attribute::ContentDisposition),
+        "content_encoding" => Some(Attribute::ContentEncoding),
+        "content_language" => Some(Attribute::ContentLanguage),
+        "content_type" => Some(Attribute::ContentType),
+        "cache_control" => Some(Attribute::CacheControl),
+        "storage_class" => Some(Attribute::StorageClass),
+        _ => None,
+    }
 }
 
 fn relative_object_path(root: &CurvinePath, full_path: &str) -> StdResult<Path, String> {

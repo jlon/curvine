@@ -78,6 +78,13 @@ async fn curvine_object_store_semantics_live_cluster() {
     let payload: &[u8] = b"hello-range-copy";
     store.put(&key, payload).await.unwrap();
 
+    let missing = Path::parse(format!("{pfx}/missing.bin")).unwrap();
+    let missing_head = store.inner.head(&missing).await;
+    assert!(
+        matches!(missing_head, Err(OsError::NotFound { .. })),
+        "missing object head must map to object_store::Error::NotFound, got {missing_head:?}"
+    );
+
     let workspace_curvine_key = Path::parse(&rel_workspace_curvine).unwrap();
     store
         .put(&workspace_curvine_key, b"workspace-local-curvine")

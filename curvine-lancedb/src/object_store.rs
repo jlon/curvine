@@ -417,9 +417,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .delete(&cv_path, false)
                 .await
                 .map_err(|e| fs_error_to_object_store(location, e)),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_not_found_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(location, e)),
         };
         let _ = self.release_object_write_lock(&lock).await;
@@ -1007,14 +1005,7 @@ impl CurvineObjectStore {
     ) -> OsResult<Vec<FileStatus>> {
         match self.context.fs.list_status(dir).await {
             Ok(entries) => Ok(entries),
-            Err(e)
-                if matches!(
-                    &e,
-                    FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
-                ) =>
-            {
-                Ok(Vec::new())
-            }
+            Err(e) if is_not_found_error(&e) => Ok(Vec::new()),
             Err(e) => Err(fs_error_to_object_store(err_location, e)),
         }
     }
@@ -1142,9 +1133,7 @@ impl CurvineObjectStore {
         let dir = self.multipart_dir(location, upload_id)?;
         match self.context.fs.delete(&dir, true).await {
             Ok(_) => Ok(()),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_not_found_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(&Path::default(), e)),
         }
     }
@@ -1162,9 +1151,7 @@ impl CurvineObjectStore {
                 });
             }
             Ok(_) => {}
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => {}
+            Err(e) if is_not_found_error(&e) => {}
             Err(e) => return Err(fs_error_to_object_store(location, e)),
         }
 
@@ -1211,10 +1198,8 @@ impl CurvineObjectStore {
                         source: e.to_string().into(),
                     })?;
                 }
-                Err(FsError::DirNotEmpty(_))
-                | Err(FsError::FileNotFound(_))
-                | Err(FsError::Expired(_))
-                | Err(FsError::JobNotFound(_)) => break,
+                Err(FsError::DirNotEmpty(_)) => break,
+                Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
             }
         }
@@ -1624,6 +1609,13 @@ fn multipart_staging_id(workspace_root: &CurvinePath, location: Option<&Path>) -
 }
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
+    if is_not_found_error(&error) {
+        return OsError::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        };
+    }
+
     match error {
         e @ FsError::FileNotFound(_) | e @ FsError::Expired(_) | e @ FsError::JobNotFound(_) => {
             OsError::NotFound {
@@ -1643,4 +1635,23 @@ fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
             source: Box::new(e),
         },
     }
+}
+
+fn is_not_found_error(error: &FsError) -> bool {
+    if matches!(
+        error,
+        FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
+    ) {
+        return true;
+    }
+
+    if !matches!(error, FsError::Common(_)) {
+        return false;
+    }
+
+    // Older Curvine clusters can return filesystem misses as Common errors
+    // with server-side "not exists" / "not found" messages. Object-store list
+    // and head semantics still require these to behave as missing objects.
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("not exists") || message.contains("not found")
 }

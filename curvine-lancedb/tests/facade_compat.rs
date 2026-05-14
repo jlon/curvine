@@ -20,7 +20,9 @@ use curvine_common::conf::ClusterConf;
 use lancedb::connect;
 use lancedb::connect_namespace;
 use lancedb::error::Error as LanceDbError;
-use lancedb::object_store::{curvine_registry, curvine_session, CurvineObjectStoreProvider};
+use lancedb::object_store::{
+    curvine_registry, curvine_session, CurvineObjectStoreProvider, CURVINE_MASTER_ADDRS_KEY,
+};
 use lancedb::{ObjectStoreProvider, ObjectStoreRegistry, Session};
 use tokio::sync::Mutex;
 use url::Url;
@@ -140,6 +142,7 @@ async fn facade_boundary_curvine_connect_fails_without_config() {
         "unexpected error message: {rendered}"
     );
     assert!(rendered.contains("CURVINE_CONF_FILE"));
+    assert!(rendered.contains("curvine.master_addrs"));
 }
 
 #[tokio::test]
@@ -171,6 +174,70 @@ async fn facade_boundary_curvine_namespace_connect_fails_without_config() {
         "unexpected error message: {rendered}"
     );
     assert!(rendered.contains("CURVINE_CONF_FILE"));
+    assert!(rendered.contains("curvine.master_addrs"));
+}
+
+#[tokio::test]
+async fn facade_boundary_curvine_connect_rejects_invalid_master_addrs() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
+
+    let result = connect("curvine:///data/lancedb/demo")
+        .storage_option(CURVINE_MASTER_ADDRS_KEY, "missing-port")
+        .execute()
+        .await;
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected connect to fail with invalid Curvine master_addrs"),
+        Err(err) => err,
+    };
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("Invalid `curvine.master_addrs` entry `missing-port`"),
+        "unexpected error message: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn facade_boundary_curvine_master_addrs_storage_option_precedes_env_conf() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::set_var(
+        ClusterConf::ENV_CONF_FILE,
+        "/definitely/missing/curvine-cluster.toml",
+    );
+
+    let result = connect("curvine:///data/lancedb/demo")
+        .storage_option(CURVINE_MASTER_ADDRS_KEY, "missing-port")
+        .execute()
+        .await;
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    } else {
+        env::remove_var(ClusterConf::ENV_CONF_FILE);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected connect to fail with invalid Curvine master_addrs"),
+        Err(err) => err,
+    };
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("Invalid `curvine.master_addrs` entry `missing-port`"),
+        "storage option master_addrs must take precedence over CURVINE_CONF_FILE; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("/definitely/missing/curvine-cluster.toml"),
+        "CURVINE_CONF_FILE unexpectedly took precedence over storage option: {rendered}"
+    );
 }
 
 #[tokio::test]

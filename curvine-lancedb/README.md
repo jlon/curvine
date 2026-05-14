@@ -53,6 +53,28 @@ let db = connect("curvine:///data/lancedb/demo")
 也可以设置环境变量 `CURVINE_CONF_FILE=/path/to/curvine-cluster.toml`。如果两者同时存在，
 `storage_option(CURVINE_CONF_FILE_KEY, ...)` 优先级更高。
 
+如果业务只需要指定 master 地址，也可以不提供配置文件，直接传
+`curvine.master_addrs`：
+
+```rust,no_run
+use lancedb::connect;
+use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
+
+# async fn example() -> lancedb::Result<()> {
+let db = connect("curvine:///data/lancedb/demo")
+    .storage_option(
+        CURVINE_MASTER_ADDRS_KEY,
+        "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995",
+    )
+    .execute()
+    .await?;
+# Ok(())
+# }
+```
+
+配置优先级是：`curvine.conf.path` > `curvine.master_addrs` / `master_addrs` >
+`CURVINE_CONF_FILE`。
+
 ### 最小示例
 
 ```rust,no_run
@@ -62,13 +84,13 @@ use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connect;
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
 use lancedb::query::ExecutableQuery;
 
 # async fn example() -> lancedb::Result<()> {
-let conf = "/path/to/curvine-cluster.toml";
+let master_addrs = "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995";
 let db = connect("curvine:///data/lancedb/demo")
-    .storage_option(CURVINE_CONF_FILE_KEY, conf)
+    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
     .execute()
     .await?;
 
@@ -80,7 +102,7 @@ let batch = RecordBatch::try_new(
 
 let table = db
     .create_table("items", batch)
-    .storage_option(CURVINE_CONF_FILE_KEY, conf)
+    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
     .execute()
     .await?;
 
@@ -154,6 +176,28 @@ let db = connect("curvine:///data/lancedb/demo")
 It can also set `CURVINE_CONF_FILE=/path/to/curvine-cluster.toml`. The explicit
 storage option has higher priority.
 
+If the application only needs to specify master addresses, it can pass
+`curvine.master_addrs` directly:
+
+```rust,no_run
+use lancedb::connect;
+use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
+
+# async fn example() -> lancedb::Result<()> {
+let db = connect("curvine:///data/lancedb/demo")
+    .storage_option(
+        CURVINE_MASTER_ADDRS_KEY,
+        "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995",
+    )
+    .execute()
+    .await?;
+# Ok(())
+# }
+```
+
+The priority order is `curvine.conf.path`, then `curvine.master_addrs` /
+`master_addrs`, then `CURVINE_CONF_FILE`.
+
 ## Minimal Usage
 
 ```rust,no_run
@@ -163,13 +207,13 @@ use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connect;
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
 use lancedb::query::ExecutableQuery;
 
 # async fn example() -> lancedb::Result<()> {
-let conf = "/path/to/curvine-cluster.toml";
+let master_addrs = "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995";
 let db = connect("curvine:///data/lancedb/demo")
-    .storage_option(CURVINE_CONF_FILE_KEY, conf)
+    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
     .execute()
     .await?;
 
@@ -181,7 +225,7 @@ let batch = RecordBatch::try_new(
 
 let table = db
     .create_table("items", batch)
-    .storage_option(CURVINE_CONF_FILE_KEY, conf)
+    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
     .execute()
     .await?;
 

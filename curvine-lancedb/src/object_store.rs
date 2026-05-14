@@ -48,6 +48,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
+use orpc::io::net::InetAddr;
 use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
@@ -57,6 +58,9 @@ use uuid::Uuid;
 pub const CURVINE_SCHEME: &str = "curvine";
 
 pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
+pub const CURVINE_MASTER_ADDRS_KEY: &str = "curvine.master_addrs";
+
+const MASTER_ADDRS_KEY_ALIAS: &str = "master_addrs";
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
@@ -149,22 +153,11 @@ impl CurvineObjectStoreProvider {
         base_path: &Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<CurvineContext>> {
-        let conf_path =
-            resolve_curvine_conf_path(params).ok_or_else(missing_curvine_config_error)?;
-
-        let conf = ClusterConf::from(&conf_path).map_err(|e| {
-            LanceError::invalid_input(format!(
-                "Failed to load Curvine configuration from '{}': {e}",
-                conf_path
-            ))
-        })?;
+        let conf = resolve_curvine_conf(params)?;
 
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
         let fs = CurvineFileSystem::with_rt(conf, rt).map_err(|e| {
-            LanceError::invalid_input(format!(
-                "Failed to initialize Curvine filesystem (config '{}'): {e}",
-                conf_path
-            ))
+            LanceError::invalid_input(format!("Failed to initialize Curvine filesystem: {e}"))
         })?;
 
         curvine_workspace_root_from_uri(base_path).map_err(|e| {
@@ -181,18 +174,101 @@ impl CurvineObjectStoreProvider {
     }
 }
 
-fn resolve_curvine_conf_path(params: &ObjectStoreParams) -> Option<String> {
-    params
-        .storage_options()
+fn resolve_curvine_conf(params: &ObjectStoreParams) -> Result<ClusterConf> {
+    if let Some(conf_path) = resolve_curvine_conf_path(params.storage_options()) {
+        return ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        });
+    }
+
+    if let Some(master_addrs) = resolve_curvine_master_addrs(params) {
+        return cluster_conf_from_master_addrs(&master_addrs);
+    }
+
+    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
+        return ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        });
+    }
+
+    Err(missing_curvine_config_error())
+}
+
+fn resolve_curvine_conf_path(storage_options: Option<&HashMap<String, String>>) -> Option<String> {
+    storage_options
         .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
         .cloned()
-        .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+}
+
+fn resolve_curvine_master_addrs(params: &ObjectStoreParams) -> Option<String> {
+    params.storage_options().and_then(|opts| {
+        opts.get(CURVINE_MASTER_ADDRS_KEY)
+            .or_else(|| opts.get(MASTER_ADDRS_KEY_ALIAS))
+            .cloned()
+    })
+}
+
+fn cluster_conf_from_master_addrs(master_addrs: &str) -> Result<ClusterConf> {
+    let addrs = parse_master_addrs(master_addrs)?;
+    let mut conf = ClusterConf::default();
+    conf.client.master_addrs = addrs;
+    conf.master.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine master configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.client.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine client configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.fuse.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine fuse configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.job.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine job configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    Ok(conf)
+}
+
+fn parse_master_addrs(master_addrs: &str) -> Result<Vec<InetAddr>> {
+    let addrs = master_addrs
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .map(|addr| {
+            InetAddr::from_str(addr).map_err(|e| {
+                LanceError::invalid_input(format!(
+                    "Invalid `{CURVINE_MASTER_ADDRS_KEY}` entry `{addr}`: expected `host:port`: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if addrs.is_empty() {
+        return Err(LanceError::invalid_input(format!(
+            "`{CURVINE_MASTER_ADDRS_KEY}` must contain at least one `host:port` address"
+        )));
+    }
+
+    Ok(addrs)
 }
 
 fn missing_curvine_config_error() -> LanceError {
     LanceError::invalid_input(format!(
         "Missing Curvine cluster configuration: set storage option `{CURVINE_CONF_FILE_KEY}` \
-         (highest priority) or environment variable `{}` to the Curvine client configuration file path.",
+         (highest priority), `{CURVINE_MASTER_ADDRS_KEY}`, `{MASTER_ADDRS_KEY_ALIAS}`, \
+         or environment variable `{}` to the Curvine client configuration file path.",
         ClusterConf::ENV_CONF_FILE
     ))
 }
@@ -282,12 +358,23 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         curvine_workspace_root_from_uri(url).map_err(|e| {
             LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
         })?;
-        let conf_path = storage_options
-            .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
-            .cloned()
-            .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
-            .ok_or_else(missing_curvine_config_error)?;
-        Ok(format!("{CURVINE_SCHEME}${conf_path}"))
+        if let Some(conf_path) = resolve_curvine_conf_path(storage_options) {
+            return Ok(format!("{CURVINE_SCHEME}$conf${conf_path}"));
+        }
+
+        if let Some(master_addrs) = storage_options.and_then(|opts| {
+            opts.get(CURVINE_MASTER_ADDRS_KEY)
+                .or_else(|| opts.get(MASTER_ADDRS_KEY_ALIAS))
+                .cloned()
+        }) {
+            return Ok(format!("{CURVINE_SCHEME}$masters${master_addrs}"));
+        }
+
+        if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
+            return Ok(format!("{CURVINE_SCHEME}$conf${conf_path}"));
+        }
+
+        Err(missing_curvine_config_error())
     }
 }
 

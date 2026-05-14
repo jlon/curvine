@@ -1,60 +1,65 @@
-# LanceDB on Curvine
+# curvine-lancedb
 
-## 中文说明
+`curvine-lancedb` lets Rust applications use LanceDB with Curvine storage. It is
+a small facade over upstream `lancedb`: the Cargo package is
+`curvine-lancedb`, but the Rust library name is still `lancedb`.
 
-`curvine-lancedb` 是 LanceDB on Curvine 的 Rust facade crate。Cargo 包名是
-`curvine-lancedb`，但 Rust crate 名仍然是 `lancedb`，所以业务代码可以继续使用
-`use lancedb::connect` 这类上游 LanceDB 风格的导入。
+The crate adds the Curvine `ObjectStoreProvider`, `ObjectStoreRegistry`,
+`Session`, and commit wiring needed by LanceDB. Normal LanceDB APIs remain
+upstream-compatible.
 
-### 依赖引入
+## 当前状态
 
-当前不发布 crates.io，业务侧使用 Git 方式引入：
+当前不发布到 crates.io。业务项目使用 Git 或 path 方式引入。
 
-```toml
-[dependencies]
-lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", branch = "feat/lancedb-on-curvine" }
-```
-
-生产业务建议固定 commit，避免分支继续变化影响构建：
+推荐生产业务固定 commit：
 
 ```toml
 [dependencies]
 lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", rev = "<commit-sha>" }
 ```
 
-### Curvine 配置
-
-业务需要提供 Curvine client 配置文件。三 master 示例：
+开发阶段也可以跟随分支：
 
 ```toml
-[client]
-master_addrs = [
-    { hostname = "10.209.148.124", port = 8995 },
-    { hostname = "10.209.148.125", port = 8995 },
-    { hostname = "10.209.148.127", port = 8995 },
-]
+[dependencies]
+lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", branch = "feat/lancedb-on-curvine" }
 ```
 
-推荐在连接时显式传入配置路径：
+本地联调可以使用 path：
 
-```rust,no_run
-use lancedb::connect;
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
-
-# async fn example() -> lancedb::Result<()> {
-let db = connect("curvine:///data/lancedb/demo")
-    .storage_option(CURVINE_CONF_FILE_KEY, "/path/to/curvine-cluster.toml")
-    .execute()
-    .await?;
-# Ok(())
-# }
+```toml
+[dependencies]
+lancedb = { package = "curvine-lancedb", path = "/path/to/curvine/curvine-lancedb" }
 ```
 
-也可以设置环境变量 `CURVINE_CONF_FILE=/path/to/curvine-cluster.toml`。如果两者同时存在，
-`storage_option(CURVINE_CONF_FILE_KEY, ...)` 优先级更高。
+## URI 与 workspace
 
-如果业务只需要指定 master 地址，也可以不提供配置文件，直接传
-`curvine.master_addrs`：
+使用 `curvine://` URI，不需要 FUSE。
+
+```text
+curvine:///data/lancedb/demo
+```
+
+这个 URI 表示 Curvine 文件系统里的 workspace root。LanceDB 表、索引和提交文件都写在这个目录下面。
+
+也支持带 authority 的 URI：
+
+```text
+curvine://tenant/data/lancedb/demo
+```
+
+它会映射到 Curvine 绝对路径：
+
+```text
+/tenant/data/lancedb/demo
+```
+
+`.curvine` 是内部保留命名空间，不要作为业务 workspace 使用。
+
+## Curvine 连接配置
+
+推荐业务直接传 master 地址，不需要生成临时配置文件。
 
 ```rust,no_run
 use lancedb::connect;
@@ -72,10 +77,63 @@ let db = connect("curvine:///data/lancedb/demo")
 # }
 ```
 
-配置优先级是：`curvine.conf.path` > `curvine.master_addrs` / `master_addrs` >
-`CURVINE_CONF_FILE`。
+`CURVINE_MASTER_ADDRS_KEY` 的值是：
 
-### 最小示例
+```text
+curvine.master_addrs
+```
+
+也兼容短 key：
+
+```text
+master_addrs
+```
+
+如果业务已有 Curvine client 配置文件，也可以传配置文件路径：
+
+```rust,no_run
+use lancedb::connect;
+use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+
+# async fn example() -> lancedb::Result<()> {
+let db = connect("curvine:///data/lancedb/demo")
+    .storage_option(CURVINE_CONF_FILE_KEY, "/path/to/curvine-cluster.toml")
+    .execute()
+    .await?;
+# Ok(())
+# }
+```
+
+`CURVINE_CONF_FILE_KEY` 的值是：
+
+```text
+curvine.conf.path
+```
+
+还可以使用环境变量：
+
+```bash
+export CURVINE_CONF_FILE=/path/to/curvine-cluster.toml
+```
+
+配置优先级固定为：
+
+```text
+curvine.conf.path > curvine.master_addrs/master_addrs > CURVINE_CONF_FILE
+```
+
+三 master 配置文件示例：
+
+```toml
+[client]
+master_addrs = [
+    { hostname = "10.209.148.124", port = 8995 },
+    { hostname = "10.209.148.125", port = 8995 },
+    { hostname = "10.209.148.127", port = 8995 },
+]
+```
+
+## 最小示例
 
 ```rust,no_run
 use std::sync::Arc;
@@ -89,6 +147,7 @@ use lancedb::query::ExecutableQuery;
 
 # async fn example() -> lancedb::Result<()> {
 let master_addrs = "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995";
+
 let db = connect("curvine:///data/lancedb/demo")
     .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
     .execute()
@@ -106,78 +165,115 @@ let table = db
     .execute()
     .await?;
 
-let rows = table.query().execute().await?.try_collect::<Vec<_>>().await?;
-assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+let batches = table.query().execute().await?.try_collect::<Vec<_>>().await?;
+let row_count = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
+assert_eq!(row_count, 3);
 # Ok(())
 # }
 ```
 
-### 使用约束
+## Session 用法
 
-- 使用 `curvine://` URI，不需要 FUSE。
-- workspace root 是 Curvine 上的目录，例如 `curvine:///data/lancedb/demo`。
-- 非 Curvine 的 LanceDB API 继续委托给上游 LanceDB。
-- 当前已使用 `10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995`
-  跑通 `curvine-tests` LanceDB object-store e2e。
-
-## English
-
-`curvine-lancedb` is a facade crate that lets Rust applications use LanceDB on
-Curvine through Lance's object store interface. The Cargo package is
-`curvine-lancedb`, but the Rust library name is still `lancedb`, so application
-code can keep upstream-style imports.
-
-## Add The Dependency
-
-Use Git while this crate is not published to crates.io:
-
-```toml
-[dependencies]
-lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", branch = "feat/lancedb-on-curvine" }
-```
-
-If the business project needs a fixed revision, pin the commit instead of the
-branch:
-
-```toml
-[dependencies]
-lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", rev = "<commit-sha>" }
-```
-
-## Provide Curvine Configuration
-
-Create a Curvine client config file and point LanceDB at it. For a three-master
-cluster:
-
-```toml
-[client]
-master_addrs = [
-    { hostname = "10.209.148.124", port = 8995 },
-    { hostname = "10.209.148.125", port = 8995 },
-    { hostname = "10.209.148.127", port = 8995 },
-]
-```
-
-The application can pass the config path per connection:
+默认 `connect("curvine://...")` 会注入支持 Curvine 的 `Session`。如果业务需要显式构造 session，可以使用：
 
 ```rust,no_run
 use lancedb::connect;
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+use lancedb::object_store::curvine_session;
 
 # async fn example() -> lancedb::Result<()> {
 let db = connect("curvine:///data/lancedb/demo")
-    .storage_option(CURVINE_CONF_FILE_KEY, "/path/to/curvine-cluster.toml")
+    .session(curvine_session())
+    .storage_option(
+        lancedb::object_store::CURVINE_MASTER_ADDRS_KEY,
+        "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995",
+    )
     .execute()
     .await?;
 # Ok(())
 # }
 ```
 
-It can also set `CURVINE_CONF_FILE=/path/to/curvine-cluster.toml`. The explicit
-storage option has higher priority.
+如果业务传入自定义 `Session`，facade 不会覆盖它。自定义 session 必须注册 `curvine` scheme，否则 LanceDB 会按上游语义报找不到 object store provider。
 
-If the application only needs to specify master addresses, it can pass
-`curvine.master_addrs` directly:
+## 支持范围
+
+已覆盖主线能力：
+
+- `connect("curvine://...")`
+- `connect_namespace(...).storage_option(...)`
+- create/open/drop/list table
+- add/query/count rows
+- scalar filter、projection、limit
+- vector search 和 index smoke
+- conditional commit 所需的 `PutMode::Update`
+- multipart upload complete
+- shallow clone 所需的 object store path 语义
+
+对象存储语义通过 Curvine 文件系统实现，包括 `put`、`head`、`get`、range read、delete、copy、list、list_with_delimiter、conditional put、multipart upload。
+
+## 已知边界
+
+- `curvine.master_addrs` 只包含 master 地址。其它 Curvine client 参数使用默认值；需要完整调参时请传 `curvine.conf.path`。
+- eTag 是基于 Curvine 文件状态生成的 weak eTag，不是内容哈希。
+- 当前 crate 面向 Rust 业务使用。Python SDK 仍应通过 Rust 核心复用存储逻辑，不应另写一套 Curvine 存储实现。
+- 该 crate 目前随 Curvine 仓库开发，不保证分支 head 对业务构建稳定。生产使用请固定 `rev`。
+
+## 本地验证
+
+默认测试不需要真实 Curvine 集群：
+
+```bash
+cargo test -p curvine-lancedb
+```
+
+运行 live smoke 时传 master 地址：
+
+```bash
+CURVINE_MASTER_ADDRS=10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995 \
+  cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored --nocapture
+```
+
+运行 Curvine minicluster e2e：
+
+```bash
+cargo test -p curvine-tests --test lancedb_object_store_e2e -- --nocapture
+```
+
+使用外部集群跑 e2e：
+
+```bash
+cat >/tmp/curvine-lancedb-e2e.toml <<'EOF'
+[client]
+master_addrs = [
+    { hostname = "10.209.148.124", port = 8995 },
+    { hostname = "10.209.148.125", port = 8995 },
+    { hostname = "10.209.148.127", port = 8995 },
+]
+EOF
+
+CURVINE_E2E_CONF_FILE=/tmp/curvine-lancedb-e2e.toml \
+  cargo test -p curvine-tests --test lancedb_object_store_e2e -- --nocapture
+```
+
+提交前至少运行：
+
+```bash
+cargo fmt --all
+cargo clippy -p curvine-lancedb --all-targets --all-features -- -D warnings
+cargo test -p curvine-lancedb
+```
+
+## English Quick Start
+
+Use this crate through Git or path dependencies. The package name is
+`curvine-lancedb`; the library name is `lancedb`.
+
+```toml
+[dependencies]
+lancedb = { package = "curvine-lancedb", git = "https://github.com/CurvineIO/curvine", rev = "<commit-sha>" }
+```
+
+Pass Curvine master addresses directly:
 
 ```rust,no_run
 use lancedb::connect;
@@ -195,52 +291,9 @@ let db = connect("curvine:///data/lancedb/demo")
 # }
 ```
 
-The priority order is `curvine.conf.path`, then `curvine.master_addrs` /
-`master_addrs`, then `CURVINE_CONF_FILE`.
+Use `curvine.conf.path` when the application needs a full Curvine client
+configuration file. The priority order is:
 
-## Minimal Usage
-
-```rust,no_run
-use std::sync::Arc;
-
-use arrow_array::{Int32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use futures::TryStreamExt;
-use lancedb::connect;
-use lancedb::object_store::CURVINE_MASTER_ADDRS_KEY;
-use lancedb::query::ExecutableQuery;
-
-# async fn example() -> lancedb::Result<()> {
-let master_addrs = "10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995";
-let db = connect("curvine:///data/lancedb/demo")
-    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
-    .execute()
-    .await?;
-
-let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-let batch = RecordBatch::try_new(
-    schema,
-    vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-)?;
-
-let table = db
-    .create_table("items", batch)
-    .storage_option(CURVINE_MASTER_ADDRS_KEY, master_addrs)
-    .execute()
-    .await?;
-
-let rows = table.query().execute().await?.try_collect::<Vec<_>>().await?;
-assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
-# Ok(())
-# }
+```text
+curvine.conf.path > curvine.master_addrs/master_addrs > CURVINE_CONF_FILE
 ```
-
-## Notes
-
-- Use `curvine://` URIs. FUSE is not required.
-- The workspace root is a Curvine directory, for example
-  `curvine:///data/lancedb/demo`.
-- This crate delegates non-Curvine LanceDB APIs to upstream LanceDB and adds the
-  Curvine object store, session, and safe commit wiring needed for Curvine.
-- Current validation includes the `curvine-tests` LanceDB object-store e2e suite
-  against `10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995`.

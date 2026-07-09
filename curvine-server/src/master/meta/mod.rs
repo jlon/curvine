@@ -24,6 +24,17 @@ pub use self::fs_stats::FileSystemStats;
 mod inode_id;
 pub use self::inode_id::InodeId;
 
+mod inode_lock_manager;
+pub use self::inode_lock_manager::*;
+
+mod block_location_lock_manager;
+pub use self::block_location_lock_manager::*;
+
+mod namespace_commit_gate;
+pub use self::namespace_commit_gate::*;
+
+mod object_lock_pool;
+
 pub mod store;
 
 mod block_meta;

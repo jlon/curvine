@@ -14,6 +14,7 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::master::journal::read_barrier::JournalReadBarrier;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::meta::FsDir;
@@ -22,29 +23,39 @@ use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
-use log::{debug, info};
+use log::{debug, error};
 use orpc::common::LocalTime;
-use orpc::err_box;
 use orpc::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use orpc::sync::AtomicCounter;
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+thread_local! {
+    static JOURNAL_PERMIT_SCOPES: RefCell<Vec<Vec<JournalPermit>>> = const { RefCell::new(Vec::new()) };
+}
 
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
     node_id: u64,
-    sender: BlockingSender<JournalEntry>,
+    sender: BlockingSender<QueuedJournalEntry>,
+    permit_pool: Arc<JournalPermitPool>,
+    read_barrier: Arc<JournalReadBarrier>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+    receiver: Option<Mutex<BlockingReceiver<QueuedJournalEntry>>>,
 
     snapshot_entries: u64,
     entries_since_snapshot: AtomicCounter,
+    snapshot_requested: AtomicBool,
+    snapshot_in_progress: AtomicBool,
 }
 
 impl JournalWriter {
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;
+        let permit_pool = Arc::new(JournalPermitPool::new(conf.writer_channel_size));
         let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
@@ -60,62 +71,157 @@ impl JournalWriter {
             enable: conf.enable,
             node_id,
             sender,
+            permit_pool,
+            read_barrier: Arc::new(JournalReadBarrier::new()),
             metrics,
             receiver,
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
+            snapshot_requested: AtomicBool::new(false),
+            snapshot_in_progress: AtomicBool::new(false),
         })
     }
 
     fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
+        let permit = match Self::take_scoped_permit() {
+            Some(permit) => permit,
+            None => self.reserve()?,
+        };
+        self.enqueue_with_permit(permit, entry)
+    }
+
+    fn enqueue_after_commit(&self, entry: JournalEntry) -> FsResult<()> {
+        if let Err(error) = self.send_inner(entry) {
+            error!(
+                "journal enqueue failed after metadata commit; aborting master: {}",
+                error
+            );
+            std::process::abort();
+        }
+        Ok(())
+    }
+
+    pub fn reserve(&self) -> FsResult<JournalPermit> {
+        Ok(JournalPermit {
+            _permit: self.permit_pool.try_acquire()?,
+        })
+    }
+
+    pub fn begin_metadata_catch_up(&self, applied_index: u64, required_index: u64) {
+        self.read_barrier
+            .begin_catch_up(applied_index, required_index);
+    }
+
+    pub fn require_metadata_catch_up(&self, required_index: u64) {
+        self.read_barrier.require_catch_up(required_index);
+    }
+
+    pub fn advance_metadata_applied(&self, applied_index: u64) {
+        self.read_barrier.advance_applied(applied_index);
+    }
+
+    pub fn advance_metadata_catch_up(&self, applied_index: u64) {
+        self.read_barrier.advance_catch_up(applied_index);
+    }
+
+    pub fn ensure_metadata_current(&self) -> FsResult<()> {
+        self.read_barrier.ensure_current()
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub fn reserve_scope(&self, count: usize) -> FsResult<JournalPermitScope> {
+        let mut permits = Vec::with_capacity(count);
+        if self.enable {
+            for _ in 0..count {
+                permits.push(self.reserve()?);
+            }
+        }
+
+        JOURNAL_PERMIT_SCOPES.with(|scopes| scopes.borrow_mut().push(permits));
+        Ok(JournalPermitScope {})
+    }
+
+    fn take_scoped_permit() -> Option<JournalPermit> {
+        JOURNAL_PERMIT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            scopes.last_mut().and_then(|permits| permits.pop())
+        })
+    }
+
+    pub fn enqueue_with_permit(&self, permit: JournalPermit, entry: JournalEntry) -> FsResult<()> {
         debug!("send_entry {:?}", entry);
-        self.sender.send(entry)?;
+        self.sender.send(QueuedJournalEntry {
+            entry,
+            _permit: permit,
+        })?;
         self.metrics.journal_queue_len.inc();
         Ok(())
     }
 
-    fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
+    fn send(&self, _fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
-            self.send_inner(entry)?;
-            self.maybe_emit_snapshot(fs_dir)?;
+            self.enqueue_after_commit(entry)?;
+            self.request_snapshot_if_needed();
         }
         Ok(())
     }
 
-    fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+    fn request_snapshot_if_needed(&self) {
         if self.snapshot_entries == 0 {
-            return Ok(());
+            return;
         }
 
         let entries = self.entries_since_snapshot.add_and_get(1);
         if entries < self.snapshot_entries {
-            return Ok(());
+            return;
         }
 
-        let now = LocalTime::mills();
         self.entries_since_snapshot.set(0);
-        let dir = match fs_dir.store.create_checkpoint(now) {
-            Ok(d) => d,
-            Err(e) => {
-                return err_box!("leaderSnapshot: create_checkpoint failed: {}", e);
-            }
-        };
+        self.snapshot_requested.store(true, Ordering::SeqCst);
+    }
 
-        info!(
-            "create leader snapshot, dir {}, entries {}, cost {} ms, inode_id {}",
-            dir,
-            entries,
-            LocalTime::mills() - now,
-            fs_dir.inode_id.current()
-        );
+    pub fn try_begin_snapshot(&self) -> bool {
+        if !self.snapshot_requested.swap(false, Ordering::SeqCst) {
+            return false;
+        }
 
-        self.send_inner(JournalEntry::Snapshot(SnapshotEntry {
-            op_id: fs_dir.next_op_id(),
-            rpc_id: 0,
-            node_id: self.node_id,
-            dir,
-        }))?;
-        Ok(())
+        if self
+            .snapshot_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            true
+        } else {
+            self.snapshot_requested.store(true, Ordering::SeqCst);
+            false
+        }
+    }
+
+    pub fn finish_snapshot(&self, success: bool) {
+        if !success {
+            self.snapshot_requested.store(true, Ordering::SeqCst);
+        }
+        self.snapshot_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub fn enqueue_snapshot_with_permit(
+        &self,
+        permit: JournalPermit,
+        op_id: u64,
+        dir: String,
+    ) -> FsResult<()> {
+        self.enqueue_with_permit(
+            permit,
+            JournalEntry::Snapshot(SnapshotEntry {
+                op_id,
+                rpc_id: 0,
+                node_id: self.node_id,
+                dir,
+            }),
+        )
     }
 
     pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -243,22 +349,30 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::Free(entry))
     }
 
-    pub fn log_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+    pub fn log_mount_by_id(&self, op_id: u64, info: MountInfo) -> FsResult<()> {
         let entry = MountEntry {
-            op_id: fs_dir.next_op_id(),
+            op_id,
             rpc_id: 0,
             info,
         };
-        self.send(fs_dir, JournalEntry::Mount(entry))
+        if self.enable {
+            self.enqueue_after_commit(JournalEntry::Mount(entry))?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
-    pub fn log_unmount(&self, fs_dir: &FsDir, id: u32) -> FsResult<()> {
+    pub fn log_unmount_by_id(&self, op_id: u64, id: u32) -> FsResult<()> {
         let entry = UnMountEntry {
-            op_id: fs_dir.next_op_id(),
+            op_id,
             rpc_id: 0,
             id,
         };
-        self.send(fs_dir, JournalEntry::UnMount(entry))
+        if self.enable {
+            self.enqueue_after_commit(JournalEntry::UnMount(entry))?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
     pub fn log_set_attr(&self, fs_dir: &FsDir, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
@@ -315,8 +429,7 @@ impl JournalWriter {
             term,
             index,
         };
-        self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsApplied(entry))?;
+        self.enqueue_after_commit(JournalEntry::UfsApplied(entry))?;
 
         Ok(())
     }
@@ -329,6 +442,20 @@ impl JournalWriter {
             locks,
         };
         self.send(fs_dir, JournalEntry::SetLocks(entry))
+    }
+
+    pub fn log_set_locks_by_id(&self, op_id: u64, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
+        let entry = SetLocksEntry {
+            op_id,
+            rpc_id: 0,
+            ino,
+            locks,
+        };
+        if self.enable {
+            self.enqueue_after_commit(JournalEntry::SetLocks(entry))?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
     // for testing
@@ -345,8 +472,85 @@ impl JournalWriter {
             }
         };
         while let Ok(v) = receiver.try_recv() {
-            entries.push(v);
+            self.metrics.journal_queue_len.dec();
+            entries.push(v.entry);
         }
         entries
+    }
+}
+
+pub struct QueuedJournalEntry {
+    pub(crate) entry: JournalEntry,
+    _permit: JournalPermit,
+}
+
+pub struct JournalPermit {
+    _permit: Option<JournalQueuePermit>,
+}
+
+pub struct JournalPermitScope {}
+
+impl Drop for JournalPermitScope {
+    fn drop(&mut self) {
+        JOURNAL_PERMIT_SCOPES.with(|scopes| {
+            let _ = scopes.borrow_mut().pop();
+        });
+    }
+}
+
+struct JournalQueuePermit {
+    pool: Arc<JournalPermitPool>,
+}
+
+impl Drop for JournalQueuePermit {
+    fn drop(&mut self) {
+        self.pool.release();
+    }
+}
+
+struct JournalPermitPool {
+    state: Mutex<JournalPermitState>,
+}
+
+struct JournalPermitState {
+    capacity: usize,
+    available: usize,
+}
+
+impl JournalPermitPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(JournalPermitState {
+                capacity,
+                available: capacity,
+            }),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> FsResult<Option<JournalQueuePermit>> {
+        let mut state = self.state.lock().expect("journal permit pool poisoned");
+        if state.capacity == 0 {
+            return Ok(None);
+        }
+
+        if state.available == 0 {
+            return Err(curvine_common::error::FsError::common(
+                "journal writer queue is full",
+            ));
+        }
+        state.available -= 1;
+        Ok(Some(JournalQueuePermit { pool: self.clone() }))
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("journal permit pool poisoned");
+        if state.capacity == 0 {
+            return;
+        }
+        assert!(
+            state.available < state.capacity,
+            "journal permit release without matching acquire"
+        );
+        state.available += 1;
     }
 }

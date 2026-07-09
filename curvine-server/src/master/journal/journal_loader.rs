@@ -18,23 +18,25 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
 use crate::master::meta::inode::{InodePath, InodeView};
-use crate::master::meta::InodeId;
+use crate::master::meta::store::{RocksStoreHandle, RocksStoreReadGuard};
+use crate::master::meta::{InodeId, NamespaceCommitGate};
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_common::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftResult, RaftUtils};
+use curvine_common::raft::{RaftClient, RaftError, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
 use orpc::common::{FileUtils, LocalTime, TimeSpent};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
-use orpc::{err_box, ternary, CommonResult};
-use raft::eraftpb::Entry;
+use orpc::{err_box, CommonResult};
+use raft::eraftpb::{Entry, EntryType};
 use raft::StateRole;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{fs, mem};
@@ -44,6 +46,7 @@ use std::{fs, mem};
 pub struct JournalLoader {
     node_id: u64,
     fs_dir: SyncFsDir,
+    store_handle: Arc<RocksStoreHandle>,
     mnt_mgr: Arc<MountManager>,
     journal_writer: Arc<JournalWriter>,
     ufs_loader: UfsLoader,
@@ -58,6 +61,9 @@ pub struct JournalLoader {
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
+    namespace_commit_gate: Arc<NamespaceCommitGate>,
+    leader_mode: Arc<AtomicBool>,
+    metadata_applied_index: Arc<AtomicU64>,
 }
 
 impl JournalLoader {
@@ -79,6 +85,7 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            Arc::new(NamespaceCommitGate::new()),
             true,
         )
     }
@@ -92,6 +99,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        namespace_commit_gate: Arc<NamespaceCommitGate>,
     ) -> CommonResult<Self> {
         Self::build(
             rt,
@@ -101,6 +109,7 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            namespace_commit_gate,
             false,
         )
     }
@@ -114,13 +123,16 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        namespace_commit_gate: Arc<NamespaceCommitGate>,
         testing: bool,
     ) -> CommonResult<Self> {
         let ufs_loader = UfsLoader::new(job_manager, conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
+        let store_handle = fs_dir.read().store_handle.clone();
         let loader = Self {
             node_id: conf.node_id()?,
             fs_dir,
+            store_handle,
             mnt_mgr,
             journal_writer,
             ufs_loader,
@@ -135,6 +147,9 @@ impl JournalLoader {
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics()?,
             has_apply_worker: !testing,
+            namespace_commit_gate,
+            leader_mode: Arc::new(AtomicBool::new(false)),
+            metadata_applied_index: Arc::new(AtomicU64::new(0)),
         };
 
         if !testing {
@@ -158,8 +173,53 @@ impl JournalLoader {
         Ok(self.fsm_state()?.clone())
     }
 
+    fn rocks_store(&self) -> CommonResult<RocksStoreReadGuard<'_>> {
+        self.store_handle.read()
+    }
+
     fn get_ufs_applied(&self) -> CommonResult<AppliedIndex> {
         Ok(self.fsm_state()?.ufs_applied.clone())
+    }
+
+    fn metadata_applied_index(&self) -> u64 {
+        self.metadata_applied_index.load(Ordering::Acquire)
+    }
+
+    fn advance_metadata_applied_index(&self, index: u64) {
+        let mut current = self.metadata_applied_index.load(Ordering::Acquire);
+        while index > current {
+            match self.metadata_applied_index.compare_exchange(
+                current,
+                index,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn entry_needs_leader_metadata_apply(&self, entry: &Entry) -> bool {
+        self.leader_mode.load(Ordering::Acquire)
+            && entry.term < self.log_store.hard_state().term
+            && entry.index > self.metadata_applied_index()
+    }
+
+    fn require_metadata_before_entry_apply(&self, entry: &Entry) {
+        if entry.data.is_empty() || entry.get_entry_type() != EntryType::EntryNormal {
+            return;
+        }
+        if self.entry_needs_leader_metadata_apply(entry) {
+            self.journal_writer.require_metadata_catch_up(entry.index);
+        }
+    }
+
+    fn require_metadata_before_apply(&self, msg: &ApplyMsg) {
+        let ApplyMsg::Entry(entry) = msg else {
+            return;
+        };
+        self.require_metadata_before_entry_apply(entry);
     }
 
     fn abort_on_fatal_apply_error(message: impl AsRef<str>) -> ! {
@@ -181,11 +241,16 @@ impl JournalLoader {
                 .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
         }
 
+        let applied_index = applied.index;
         let mut state = self.fsm_state()?;
         if is_leader {
-            state.ufs_applied = applied.clone();
-            state.applied = applied;
-        } else {
+            if applied.index > state.ufs_applied.index {
+                state.ufs_applied = applied.clone();
+            }
+            if applied.index > state.applied.index {
+                state.applied = applied;
+            }
+        } else if applied.index > state.applied.index {
             state.applied = applied;
         }
 
@@ -194,6 +259,12 @@ impl JournalLoader {
             .journal_ufs_applied
             .set(state.ufs_applied.index as i64);
         drop(state);
+        self.advance_metadata_applied_index(applied_index);
+        if is_leader {
+            self.journal_writer.advance_metadata_catch_up(applied_index);
+        } else {
+            self.journal_writer.advance_metadata_applied(applied_index);
+        }
 
         let state = self.log_store.hard_state();
         self.metrics.journal_committed.set(state.commit as i64);
@@ -216,13 +287,21 @@ impl JournalLoader {
         entry: &Entry,
         skip_ufs_error: bool,
     ) -> CommonResult<()> {
-        if entry.data.is_empty() {
+        if entry.data.is_empty() || entry.get_entry_type() != EntryType::EntryNormal {
+            self.advance_metadata_applied_index(entry.index);
+            if is_leader {
+                self.journal_writer.advance_metadata_catch_up(entry.index);
+            } else {
+                self.journal_writer.advance_metadata_applied(entry.index);
+            }
             return Ok(());
         }
 
         let cur = self.fsm_state_snapshot()?;
-        let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
-        if entry.index <= role_applied {
+        let apply_metadata = (!is_leader && entry.index > cur.applied.index)
+            || self.entry_needs_leader_metadata_apply(entry);
+        let apply_ufs = is_leader && entry.index > cur.ufs_applied.index;
+        if !apply_metadata && !apply_ufs {
             info!(
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
@@ -262,10 +341,14 @@ impl JournalLoader {
                 }
             }
 
-            let res = if is_leader {
+            if apply_metadata {
+                self.apply_entry(op_entry.clone())?;
+            }
+
+            let res = if apply_ufs {
                 self.ufs_loader.apply_entry(&op_entry).await
             } else {
-                self.apply_entry(op_entry.clone())
+                Ok(())
             };
 
             if let Err(e) = res {
@@ -281,10 +364,11 @@ impl JournalLoader {
             }
         }
 
-        self.set_applied(is_leader, applied, has_ufs_affecting)?;
-
         if let Some(e) = snapshot {
-            let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
+            SnapshotManifest::validate_checkpoint_if_present(&e.dir, e.op_id, e.node_id)?;
+            let snapshot_state = self.next_fsm_state(is_leader, applied.clone())?;
+            let snap_data =
+                self.create_snapshot_with_state(Some(e.dir.to_string()), snapshot_state)?;
 
             self.log_store.create_snapshot(snap_data.clone())?;
             self.log_store.compact(snap_data.fsm_state.compact())?;
@@ -294,6 +378,8 @@ impl JournalLoader {
                 e.dir, snap_data.fsm_state
             );
         }
+
+        self.set_applied(is_leader, applied, has_ufs_affecting && apply_ufs)?;
 
         Ok(())
     }
@@ -319,6 +405,11 @@ impl JournalLoader {
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
                     if last_applied >= commit_index {
+                        if is_leader {
+                            self.journal_writer.advance_metadata_catch_up(commit_index);
+                        } else {
+                            self.journal_writer.advance_metadata_applied(commit_index);
+                        }
                         return Ok(());
                     }
 
@@ -326,6 +417,11 @@ impl JournalLoader {
                     let list = self.log_store.scan_entries(last_applied + 1, high)?;
 
                     if list.is_empty() {
+                        if is_leader {
+                            self.journal_writer.advance_metadata_catch_up(commit_index);
+                        } else {
+                            self.journal_writer.advance_metadata_applied(commit_index);
+                        }
                         return Ok(());
                     };
 
@@ -340,6 +436,11 @@ impl JournalLoader {
                         self.apply0(is_leader, &entry, skip_ufs_error).await?;
                         last_applied = entry.index;
                         if skip_ufs_error {
+                            if is_leader {
+                                self.journal_writer.advance_metadata_catch_up(last_applied);
+                            } else {
+                                self.journal_writer.advance_metadata_applied(last_applied);
+                            }
                             return Ok(());
                         }
                     }
@@ -353,11 +454,13 @@ impl JournalLoader {
     async fn next_apply_msg(
         &self,
         receiver: &mut AsyncReceiver<ApplyMsg>,
-        retry_msg: &mut Option<ApplyMsg>,
+        retry_msg: &mut Option<(ApplyMsg, bool)>,
     ) -> Option<ApplyMsg> {
         match retry_msg.take() {
-            Some(msg) => {
-                tokio::time::sleep(self.retry_interval).await;
+            Some((msg, delay)) => {
+                if delay {
+                    tokio::time::sleep(self.retry_interval).await;
+                }
                 Some(msg)
             }
             None => receiver.recv().await,
@@ -365,7 +468,7 @@ impl JournalLoader {
     }
 
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
-        let mut retry_msg: Option<ApplyMsg> = None;
+        let mut retry_msg: Option<(ApplyMsg, bool)> = None;
         let mut retry_num: u64 = 0;
         let mut is_leader = false;
 
@@ -392,8 +495,9 @@ impl JournalLoader {
 
                 ApplyMsg::RoleChange(role) => {
                     is_leader = role == StateRole::Leader;
+                    self.leader_mode.store(is_leader, Ordering::Release);
                     if is_leader {
-                        let ufs_applied = match self.get_ufs_applied() {
+                        let mut scan_applied = match self.get_ufs_applied() {
                             Ok(ufs_applied) => ufs_applied,
                             Err(e) => {
                                 Self::abort_on_fatal_apply_error(format!(
@@ -402,8 +506,15 @@ impl JournalLoader {
                                 ));
                             }
                         };
-                        info!("role changed to leader, scheduling UFS replay scan from ufs_applied: {:?}", ufs_applied);
-                        retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                        let metadata_applied = self.metadata_applied_index();
+                        if metadata_applied < scan_applied.index {
+                            scan_applied.index = metadata_applied;
+                        }
+                        info!(
+                            "role changed to leader, scheduling replay scan from {:?}",
+                            scan_applied
+                        );
+                        retry_msg.replace((ApplyMsg::new_scan(scan_applied), false));
                     }
                 }
 
@@ -438,7 +549,7 @@ impl JournalLoader {
                                     }
                                     retry_num = 0;
                                     if continue_scan {
-                                        retry_msg.replace(msg);
+                                        retry_msg.replace((msg, true));
                                     }
                                 } else {
                                     Self::abort_on_fatal_apply_error(format!(
@@ -448,7 +559,7 @@ impl JournalLoader {
                                 }
                             } else {
                                 error!("apply entry failed(retry_num={}): {}", retry_num, error);
-                                retry_msg.replace(msg);
+                                retry_msg.replace((msg, true));
                             }
                         } else {
                             Self::abort_on_fatal_apply_error(format!(
@@ -463,11 +574,29 @@ impl JournalLoader {
     }
 
     fn create_snapshot0(&self, dir_option: Option<String>) -> RaftResult<SnapshotData> {
+        if dir_option.is_none() {
+            let _barrier = self.namespace_commit_gate.close_and_wait();
+            let fsm_state = self.fsm_state_snapshot()?;
+            return self.create_snapshot_with_state(None, fsm_state);
+        }
+
         let fsm_state = self.fsm_state_snapshot()?;
-        let fs_dir = self.fs_dir.read();
+        self.create_snapshot_with_state(dir_option, fsm_state)
+    }
+
+    fn create_snapshot_with_state(
+        &self,
+        dir_option: Option<String>,
+        fsm_state: FsmState,
+    ) -> RaftResult<SnapshotData> {
         let dir = match dir_option {
             Some(dir) => dir,
-            None => fs_dir.create_checkpoint(fsm_state.applied.index)?,
+            None => {
+                let fs_dir = self.fs_dir.read();
+                let dir = fs_dir.create_checkpoint(fsm_state.applied.index)?;
+                SnapshotManifest::write_checkpoint(&dir, fsm_state.op_id(), self.node_id)?;
+                dir
+            }
         };
 
         let data = RaftUtils::create_file_snapshot(&dir, self.node_id, fsm_state)?;
@@ -479,6 +608,15 @@ impl JournalLoader {
         Ok(data)
     }
 
+    fn next_fsm_state(&self, is_leader: bool, applied: AppliedIndex) -> CommonResult<FsmState> {
+        let mut state = self.fsm_state_snapshot()?;
+        if is_leader {
+            state.ufs_applied = applied.clone();
+        }
+        state.applied = applied;
+        Ok(state)
+    }
+
     fn apply_snapshot0(&self, snapshot: SnapshotData) -> RaftResult<()> {
         let mut spend = TimeSpent::new();
 
@@ -487,6 +625,11 @@ impl JournalLoader {
         // The traversal is skipped entirely when info logging is disabled.
         let (restore_path, checkpoint_size) = match &snapshot.files_data {
             Some(data) => {
+                SnapshotManifest::validate_checkpoint_if_present(
+                    &data.dir,
+                    snapshot.fsm_state.op_id(),
+                    snapshot.node_id,
+                )?;
                 let size = if log::log_enabled!(log::Level::Info) {
                     FileUtils::dir_size(&data.dir).unwrap_or_else(|e| {
                         warn!("failed to compute checkpoint size for {}: {}", data.dir, e);
@@ -519,10 +662,15 @@ impl JournalLoader {
         let restore_ms = spend.used_ms();
         spend.reset();
 
-        self.mnt_mgr.restore_best_effort();
+        self.mnt_mgr
+            .restore()
+            .map_err(|error| RaftError::other(error.into()))?;
         let mount_ms = spend.used_ms();
 
+        let applied_index = snapshot.fsm_state.applied.index;
         *self.fsm_state()? = snapshot.fsm_state;
+        self.advance_metadata_applied_index(applied_index);
+        self.journal_writer.advance_metadata_applied(applied_index);
 
         info!(
             "apply_snapshot: fs_dir_restore={} ms, mount_restore={} ms, total={} ms",
@@ -575,7 +723,7 @@ impl JournalLoader {
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
         let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
@@ -583,7 +731,7 @@ impl JournalLoader {
     }
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
         if inp.is_full() {
@@ -596,7 +744,7 @@ impl JournalLoader {
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
@@ -615,7 +763,7 @@ impl JournalLoader {
     }
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
@@ -634,7 +782,7 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
 
         let inode_id = entry.blocks.first().map(|v| InodeId::get_id(v.id));
 
@@ -655,7 +803,7 @@ impl JournalLoader {
     }
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
 
         let mut inode =
             match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, Some(entry.file.id)) {
@@ -676,7 +824,7 @@ impl JournalLoader {
         Ok(())
     }
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let entry_src = entry.src;
         let src_inp = InodePath::resolve(fs_dir.root_ptr(), &entry_src, &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
@@ -695,7 +843,7 @@ impl JournalLoader {
     }
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let entry_path = entry.path;
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry_path, &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
@@ -707,7 +855,7 @@ impl JournalLoader {
     }
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
         let Some(inode) = inp.get_last_inode() else {
             warn!("Free: path not found: {:?}", entry);
@@ -718,26 +866,23 @@ impl JournalLoader {
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
+        self.rocks_store()?
+            .add_mountpoint(entry.info.mount_id, &entry.info)?;
         self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.unprotected_store_mount(entry.info)?;
         Ok(())
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        if !self.mnt_mgr.has_mounted(entry.id)? {
+        self.rocks_store()?.remove_mountpoint(entry.id)?;
+        if !self.mnt_mgr.unprotected_umount_if_mounted(entry.id)? {
             warn!("Unmount: id already unmounted: {:?}", entry);
             return Ok(());
         }
-        self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.unprotected_unmount(entry.id)?;
         Ok(())
     }
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
         let last_inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -753,7 +898,7 @@ impl JournalLoader {
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
         let link_path = entry.link;
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &link_path, &fs_dir.store)?;
         match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
             Ok(_) => Ok(()),
@@ -766,7 +911,7 @@ impl JournalLoader {
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
+        let fs_dir = self.fs_dir.read();
         let old_path = InodePath::resolve(fs_dir.root_ptr(), &entry.src_path, &fs_dir.store)?;
         let new_path = InodePath::resolve(fs_dir.root_ptr(), &entry.dst_path, &fs_dir.store)?;
 
@@ -796,8 +941,7 @@ impl JournalLoader {
     }
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
-        fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
+        self.rocks_store()?.set_locks(entry.ino, &entry.locks)
     }
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
@@ -858,9 +1002,18 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
+    fn before_apply_entries(&self, entries: &[Entry]) -> RaftResult<()> {
+        for entry in entries {
+            self.require_metadata_before_entry_apply(entry);
+        }
+        Ok(())
+    }
+
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
         if wait || !self.has_apply_worker {
-            if let Err(e) = self.apply_msg(false, &msg, false).await {
+            let is_leader = self.leader_mode.load(Ordering::Acquire);
+            self.require_metadata_before_apply(&msg);
+            if let Err(e) = self.apply_msg(is_leader, &msg, false).await {
                 if self.ignore_reply_error {
                     error!("apply entry failed: {}", e);
                     Ok(())
@@ -871,6 +1024,7 @@ impl AppStorage for JournalLoader {
                 Ok(())
             }
         } else {
+            self.require_metadata_before_apply(&msg);
             self.sender.send(msg).await?;
             Ok(())
         }
@@ -887,6 +1041,15 @@ impl AppStorage for JournalLoader {
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        if role == StateRole::Leader {
+            self.leader_mode.store(true, Ordering::Release);
+            let applied_index = self.metadata_applied_index();
+            let required = self.log_store.hard_state().commit;
+            self.journal_writer
+                .begin_metadata_catch_up(applied_index, required);
+        } else {
+            self.leader_mode.store(false, Ordering::Release);
+        }
         if !self.has_apply_worker {
             return Ok(());
         }

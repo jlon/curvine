@@ -630,6 +630,7 @@ where
         entries: Vec<Entry>,
         client_send: &mut HashMap<i64, Callback>,
     ) -> RaftResult<()> {
+        self.storage.before_apply_entries(&entries)?;
         for entry in entries {
             if entry.get_data().is_empty() {
                 continue;

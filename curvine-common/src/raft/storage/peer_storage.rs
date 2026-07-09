@@ -96,6 +96,10 @@ where
         self.app_store.apply(wait, apply_msg).await
     }
 
+    pub fn before_apply_entries(&self, entries: &[Entry]) -> RaftResult<()> {
+        self.app_store.before_apply_entries(entries)
+    }
+
     /// Scan log entries in [low, high). Used to get committed-but-not-applied entries for replay.
     pub fn scan_entries(&self, low: u64, high: u64) -> RaftResult<Vec<Entry>> {
         self.log_store.scan_entries(low, high)

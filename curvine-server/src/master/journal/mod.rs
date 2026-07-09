@@ -13,7 +13,14 @@
 // limitations under the License.
 
 mod journal_writer;
-pub use self::journal_writer::JournalWriter;
+pub use self::journal_writer::{
+    JournalPermit, JournalPermitScope, JournalWriter, QueuedJournalEntry,
+};
+
+mod read_barrier;
+
+mod snapshot_manifest;
+pub use self::snapshot_manifest::SnapshotManifest;
 
 mod journal_loader;
 pub use self::journal_loader::JournalLoader;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{JournalBatch, JournalEntry};
+use crate::master::journal::{JournalBatch, JournalEntry, QueuedJournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
@@ -49,7 +49,7 @@ impl SenderTask {
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: BlockingReceiver<QueuedJournalEntry>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -63,7 +63,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: BlockingReceiver<JournalEntry>,
+        receiver: BlockingReceiver<QueuedJournalEntry>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -81,10 +81,10 @@ impl SenderTask {
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
+    pub fn handle(&mut self, entry: Option<QueuedJournalEntry>) -> FsResult<()> {
         let force = if let Some(v) = entry {
-            let force = matches!(v, JournalEntry::Snapshot(_));
-            self.batch.push(v);
+            let force = matches!(v.entry, JournalEntry::Snapshot(_));
+            self.batch.push(v.entry);
             self.metrics.journal_queue_len.dec();
             force
         } else {

@@ -14,6 +14,7 @@
 
 use std::future::Future;
 
+use raft::eraftpb::Entry;
 use raft::StateRole;
 
 use crate::proto::raft::{FsmState, SnapshotData};
@@ -23,6 +24,10 @@ use crate::raft::RaftResult;
 /// Application layer storage.
 /// Replay raft log
 pub trait AppStorage: Clone + Send + Sync + 'static {
+    fn before_apply_entries(&self, _entries: &[Entry]) -> RaftResult<()> {
+        Ok(())
+    }
+
     fn apply(&self, wait: bool, msg: ApplyMsg) -> impl Future<Output = RaftResult<()>> + Send;
 
     fn get_fsm_state(&self) -> FsmState;

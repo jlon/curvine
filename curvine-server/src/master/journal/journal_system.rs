@@ -284,6 +284,7 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
+                parts.fs.namespace_commit_gate(),
             )?,
             conf.journal.clone(),
             role_monitor,
@@ -404,6 +405,22 @@ impl JournalSystem {
         let data = SnapshotData::decode(snapshot.get_data())?;
         self.rt
             .block_on(self.raft_journal.app_store().apply_snapshot(data))
+    }
+
+    // Append raft entries and hard state manually, dedicated for tests that
+    // need a precise committed-log term without running a full raft cluster.
+    #[doc(hidden)]
+    pub fn append_test_entries(
+        &self,
+        entries: &[Entry],
+        current_term: u64,
+        committed_index: u64,
+    ) -> RaftResult<()> {
+        self.raft_journal.log_store().append(entries)?;
+        let mut hard_state = self.raft_journal.log_store().hard_state();
+        hard_state.term = current_term;
+        hard_state.commit = committed_index;
+        self.raft_journal.log_store().set_hard_state(&hard_state)
     }
 }
 

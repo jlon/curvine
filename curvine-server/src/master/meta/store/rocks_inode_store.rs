@@ -14,7 +14,7 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
-use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_common::rocksdb::{DBConf, DBEngine, DBSnapshotReader, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
@@ -65,6 +65,12 @@ impl RocksInodeStore {
         };
 
         Ok(InodeChildrenIter { inner: iter })
+    }
+
+    pub fn snapshot(&self) -> RocksInodeStoreSnapshot<'_> {
+        RocksInodeStoreSnapshot {
+            reader: self.db.snapshot_reader(),
+        }
     }
 
     // Get all location information for all block ids.
@@ -158,6 +164,22 @@ impl RocksInodeStore {
         Ok(block_ids)
     }
 
+    pub fn apply_block_locations(
+        &self,
+        locations: Vec<(bool, i64, BlockLocation)>,
+    ) -> CommonResult<()> {
+        let mut batch = self.new_batch();
+        for (add, id, loc) in locations {
+            if add {
+                batch.add_location(id, &loc)?;
+            } else {
+                batch.delete_location(id, loc.worker_id)?;
+            }
+        }
+
+        batch.commit()
+    }
+
     pub fn get_block_ids(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
         let prefix = RocksUtils::u32_to_bytes(worker_id);
         let iter = self.db.prefix_scan(Self::CF_LOCATION, prefix)?;
@@ -234,6 +256,95 @@ impl RocksInodeStore {
 
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
         self.db.get_rocksdb_metrics()
+    }
+}
+
+pub struct RocksInodeStoreSnapshot<'a> {
+    reader: DBSnapshotReader<'a>,
+}
+
+impl RocksInodeStoreSnapshot<'_> {
+    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        let bytes = self
+            .reader
+            .get_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
+        bytes
+            .map(|bytes| Serde::deserialize::<InodeView>(&bytes))
+            .transpose()
+    }
+
+    pub fn get_inodes<I>(&self, ids: I) -> CommonResult<Vec<Option<InodeView>>>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let keys = ids
+            .into_iter()
+            .map(RocksUtils::i64_to_bytes)
+            .collect::<Vec<_>>();
+        let values = self.reader.multi_get_cf(RocksInodeStore::CF_INODES, keys)?;
+        let mut inodes = Vec::with_capacity(values.len());
+
+        for value in values {
+            let bytes = value?;
+            inodes.push(
+                bytes
+                    .map(|bytes| Serde::deserialize::<InodeView>(&bytes))
+                    .transpose()?,
+            );
+        }
+
+        Ok(inodes)
+    }
+
+    pub fn get_child_id(&self, parent_id: i64, name: &str) -> CommonResult<Option<i64>> {
+        let key = RocksUtils::i64_str_to_bytes(parent_id, name);
+        let bytes = self.reader.get_cf(RocksInodeStore::CF_EDGES, key)?;
+        bytes
+            .map(|bytes| RocksUtils::i64_from_bytes(&bytes))
+            .transpose()
+    }
+
+    pub fn get_child_ids(
+        &self,
+        parent_id: i64,
+        start_after: Option<&str>,
+        limit: Option<usize>,
+    ) -> CommonResult<Vec<(String, i64)>> {
+        let prefix = RocksUtils::i64_to_bytes(parent_id);
+        let iter = self.reader.prefix_scan(RocksInodeStore::CF_EDGES, prefix)?;
+        let limit = limit.unwrap_or(usize::MAX);
+        let mut children = Vec::new();
+
+        for item in iter {
+            if children.len() >= limit {
+                break;
+            }
+
+            let (key, value) = item?;
+            let (edge_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key)?;
+            if edge_parent_id != parent_id {
+                continue;
+            }
+            if matches!(start_after, Some(start_after) if child_name.as_str() <= start_after) {
+                continue;
+            }
+
+            children.push((child_name, RocksUtils::i64_from_bytes(&value)?));
+        }
+
+        Ok(children)
+    }
+
+    pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        let prefix = RocksUtils::i64_to_bytes(block_id);
+        let iter = self.reader.prefix_scan(RocksInodeStore::CF_BLOCK, prefix)?;
+
+        let mut locations = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            locations.push(Serde::deserialize::<BlockLocation>(&bytes.1)?);
+        }
+        Ok(locations)
     }
 }
 

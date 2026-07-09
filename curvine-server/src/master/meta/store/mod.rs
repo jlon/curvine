@@ -17,3 +17,9 @@ pub use self::inode_store::InodeStore;
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;
+
+mod store_handle;
+pub use self::store_handle::{RocksStoreHandle, RocksStoreReadGuard};
+
+mod store_path_resolver;
+pub use self::store_path_resolver::*;

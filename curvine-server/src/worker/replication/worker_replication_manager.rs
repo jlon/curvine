@@ -19,13 +19,14 @@ use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
-use curvine_common::state::{ExtendedBlock, FileType};
-use log::{error, info};
+use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use log::{error, info, warn};
 use once_cell::sync::OnceCell;
 use orpc::io::BlockIO;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
 
@@ -37,6 +38,7 @@ pub struct WorkerReplicationManager {
     fs_client_context: Arc<FsContext>,
     master_client: OnceCell<MasterClient>,
     replicate_chunk_size: usize,
+    report_retry_interval: Duration,
     // todo: add more metrics to track
 }
 
@@ -57,6 +59,9 @@ impl WorkerReplicationManager {
             fs_client_context: fs_client_context.clone(),
             master_client: Default::default(),
             replicate_chunk_size: conf.worker.block_replication_chunk_size,
+            report_retry_interval: Duration::from_millis(
+                conf.client.rpc_retry_min_sleep_ms.max(1_000),
+            ),
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime.clone(), recv);
@@ -80,28 +85,55 @@ impl WorkerReplicationManager {
                         Some(e.to_string())
                     }
                 };
-                if let Err(e) = manager.report_job(&job, msg).await {
+                if let Err(e) = manager.report_job_until_accepted(&job, msg).await {
                     error!("Errors on reporting block: {}. err: {}", job.block_id, e);
                 }
             }
         });
     }
 
-    async fn report_job(
+    async fn report_job_until_accepted(
         &self,
         job: &ReplicationJob,
         err_msg: Option<String>,
-    ) -> CommonResult<ReportBlockReplicationResponse> {
-        let Some(storage_type) = job.storage_type else {
+    ) -> CommonResult<()> {
+        if err_msg.is_none() && job.storage_type.is_none() {
             return err_box!(
                 "missing storage type when reporting replication result for block {}",
                 job.block_id
             );
+        }
+
+        loop {
+            match self.report_job(job, err_msg.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        "Errors on reporting block: {}. err: {}. Retrying after {:?}",
+                        job.block_id, e, self.report_retry_interval
+                    );
+                    tokio::time::sleep(self.report_retry_interval).await;
+                }
+            }
+        }
+    }
+
+    async fn report_job(&self, job: &ReplicationJob, err_msg: Option<String>) -> CommonResult<()> {
+        let success = err_msg.is_none();
+        let storage_type = match job.storage_type {
+            Some(storage_type) => storage_type,
+            None if !success => StorageType::default(),
+            None => {
+                return err_box!(
+                    "missing storage type when reporting replication result for block {}",
+                    job.block_id
+                );
+            }
         };
         let request = ReportBlockReplicationRequest {
             block_id: job.block_id,
             storage_type: storage_type.into(),
-            success: err_msg.is_none(),
+            success,
             message: err_msg,
         };
 
@@ -113,7 +145,15 @@ impl WorkerReplicationManager {
             .fs_client
             .rpc(RpcCode::ReportBlockReplicationResult, request)
             .await?;
-        Ok(response)
+        if response.success {
+            return Ok(());
+        }
+
+        err_box!(
+            "master rejected block replication report for block {}: {:?}",
+            job.block_id,
+            response.message
+        )
     }
 
     async fn replicate_block(&self, job: &mut ReplicationJob) -> CommonResult<()> {

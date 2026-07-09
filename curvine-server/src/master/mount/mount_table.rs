@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::meta::store::RocksStoreHandle;
 use crate::master::SyncFsDir;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::Path;
@@ -22,6 +23,7 @@ use orpc::err_box;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
+use std::sync::Arc;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct MountTableInner {
@@ -32,19 +34,25 @@ pub struct MountTableInner {
 
 pub struct MountTable {
     inner: RwLock<MountTableInner>,
-    fs_dir: SyncFsDir,
+    store_handle: Arc<RocksStoreHandle>,
 }
 
 impl MountTable {
     pub fn new(fs_dir: SyncFsDir) -> Self {
+        let store_handle = fs_dir.read().store_handle.clone();
         MountTable {
             inner: RwLock::new(MountTableInner {
                 ufs2mountid: HashMap::new(),
                 mountid2entry: HashMap::new(),
                 mountpath2id: HashMap::new(),
             }),
-            fs_dir,
+            store_handle,
         }
+    }
+
+    fn get_mounts_from_store(&self) -> FsResult<Vec<MountInfo>> {
+        let store = self.store_handle.read()?;
+        Ok(store.get_mount_table()?)
     }
 
     fn read_inner(&self) -> FsResult<RwLockReadGuard<'_, MountTableInner>> {
@@ -63,12 +71,12 @@ impl MountTable {
 
     //for new master node
     pub fn restore(&self) -> FsResult<()> {
-        let mounts = self.fs_dir.read().get_mount_table()?;
+        let mounts = self.get_mounts_from_store()?;
         self.replace_with_mounts(mounts)
     }
 
     pub fn restore_best_effort(&self) {
-        match self.fs_dir.read().get_mount_table() {
+        match self.get_mounts_from_store() {
             Ok(mounts) => {
                 if let Err(e) = self.replace_with_mounts(mounts) {
                     warn!("failed to restore mount table: {}", e);
@@ -172,13 +180,13 @@ impl MountTable {
         Ok(())
     }
 
-    pub fn add_mount(
+    pub fn build_mount_info(
         &self,
         mount_id: u32,
         cv_path: &str,
         ufs_path: &str,
         mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
+    ) -> FsResult<MountInfo> {
         if self.exists(ufs_path)? {
             return err_box!("{} already exists in mount table", ufs_path);
         }
@@ -189,25 +197,16 @@ impl MountTable {
 
         self.check_conflict(cv_path, ufs_path)?;
 
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
-        self.unprotected_add_mount(info.clone())?;
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.store_mount(info, true)?;
-        Ok(())
+        Ok(mnt_opt.clone().to_info(mount_id, cv_path, ufs_path))
     }
 
-    pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
+    pub fn build_updated_mount_info(&self, info: MountInfo) -> FsResult<MountInfo> {
         let old = self.get_mount_info_by_id(info.mount_id)?;
         if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
             return err_box!("cannot change mount path");
         }
 
-        self.unprotected_add_mount(info.clone())?;
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.store_mount(info, true)?;
-        Ok(())
+        Ok(info)
     }
 
     pub fn assign_mount_id(&self) -> FsResult<u32> {
@@ -222,27 +221,13 @@ impl MountTable {
         err_box!("failed assign mount id")
     }
 
-    pub fn umount(&self, mount_path: &str) -> FsResult<()> {
-        let mut inner = self.write_inner()?;
-
+    pub fn get_mount_id_by_path(&self, mount_path: &str) -> FsResult<u32> {
+        let inner = self.read_inner()?;
         let mount_id = match inner.mountpath2id.get(mount_path) {
             Some(&id) => id,
             None => return err_box!("failed found {} to umount", mount_path),
         };
-
-        let ufs_path = match inner.mountid2entry.get(&mount_id) {
-            Some(entry) => entry.ufs_path.clone(),
-            None => return err_box!("failed found {} matched mountentry to umount", mount_id),
-        };
-
-        inner.ufs2mountid.remove(&ufs_path);
-        inner.mountpath2id.remove(mount_path);
-        inner.mountid2entry.remove(&mount_id);
-
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.unmount(mount_id)?;
-
-        Ok(())
+        Ok(mount_id)
     }
 
     /// use ufs_uri to find ufs config

@@ -4,6 +4,7 @@ use curvine_common::state::{
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
+use curvine_server::master::meta::NamespaceCommitGate;
 use curvine_server::master::Master;
 use orpc::common::Utils;
 use std::sync::{
@@ -35,6 +36,27 @@ fn new_fs(name: &str) -> (MasterFilesystem, JournalSystem) {
     let fs = MasterFilesystem::with_js(&conf, &js);
     fs.add_test_worker(WorkerInfo::default());
     (fs, js)
+}
+
+#[test]
+fn namespace_commit_gate_keeps_writes_blocked_until_all_barriers_drop() {
+    let gate = Arc::new(NamespaceCommitGate::new());
+    let barrier1 = gate.close_and_wait();
+    let barrier2 = gate.close_and_wait();
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let gate_for_writer = gate.clone();
+    let writer = thread::spawn(move || {
+        let _guard = gate_for_writer.enter();
+        entered_tx.send(()).unwrap();
+    });
+
+    assert!(entered_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(barrier1);
+    assert!(entered_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(barrier2);
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    writer.join().unwrap();
 }
 
 #[test]
@@ -99,6 +121,7 @@ fn stress_add_block_vs_block_report_no_hang() {
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: false,
+                full_report_start: false,
                 total_len: 0,
                 blocks: vec![BlockReportInfo::new(
                     9_000_000 + i as i64,
@@ -179,6 +202,7 @@ fn sanity_single_thread_paths_progress() {
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            full_report_start: false,
             total_len: 0,
             blocks: vec![BlockReportInfo::new(
                 8_000_000 + i as i64,
@@ -189,4 +213,42 @@ fn sanity_single_thread_paths_progress() {
         };
         let _ = fs.block_report(report);
     }
+}
+
+#[test]
+fn disjoint_namespace_writes_preserve_mem_store_consistency() {
+    let (fs, _js) = new_fs("parallel-create");
+    for dir in ["a", "b", "c", "d"] {
+        fs.mkdir(format!("/parallel/{}", dir), true).unwrap();
+    }
+
+    let fs = Arc::new(fs);
+    let mut handles = Vec::new();
+    for dir in ["a", "b", "c", "d"] {
+        let fs = fs.clone();
+        let dir = dir.to_string();
+        handles.push(thread::spawn(move || {
+            for index in 0..200 {
+                fs.create(format!("/parallel/{}/file-{}.log", dir, index), false)
+                    .unwrap();
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for dir in ["a", "b", "c", "d"] {
+        for index in 0..200 {
+            assert!(fs
+                .exists(format!("/parallel/{}/file-{}.log", dir, index))
+                .unwrap());
+        }
+    }
+
+    let fs_dir = fs.fs_dir.read();
+    let mem_hash = fs_dir.root_dir().sum_hash().unwrap();
+    let state_hash = fs_dir.create_tree().unwrap().sum_hash().unwrap();
+    assert_eq!(mem_hash, state_hash);
 }

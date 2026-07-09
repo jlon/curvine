@@ -157,18 +157,11 @@ impl QuotaManager {
                 break;
             }
 
-            let total_freed = {
-                let fs_guard = self.fs.fs_dir.read();
-                let freed = inode_ids
-                    .iter()
-                    .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id, None).ok().flatten())
-                    .map(|inode_view| match &inode_view {
-                        InodeView::File(f) => f.len.max(0),
-                        _ => 0,
-                    })
-                    .sum::<i64>();
-                freed
-            };
+            let total_freed = self
+                .file_sizes_by_inode_ids(&inode_ids)
+                .into_iter()
+                .map(|(_, file_size)| file_size)
+                .sum::<i64>();
 
             if total_freed <= 0 {
                 log::debug!("cluster-evict: total_freed <= 0, stopping eviction");
@@ -212,6 +205,28 @@ impl QuotaManager {
         })
     }
 
+    fn file_sizes_by_inode_ids(&self, inode_ids: &[i64]) -> Vec<(i64, i64)> {
+        let inodes = match self.fs.get_inodes_by_id(inode_ids) {
+            Ok(inodes) => inodes,
+            Err(e) => {
+                log::warn!("cluster-evict: failed to fetch inode candidates: {}", e);
+                return Vec::new();
+            }
+        };
+
+        inode_ids
+            .iter()
+            .copied()
+            .zip(inodes)
+            .filter_map(|(inode_id, inode_view)| {
+                inode_view.and_then(|inode_view| match &inode_view {
+                    InodeView::File(file) => Some((inode_id, file.len.max(0))),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
     fn execute_eviction(&self, _mode: EvictionMode, inode_ids: &[i64]) {
         let ttl_executor_guard = self.ttl_executor.read();
         let Some(ttl_executor) = ttl_executor_guard.as_ref() else {
@@ -229,24 +244,8 @@ impl QuotaManager {
         let mut successfully_evicted = Vec::with_capacity(inode_ids.len());
         let mut total_bytes_freed = 0_i64;
 
-        // Get file sizes before deletion
-        let file_sizes: Vec<(i64, i64)> = {
-            let fs_guard = self.fs.fs_dir.read();
-            inode_ids
-                .iter()
-                .filter_map(|&inode_id| {
-                    fs_guard
-                        .store
-                        .get_inode(inode_id, None)
-                        .ok()
-                        .flatten()
-                        .and_then(|inode_view| match &inode_view {
-                            InodeView::File(f) => Some((inode_id, f.len.max(0))),
-                            _ => None,
-                        })
-                })
-                .collect()
-        };
+        // Get file sizes before deletion.
+        let file_sizes = self.file_sizes_by_inode_ids(inode_ids);
 
         for (inode_id, file_size) in file_sizes {
             let res = ttl_executor.execute_by_id(inode_id);

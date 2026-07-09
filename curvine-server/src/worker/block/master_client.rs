@@ -81,6 +81,7 @@ impl MasterClient {
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             full_report: true,
+            full_report_start: Some(false),
             total_len: total_size as u64,
             blocks: vec![],
         };
@@ -106,6 +107,22 @@ impl MasterClient {
         Ok(rep_header)
     }
 
+    pub fn begin_full_block_report(&self) -> CommonResult<BlockReportListResponse> {
+        let req = BlockReportListRequest {
+            cluster_id: self.cluster_id.clone(),
+            worker_id: self.worker_id,
+            full_report: true,
+            full_report_start: Some(true),
+            total_len: 0,
+            blocks: vec![],
+        };
+
+        let rep_header: BlockReportListResponse = self
+            .fs_client
+            .rpc_blocking(RpcCode::WorkerBlockReport, req)?;
+        Ok(rep_header)
+    }
+
     pub fn incr_block_report(
         &self,
         blocks: &[BlockReportInfo],
@@ -114,6 +131,7 @@ impl MasterClient {
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             full_report: false,
+            full_report_start: Some(false),
             total_len: blocks.len() as u64,
             blocks: vec![],
         };

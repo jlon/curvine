@@ -179,18 +179,16 @@ impl MasterMetrics {
             self.blocks_size_avg.set(avg_size);
         }
 
-        let fs_dir = fs.fs_dir.read();
-        let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
+        let rocksdb_metrics = fs.get_rocksdb_metrics()?;
         for (key, value) in rocksdb_metrics {
             self.rocksdb_metrics
                 .with_label_values(&[&key])
                 .set(value as i64);
         }
 
-        let ttl_list = fs_dir.get_ttl_bucket_list();
-        drop(fs_dir);
-        self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
-        self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
+        let (ttl_bucket_len, ttl_total_inodes) = fs.ttl_bucket_counts();
+        self.ttl_bucket_len.set(ttl_bucket_len as i64);
+        self.ttl_total_inodes.set(ttl_total_inodes as i64);
 
         self.worker_num
             .with_label_values(&["live"])

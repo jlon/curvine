@@ -310,8 +310,15 @@ impl RocksInodeStoreSnapshot<'_> {
         start_after: Option<&str>,
         limit: Option<usize>,
     ) -> CommonResult<Vec<(String, i64)>> {
-        let prefix = RocksUtils::i64_to_bytes(parent_id);
-        let iter = self.reader.prefix_scan(RocksInodeStore::CF_EDGES, prefix)?;
+        let parent_prefix = RocksUtils::i64_to_bytes(parent_id);
+        let start = match start_after {
+            Some(name) => RocksUtils::i64_str_to_bytes(parent_id, name),
+            None => parent_prefix.to_vec(),
+        };
+        let end = RocksUtils::calculate_end_bytes(&parent_prefix);
+        let iter = self
+            .reader
+            .range_scan(RocksInodeStore::CF_EDGES, &start, &end, false)?;
         let limit = limit.unwrap_or(usize::MAX);
         let mut children = Vec::new();
 

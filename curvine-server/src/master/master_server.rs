@@ -205,7 +205,10 @@ impl Master {
         let mut listener = journal_system.start().await?;
         listener.wait_role().await?;
 
-        // step 2: Start rpc server
+        // step 2: Restore mount table before serving RPCs.
+        self.mount_manager.restore()?;
+
+        // step 3: Start rpc server
         let rpc_server = match self.rpc_server.take() {
             Some(rpc_server) => rpc_server,
             None => return err_box!("master rpc server is not initialized"),
@@ -213,7 +216,7 @@ impl Master {
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
-        // step3: Start the web server
+        // step4: Start the web server
         let web_server = match self.web_server.take() {
             Some(web_server) => web_server,
             None => return err_box!("master web server is not initialized"),
@@ -223,16 +226,13 @@ impl Master {
         let mut web_status = web_server.start();
         WebServer::<MasterService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
 
-        // step4: Start master actor
+        // step5: Start master actor
         self.actor.start()?;
 
-        // reload mount info
-        self.mount_manager.restore_best_effort();
-
-        // step5: Start job manager
+        // step6: Start job manager
         self.job_manager.start()?;
 
-        // step6: Start TTL scheduler (requires mount_manager and job_manager)
+        // step7: Start TTL scheduler (requires mount_manager and job_manager)
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
         }

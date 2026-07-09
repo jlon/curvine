@@ -23,6 +23,7 @@ pub struct NamespaceCommitGate {
 struct CommitGateState {
     open: bool,
     in_flight: usize,
+    closed: usize,
 }
 
 impl NamespaceCommitGate {
@@ -31,6 +32,7 @@ impl NamespaceCommitGate {
             state: Mutex::new(CommitGateState {
                 open: true,
                 in_flight: 0,
+                closed: 0,
             }),
             changed: Condvar::new(),
         }
@@ -50,6 +52,7 @@ impl NamespaceCommitGate {
 
     pub fn close_and_wait(&self) -> NamespaceCommitBarrier<'_> {
         let mut state = self.state.lock().expect("namespace commit gate poisoned");
+        state.closed += 1;
         state.open = false;
         while state.in_flight != 0 {
             state = self
@@ -74,8 +77,15 @@ impl NamespaceCommitGate {
 
     fn open(&self) {
         let mut state = self.state.lock().expect("namespace commit gate poisoned");
-        state.open = true;
-        self.changed.notify_all();
+        assert!(
+            state.closed > 0,
+            "namespace commit gate open without matching close"
+        );
+        state.closed -= 1;
+        if state.closed == 0 {
+            state.open = true;
+            self.changed.notify_all();
+        }
     }
 }
 

@@ -24,7 +24,12 @@ use log::info;
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
+use std::ffi::OsStr;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
+
+const SNAPSHOT_MANIFEST_FILE: &str = "_curvine_snapshot_manifest";
 
 // ---------------------------------------------------------------------------
 // Private helper structs for bulk-load snapshot restore (Issue #964)
@@ -855,7 +860,7 @@ impl InodeStore {
 
         // Delete the original file and move the checkpoint to the data directory.
         FileUtils::delete_path(&conf.data_dir, true)?;
-        FileUtils::copy_dir(path.as_ref(), &conf.data_dir)?;
+        copy_checkpoint_dir(path.as_ref(), &conf.data_dir)?;
 
         self.store = Arc::new(RocksInodeStore::new(conf, false)?);
         Ok(())
@@ -908,6 +913,33 @@ impl InodeStore {
     pub fn store(&self) -> &RocksInodeStore {
         &self.store
     }
+}
+
+fn copy_checkpoint_dir(src: &str, dst: &str) -> CommonResult<()> {
+    copy_checkpoint_dir0(Path::new(src), Path::new(dst))
+}
+
+fn copy_checkpoint_dir0(src: &Path, dst: &Path) -> CommonResult<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == OsStr::new(SNAPSHOT_MANIFEST_FILE) {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_checkpoint_dir0(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

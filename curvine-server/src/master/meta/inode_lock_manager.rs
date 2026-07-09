@@ -41,6 +41,10 @@ impl InodeLockMode {
             Self::Read
         }
     }
+
+    fn covers(self, required: Self) -> bool {
+        matches!(self, Self::Write) || self == required
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +124,7 @@ impl InodeLockManager {
             manager: self,
             guards,
             inode_ids,
+            held_locks: normalized,
         }
     }
 
@@ -140,7 +145,7 @@ impl InodeLockManager {
         }
 
         let mut normalized = by_inode.into_values().collect::<Vec<_>>();
-        normalized.sort_by_key(|request| (request.depth, request.inode_id));
+        normalized.sort_by_key(|request| request.inode_id);
         normalized
     }
 }
@@ -149,6 +154,18 @@ pub struct InodeLockSet<'a> {
     manager: &'a InodeLockManager,
     guards: Vec<InodeGuard>,
     inode_ids: Vec<i64>,
+    held_locks: Vec<NormalizedInodeLock>,
+}
+
+impl InodeLockSet<'_> {
+    pub fn covers_requests(&self, requests: &[InodeLockRequest]) -> bool {
+        let required = InodeLockManager::normalize_requests(requests);
+        required.into_iter().all(|required| {
+            self.held_locks
+                .iter()
+                .any(|held| held.inode_id == required.inode_id && held.mode.covers(required.mode))
+        })
+    }
 }
 
 enum InodeGuard {

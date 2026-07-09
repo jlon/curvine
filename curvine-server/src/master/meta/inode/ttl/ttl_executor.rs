@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::InodeView;
 use curvine_common::state::TtlAction;
 use curvine_common::FsResult;
 use log::debug;
@@ -44,56 +44,12 @@ impl InodeTtlExecutor {
     }
 
     fn get_inode_path(&self, inode_id: i64) -> FsResult<String> {
-        let path = self.resolve_inode_path(inode_id)?;
+        let path = self.filesystem.resolve_inode_path_by_id(inode_id)?;
         Ok(path)
     }
 
-    fn resolve_inode_path(&self, inode_id: i64) -> FsResult<String> {
-        self.build_path_recursive(inode_id)
-    }
-
-    fn build_path_recursive(&self, inode_id: i64) -> FsResult<String> {
-        if inode_id == ROOT_INODE_ID {
-            return Ok("/".to_string());
-        }
-
-        let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.read();
-        if let Ok(Some(inode_view)) = fs_dir_guard.store.get_inode(inode_id, None) {
-            match &inode_view {
-                InodeView::File(f) => {
-                    let parent_path = self.build_path_recursive(f.parent_id())?;
-                    let file_path = if parent_path == "/" {
-                        format!("/{}", f.name)
-                    } else {
-                        format!("{}/{}", parent_path, f.name)
-                    };
-                    return Ok(file_path);
-                }
-                InodeView::Dir(d) => {
-                    let parent_path = self.build_path_recursive(d.parent_id())?;
-                    let dir_path = if parent_path == "/" {
-                        format!("/{}", d.name)
-                    } else {
-                        format!("{}/{}", parent_path, d.name)
-                    };
-                    return Ok(dir_path);
-                }
-                InodeView::FileEntry(e) => {
-                    // For empty files, we can't determine parent_id, so return a basic path
-                    return Ok(format!("/{}", e.name));
-                }
-            }
-        }
-
-        err_box!("Cannot resolve path for inode {}", inode_id)
-    }
-
     pub fn get_inode_from_store(&self, inode_id: i64) -> FsResult<Option<InodeView>> {
-        let fs_dir = self.filesystem.fs_dir();
-        let fs_dir_guard = fs_dir.read();
-        let inode = fs_dir_guard.store.get_inode(inode_id, None)?;
-        Ok(inode)
+        self.filesystem.get_inode_by_id(inode_id)
     }
 
     pub fn execute_by_id(&self, inode_id: i64) -> FsResult<(bool, InodeView)> {

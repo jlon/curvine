@@ -111,7 +111,7 @@ async fn overview(
     let master_info = fs.master_info()?;
 
     let (files_total, dir_total) = {
-        let (f, d) = fs.get_file_counts();
+        let (f, d) = fs.get_file_counts_current()?;
         (f as usize, d as usize)
     };
 
@@ -157,8 +157,7 @@ async fn browse(
     Query(params): Query<HashMap<String, String>>,
 ) -> FsResult<Json<Vec<FileStatus>>> {
     let fs = &instance.fs;
-    let root_path = fs.fs_dir.read().root_dir().name().to_string();
-    let path = params.get("path").unwrap_or(&root_path);
+    let path = params.get("path").map(String::as_str).unwrap_or("/");
     let files = fs.list_status(path)?;
     Ok(Json(files))
 }

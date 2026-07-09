@@ -71,20 +71,45 @@ impl BlockLocationLockManager {
         }
     }
 
+    pub fn write_worker<'a>(&'a self, worker_id: u32) -> BlockLocationLockSet<'a> {
+        let worker_keys = vec![worker_id as u64];
+        let guards = vec![BlockLocationGuard::Write {
+            _guard: self
+                .worker_locks
+                .get_or_create_lock(worker_id as u64)
+                .write_arc(),
+        }];
+
+        BlockLocationLockSet {
+            manager: self,
+            guards,
+            block_keys: Vec::new(),
+            worker_keys,
+        }
+    }
+
     pub fn write_worker_blocks<'a>(
         &'a self,
         worker_id: u32,
         block_ids: &[i64],
     ) -> BlockLocationLockSet<'a> {
-        let worker_keys = vec![worker_id as u64];
+        self.write_workers_blocks(&[worker_id], block_ids)
+    }
+
+    pub fn write_workers_blocks<'a>(
+        &'a self,
+        worker_ids: &[u32],
+        block_ids: &[i64],
+    ) -> BlockLocationLockSet<'a> {
+        let worker_keys = sorted_unique_keys(worker_ids.iter().map(|worker_id| *worker_id as u64));
         let block_keys = sorted_unique_keys(block_ids.iter().map(|block_id| *block_id as u64));
-        let mut guards = Vec::with_capacity(block_keys.len() + 1);
-        guards.push(BlockLocationGuard::Write {
-            _guard: self
-                .worker_locks
-                .get_or_create_lock(worker_id as u64)
-                .write_arc(),
-        });
+        let mut guards = Vec::with_capacity(block_keys.len() + worker_keys.len());
+
+        for key in &worker_keys {
+            guards.push(BlockLocationGuard::Write {
+                _guard: self.worker_locks.get_or_create_lock(*key).write_arc(),
+            });
+        }
 
         for key in &block_keys {
             guards.push(BlockLocationGuard::Write {

@@ -14,20 +14,22 @@
 
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
+use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
-use curvine_common::state::MountOptions;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileAllocOpts, WorkerInfo,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, FileAllocOpts, StorageType, WorkerInfo,
 };
+use curvine_common::state::{ListOptions, MountOptions};
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
+use curvine_server::master::meta::InodeId;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::LocalTime;
@@ -36,6 +38,7 @@ use orpc::message::Builder;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -647,6 +650,32 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 #[test]
+fn list_options_respects_start_after_and_limit() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "list-options-page");
+    fs.create("/page/a.log", true)?;
+    fs.create("/page/b.log", true)?;
+    fs.create("/page/c.log", true)?;
+    fs.create("/page/d.log", true)?;
+    fs.create("/page/e.log", true)?;
+
+    let page = fs.list_options(
+        "/page",
+        ListOptions {
+            limit: Some(2),
+            start_after: Some("b.log".to_string()),
+        },
+    )?;
+
+    let names = page
+        .iter()
+        .map(|status| status.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["c.log", "d.log"]);
+    Ok(())
+}
+
+#[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "link_test");
@@ -655,6 +684,7 @@ fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     fs.print_tree();
     fs.link("/a/b/file.log", "/a/b/file2.log")?;
     assert!(fs.exists("/a/b/file2.log")?);
+    assert_eq!(fs.file_status("/a/b/file2.log")?.name, "file2.log");
     fs.print_tree();
 
     fs.link("/a/b/file.log", "/a/d/file.log")?;
@@ -993,6 +1023,578 @@ fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) ->
 }
 
 #[test]
+fn test_auto_snapshot_entry_after_journal_threshold() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-auto-snapshot"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 1,
+            writer_channel_size: 8,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-auto-snapshot"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.mkdir("/snapshot-trigger", false)?;
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    let JournalEntry::Snapshot(_) = &entries[1] else {
+        panic!(
+            "expected Snapshot entry after threshold, got {:?}",
+            entries[1]
+        );
+    };
+    assert!(entries[1].op_id() > entries[0].op_id());
+    let checkpoint_path = js
+        .fs()
+        .fs_dir
+        .read()
+        .get_checkpoint_path(entries[1].op_id());
+    assert!(std::path::Path::new(&checkpoint_path).exists());
+    Ok(())
+}
+
+#[test]
+fn test_single_entry_journal_permit_uses_one_queue_slot() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-journal-single-slot"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 1,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-single-slot"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+
+    fs.mkdir("/single-slot", false)?;
+
+    let err = fs.mkdir("/queue-full", false).unwrap_err();
+    assert!(err.to_string().contains("journal writer queue is full"));
+    assert!(matches!(
+        fs.file_status("/queue-full").unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    Ok(())
+}
+
+#[test]
+fn test_namespace_write_fails_before_mutation_when_journal_queue_is_full() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-journal-full"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 3,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-full"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+
+    let mut blocked_path = None;
+    for index in 0..16 {
+        let path = format!("/queued-{index}");
+        match fs.mkdir(&path, false) {
+            Ok(_) => {}
+            Err(err) => {
+                assert!(err.to_string().contains("journal writer queue is full"));
+                blocked_path = Some(path);
+                break;
+            }
+        }
+    }
+    let blocked_path = blocked_path.expect("journal writer queue should become full");
+
+    let err = fs.file_status(&blocked_path).unwrap_err();
+    assert!(matches!(err, FsError::FileNotFound(_)));
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert!(entries
+        .iter()
+        .all(|entry| matches!(entry, JournalEntry::Mkdir(_))));
+    Ok(())
+}
+
+#[test]
+fn test_mount_commit_failure_does_not_mutate_mount_table() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-mount-journal-full"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 4,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-mount-full"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    let mnt_mgr = js.mount_manager();
+    let mnt_opt = MountOptions::builder().build();
+    fs.mkdir("/mnt", true)?;
+    let mut queue_full = false;
+    let mut filler_success = 0usize;
+    for id in 1..16 {
+        let cv_path = format!("/filler-{}", id);
+        let ufs_path = format!("oss://filler-{}/", id);
+        let filler = mnt_opt.clone().to_info(id, &cv_path, &ufs_path);
+        if fs.commit_mount(filler).is_err() {
+            queue_full = true;
+            break;
+        }
+        filler_success += 1;
+    }
+    assert!(queue_full, "test setup should fill the journal queue");
+
+    let err = mnt_mgr
+        .mount(None, "/mnt", "oss://bucket/", &mnt_opt)
+        .unwrap_err();
+    assert!(err.to_string().contains("journal writer queue is full"));
+
+    let mount_path = Path::from_str("/mnt")?;
+    assert!(mnt_mgr.get_mount_info(&mount_path)?.is_none());
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 1 + filler_success);
+    Ok(())
+}
+
+#[test]
+fn test_link_with_created_parents_reserves_enough_journal_permits() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-link-journal-permits"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 6,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-link-permits"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.create("/source.log", true)?;
+    js.fs().fs_dir.read().take_entries();
+
+    fs.link("/source.log", "/links/nested/source.log")?;
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    assert!(matches!(entries[1], JournalEntry::Mkdir(_)));
+    assert!(matches!(entries[2], JournalEntry::Link(_)));
+    assert!(fs.file_status("/links/nested/source.log").is_ok());
+    Ok(())
+}
+
+#[test]
+fn test_delete_locations_removes_worker_block_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "delete-locations-batched");
+    fs.create("/location-cleanup.log", true)?;
+    let client = ClientAddress {
+        client_name: "delete-locations-test".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    let located = fs.add_block(
+        "/location-cleanup.log",
+        None,
+        client,
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/location-cleanup.log",
+        None,
+        located.block.len,
+        vec![commit],
+        "delete-locations-test",
+        false,
+    )?;
+    let before = fs.get_block_locations("/location-cleanup.log")?;
+    assert_eq!(before.block_locs.len(), 1);
+
+    let deleted = fs.delete_locations(100)?;
+    assert!(deleted.contains(&located.block.id));
+    let err = fs.get_block_locations("/location-cleanup.log").unwrap_err();
+    assert!(err.to_string().contains("Lost"));
+    fs.add_block_location(
+        located.block.id,
+        BlockLocation::new(100, located.block.storage_type),
+    )?;
+    let restored = fs.get_block_locations("/location-cleanup.log")?;
+    assert_eq!(restored.block_locs.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_block_report_ignores_missing_block_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-missing-block");
+    let missing_block_id = InodeId::create_block_id(900_001, 0)?;
+
+    let stale = BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: false,
+        full_report_start: false,
+        total_len: 0,
+        blocks: vec![BlockReportInfo::new(
+            missing_block_id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        )],
+    };
+
+    fs.block_report(stale)?;
+    assert!(fs.get_block_locations_by_id(missing_block_id)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_full_block_report_does_not_delete_locations_committed_after_report_start(
+) -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-candidate-race");
+    let client = ClientAddress {
+        client_name: "full-report-race".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    let first_status = fs.create("/old.log", true)?;
+    let first = fs.add_block("/old.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: first_status.block_size,
+        locations: first
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, first.block.storage_type))
+            .collect(),
+    };
+    let second = fs.add_block(
+        "/old.log",
+        None,
+        client.clone(),
+        vec![first_commit.clone()],
+        vec![],
+        first_status.block_size,
+        Some(first.block.clone()),
+    )?;
+    let second_commit = CommitBlock {
+        block_id: second.block.id,
+        block_len: second.block.len,
+        locations: second
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, second.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/old.log",
+        None,
+        first_status.block_size + second.block.len,
+        vec![second_commit],
+        &client.client_name,
+        false,
+    )?;
+
+    fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: true,
+        total_len: 0,
+        blocks: vec![],
+    })?;
+
+    fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: false,
+        total_len: 2,
+        blocks: vec![BlockReportInfo::new(
+            first.block.id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        )],
+    })?;
+
+    fs.create("/new.log", true)?;
+    let new_block = fs.add_block("/new.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let new_commit = CommitBlock {
+        block_id: new_block.block.id,
+        block_len: new_block.block.len,
+        locations: new_block
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, new_block.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/new.log",
+        None,
+        new_block.block.len,
+        vec![new_commit],
+        &client.client_name,
+        false,
+    )?;
+
+    let stale = fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: false,
+        total_len: 2,
+        blocks: vec![BlockReportInfo::new(
+            second.block.id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        )],
+    })?;
+
+    assert!(!stale.contains(&new_block.block.id));
+    assert_eq!(fs.get_block_locations("/new.log")?.block_locs.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_full_block_report_finish_ignores_newer_generation() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-generation-race");
+    let client = ClientAddress {
+        client_name: "full-report-generation".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    fs.create("/generation-race.log", true)?;
+    let located = fs.add_block(
+        "/generation-race.log",
+        None,
+        client.clone(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/generation-race.log",
+        None,
+        located.block.len,
+        vec![commit],
+        &client.client_name,
+        false,
+    )?;
+
+    fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: true,
+        total_len: 0,
+        blocks: vec![],
+    })?;
+
+    let mut blocks = vec![BlockReportInfo::new(
+        located.block.id,
+        BlockReportStatus::Finalized,
+        StorageType::Disk,
+        0,
+    )];
+    for id in 10_000_000..10_020_000 {
+        blocks.push(BlockReportInfo::new(
+            InodeId::create_block_id(id, 0)?,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        ));
+    }
+    let total_len = blocks.len() as u64;
+
+    let keep_starting = Arc::new(AtomicBool::new(true));
+    let sent_start = Arc::new(AtomicBool::new(false));
+    let start_fs = fs.clone();
+    let start_flag = Arc::clone(&keep_starting);
+    let sent_flag = Arc::clone(&sent_start);
+    let start_thread = std::thread::spawn(move || {
+        while start_flag.load(Ordering::Acquire) {
+            let _ = start_fs.block_report(BlockReportList {
+                cluster_id: "curvine".into(),
+                worker_id: 100,
+                full_report: true,
+                full_report_start: true,
+                total_len: 0,
+                blocks: vec![],
+            });
+            sent_flag.store(true, Ordering::Release);
+        }
+    });
+
+    let stale = fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: false,
+        total_len,
+        blocks,
+    })?;
+    keep_starting.store(false, Ordering::Release);
+    start_thread.join().expect("start thread should not panic");
+
+    assert!(sent_start.load(Ordering::Acquire));
+    assert!(
+        !stale.contains(&located.block.id),
+        "a newer full report generation must not let an older finish delete live block locations"
+    );
+    assert_eq!(
+        fs.get_block_locations("/generation-race.log")?
+            .block_locs
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_legacy_full_block_report_after_worker_start_reconciles_stale_locations() -> CommonResult<()>
+{
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "legacy-full-block-report-start");
+    let client = ClientAddress {
+        client_name: "legacy-full-report".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    fs.create("/stale.log", true)?;
+    let located = fs.add_block("/stale.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/stale.log",
+        None,
+        located.block.len,
+        vec![commit],
+        &client.client_name,
+        false,
+    )?;
+
+    fs.begin_full_block_report(100);
+    let stale = fs.block_report(BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: true,
+        full_report_start: false,
+        total_len: 0,
+        blocks: vec![],
+    })?;
+
+    assert_eq!(stale, vec![located.block.id]);
+    assert!(fs.get_block_locations_by_id(located.block.id)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn test_idempotent_mkdir() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
@@ -1296,6 +1898,36 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
     fs.set_lock("/lockfile.log", lock)?;
     replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    Ok(())
+}
+
+#[test]
+fn lock_operations_reject_partial_paths() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lock-partial-path");
+    fs.create("/lockfile.log", true)?;
+
+    let lock = curvine_common::state::FileLock {
+        client_id: "client1".to_string(),
+        owner_id: 1,
+        lock_type: curvine_common::state::LockType::WriteLock,
+        lock_flags: curvine_common::state::LockFlags::Plock,
+        start: 0,
+        end: 100,
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        fs.get_lock("/lockfile.log/missing", lock.clone())
+            .unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+    assert!(matches!(
+        fs.set_lock("/lockfile.log/missing", lock.clone())
+            .unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+    assert!(fs.get_lock("/lockfile.log", lock)?.is_none());
     Ok(())
 }
 

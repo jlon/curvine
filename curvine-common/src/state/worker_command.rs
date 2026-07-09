@@ -65,6 +65,7 @@ pub struct BlockReportList {
     pub cluster_id: String,
     pub worker_id: u32,
     pub full_report: bool,
+    pub full_report_start: bool,
     pub total_len: u64,
     pub blocks: Vec<BlockReportInfo>,
 }

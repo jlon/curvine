@@ -143,13 +143,17 @@ impl<'a> StorePathResolver<'a> {
             let child_name = components[index].as_str();
             current = match resolved {
                 Dir(_) => match self.get_child_id(resolved_id, child_name)? {
-                    Some(child_id) => try_option!(
-                        self.get_inode(child_id)?,
-                        "Edge {}/{} points to missing inode {}",
-                        resolved_id,
-                        child_name,
-                        child_id
-                    ),
+                    Some(child_id) => {
+                        let mut child = try_option!(
+                            self.get_inode(child_id)?,
+                            "Edge {}/{} points to missing inode {}",
+                            resolved_id,
+                            child_name,
+                            child_id
+                        );
+                        child.change_name(child_name.to_string());
+                        child
+                    }
                     None => break,
                 },
                 _ => break,
@@ -191,6 +195,13 @@ impl<'a> StorePathResolver<'a> {
 
     pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         self.get_locations_cached(block_id)
+    }
+
+    pub fn dir_has_children(&self, inode_id: i64) -> CommonResult<bool> {
+        Ok(!self
+            .snapshot
+            .get_child_ids(inode_id, None, Some(1))?
+            .is_empty())
     }
 
     pub fn collect_block_ids<T: AsRef<str>>(
@@ -299,10 +310,15 @@ impl<'a> StorePathResolver<'a> {
         let children =
             self.snapshot
                 .get_child_ids(inode.id(), opts.start_after.as_deref(), opts.limit)?;
+        let child_ids = children
+            .iter()
+            .map(|(_, child_id)| *child_id)
+            .collect::<Vec<_>>();
+        let child_inodes = self.snapshot.get_inodes(child_ids)?;
         let mut statuses = Vec::with_capacity(children.len());
-        for (child_name, child_id) in children {
+        for ((child_name, child_id), child) in children.into_iter().zip(child_inodes) {
             let mut child = try_option!(
-                self.get_inode(child_id)?,
+                child,
                 "Edge {}/{} points to missing inode {}",
                 inode.id(),
                 child_name,

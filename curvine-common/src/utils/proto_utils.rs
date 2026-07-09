@@ -417,6 +417,7 @@ impl ProtoUtils {
             cluster_id: list.cluster_id,
             worker_id: list.worker_id,
             full_report: list.full_report,
+            full_report_start: list.full_report_start.unwrap_or(false),
             total_len: list.total_len,
             blocks: vec![],
         };

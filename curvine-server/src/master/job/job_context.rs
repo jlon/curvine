@@ -27,6 +27,8 @@ use orpc::sync::{StateListener, StateMonitor};
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
     pub progress: JobTaskProgress,
+    pub skip_final_cv_attr: bool,
+    pub metadata_read_bypass_token: Option<String>,
 }
 
 impl TaskDetail {
@@ -34,7 +36,19 @@ impl TaskDetail {
         Self {
             task,
             progress: JobTaskProgress::default(),
+            skip_final_cv_attr: false,
+            metadata_read_bypass_token: None,
         }
+    }
+
+    pub fn with_replay_options(
+        mut self,
+        skip_final_cv_attr: bool,
+        metadata_read_bypass_token: Option<String>,
+    ) -> Self {
+        self.skip_final_cv_attr = skip_final_cv_attr;
+        self.metadata_read_bypass_token = metadata_read_bypass_token;
+        self
     }
 }
 

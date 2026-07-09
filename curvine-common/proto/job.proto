@@ -69,6 +69,8 @@ message GetJobStatusResponse {
 message SubmitTaskRequest {
   required JobTaskTypeProto task_type = 1;
   required bytes task_command = 2;
+  optional bool skip_final_cv_attr = 3 [default = false];
+  optional string metadata_read_bypass_token = 4;
 }
 
 message SubmitTaskResponse {

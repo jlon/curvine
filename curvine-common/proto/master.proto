@@ -198,6 +198,7 @@ message CompleteFileResponse {
 // Get the block of the file.
 message GetBlockLocationsRequest {
     required string path = 1;
+    optional string metadata_read_bypass_token = 2;
 }
 
 message GetBlockLocationsResponse {

@@ -139,8 +139,15 @@ impl LoadTaskRunner {
             (reader.path(), ufs_status.mtime)
         };
 
-        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
-        self.fs.set_attr(cv_path, attr_opts).await?;
+        if self.task.skip_final_cv_attr {
+            info!(
+                "task {} skips final CV attr update for replay export, cv_path {}, ufs_mtime {}",
+                self.task.info.task_id, cv_path, ufs_mtime
+            );
+        } else {
+            let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
+            self.fs.set_attr(cv_path, attr_opts).await?;
+        }
 
         self.update_progress(writer.pos(), reader.len(), true).await;
 
@@ -173,7 +180,13 @@ impl LoadTaskRunner {
 
     async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
         if path.is_cv() {
-            let reader = self.fs.open(path).await?;
+            let reader = if let Some(token) = self.task.metadata_read_bypass_token.as_deref() {
+                self.fs
+                    .open_with_metadata_read_bypass_token(path, token)
+                    .await?
+            } else {
+                self.fs.open(path).await?
+            };
             Ok(UnifiedReader::Cv(reader))
         } else {
             // UFS path

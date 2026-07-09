@@ -20,14 +20,26 @@ use orpc::sync::StateCtl;
 
 pub struct TaskContext {
     pub info: LoadTaskInfo,
+    pub skip_final_cv_attr: bool,
+    pub metadata_read_bypass_token: Option<String>,
     state: StateCtl,
     progress: Mutex<JobTaskProgress>,
 }
 
 impl TaskContext {
     pub fn new(info: LoadTaskInfo) -> Self {
+        Self::with_options(info, false, None)
+    }
+
+    pub fn with_options(
+        info: LoadTaskInfo,
+        skip_final_cv_attr: bool,
+        metadata_read_bypass_token: Option<String>,
+    ) -> Self {
         Self {
             info,
+            skip_final_cv_attr,
+            metadata_read_bypass_token,
             state: StateCtl::new(JobTaskState::Pending.into()),
             progress: Mutex::new(JobTaskProgress::default()),
         }

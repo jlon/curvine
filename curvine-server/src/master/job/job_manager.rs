@@ -146,11 +146,34 @@ impl JobManager {
             self.factory.clone(),
             self.job_max_files,
             self.run_seq.clone(),
+            true,
+        )
+    }
+
+    pub fn create_replay_runner(&self) -> LoadJobRunner {
+        LoadJobRunner::new(
+            self.jobs.clone(),
+            self.master_fs.clone(),
+            self.factory.clone(),
+            self.job_max_files,
+            self.run_seq.clone(),
+            false,
         )
     }
 
     pub fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         if let Some(mnt) = self.mount_manager.get_mount_info(path)? {
+            let mnt_value = self.factory.get_mnt(&mnt)?;
+            let target_path = mnt_value.toggle_path(path)?;
+
+            Ok(Some((target_path, mnt_value)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_mnt_for_replay(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+        if let Some(mnt) = self.mount_manager.get_mount_info_unchecked(path)? {
             let mnt_value = self.factory.get_mnt(&mnt)?;
             let target_path = mnt_value.toggle_path(path)?;
 

@@ -146,6 +146,22 @@ impl CurvineFileSystem {
         Ok(reader)
     }
 
+    /// Internal replay path only. The master validates the token and falls back
+    /// to the normal metadata barrier when it is absent or invalid.
+    pub async fn open_with_metadata_read_bypass_token(
+        &self,
+        path: &Path,
+        token: &str,
+    ) -> FsResult<FsReader> {
+        let file_blocks = self
+            .fs_client
+            .get_block_locations_with_metadata_read_bypass_token(path, token)
+            .await?;
+
+        let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
+        Ok(reader)
+    }
+
     pub async fn open_for_write(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
         let create_opts = self.create_opts_builder().create_parent(true).build();
         let flags = OpenFlags::new_write_only()

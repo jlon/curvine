@@ -128,9 +128,18 @@ impl TaskManager {
     ///    - Automatically releases the permit on completion
     ///    - Removes the map entry **only if it still points at its own
     ///      context** (a later `submit_task` may have superseded it)
-    pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+    pub fn submit_task(
+        &self,
+        task: LoadTaskInfo,
+        skip_final_cv_attr: bool,
+        metadata_read_bypass_token: Option<String>,
+    ) -> FsResult<()> {
         let task_id = task.task_id.clone();
-        let context = Arc::new(TaskContext::new(task));
+        let context = Arc::new(TaskContext::with_options(
+            task,
+            skip_final_cv_attr,
+            metadata_read_bypass_token,
+        ));
 
         match self.tasks.entry(task_id.clone()) {
             Entry::Occupied(mut occ) => {

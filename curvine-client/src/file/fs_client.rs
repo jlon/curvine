@@ -432,8 +432,27 @@ impl FsClient {
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
+        self.get_block_locations0(path, None).await
+    }
+
+    /// Internal replay path only. The master validates the token and falls back
+    /// to the normal metadata barrier when it is absent or invalid.
+    pub async fn get_block_locations_with_metadata_read_bypass_token(
+        &self,
+        path: &Path,
+        token: &str,
+    ) -> FsResult<FileBlocks> {
+        self.get_block_locations0(path, Some(token)).await
+    }
+
+    async fn get_block_locations0(
+        &self,
+        path: &Path,
+        metadata_read_bypass_token: Option<&str>,
+    ) -> FsResult<FileBlocks> {
         let header = GetBlockLocationsRequest {
             path: path.encode(),
+            metadata_read_bypass_token: metadata_read_bypass_token.map(ToOwned::to_owned),
         };
 
         let rep: GetBlockLocationsResponse = self.rpc(RpcCode::GetBlockLocations, header).await?;

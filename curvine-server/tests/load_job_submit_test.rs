@@ -17,6 +17,7 @@ use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
     MountOptions, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
+use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{JobContext, JobManager, JobStore, Master};
@@ -24,6 +25,7 @@ use curvine_server::worker::task::{TaskContext, TaskStore};
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use orpc::CommonResult;
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,6 +91,67 @@ fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
         target_path: "/mnt/source".to_string(),
         create_time: 0,
     }
+}
+
+#[derive(Serialize)]
+struct LegacyLoadJobInfo {
+    job_id: String,
+    source_path: String,
+    target_path: String,
+    block_size: i64,
+    replicas: i32,
+    storage_type: StorageType,
+    ttl_ms: i64,
+    ttl_action: TtlAction,
+    mount_info: MountInfo,
+    create_time: i64,
+    overwrite: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct LegacyLoadTaskInfo {
+    job: LegacyLoadJobInfo,
+    task_id: String,
+    worker: WorkerAddress,
+    source_path: String,
+    target_path: String,
+    create_time: i64,
+}
+
+#[test]
+fn load_task_bincode_payload_keeps_legacy_layout() -> CommonResult<()> {
+    let current = load_task("legacy-task", "legacy-job");
+    let legacy = LegacyLoadTaskInfo {
+        job: LegacyLoadJobInfo {
+            job_id: current.job.job_id.clone(),
+            source_path: current.job.source_path.clone(),
+            target_path: current.job.target_path.clone(),
+            block_size: current.job.block_size,
+            replicas: current.job.replicas,
+            storage_type: current.job.storage_type,
+            ttl_ms: current.job.ttl_ms,
+            ttl_action: current.job.ttl_action,
+            mount_info: current.job.mount_info.clone(),
+            create_time: current.job.create_time,
+            overwrite: current.job.overwrite,
+        },
+        task_id: current.task_id.clone(),
+        worker: current.worker.clone(),
+        source_path: current.source_path.clone(),
+        target_path: current.target_path.clone(),
+        create_time: current.create_time,
+    };
+
+    let current_bytes = SerdeUtils::serialize(&current)?;
+    let legacy_bytes = SerdeUtils::serialize(&legacy)?;
+    assert_eq!(current_bytes, legacy_bytes);
+
+    let decoded: LoadTaskInfo = SerdeUtils::deserialize(&legacy_bytes)?;
+    assert_eq!(decoded.job.job_id, current.job.job_id);
+    assert_eq!(decoded.task_id, current.task_id);
+    assert_eq!(decoded.source_path, current.source_path);
+    assert_eq!(decoded.target_path, current.target_path);
+    Ok(())
 }
 
 #[test]

@@ -41,6 +41,7 @@ pub struct LoadJobRunner {
     factory: Arc<UfsFactory>,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
+    enforce_metadata_barrier: bool,
 }
 
 #[derive(Clone)]
@@ -63,6 +64,7 @@ impl LoadJobRunner {
         factory: Arc<UfsFactory>,
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
+        enforce_metadata_barrier: bool,
     ) -> Self {
         Self {
             jobs,
@@ -70,6 +72,23 @@ impl LoadJobRunner {
             factory,
             job_max_files,
             run_seq,
+            enforce_metadata_barrier,
+        }
+    }
+
+    fn file_status(&self, path: &str) -> FsResult<curvine_common::state::FileStatus> {
+        if self.enforce_metadata_barrier {
+            self.master_fs.file_status(path)
+        } else {
+            self.master_fs.file_status_unchecked(path)
+        }
+    }
+
+    fn list_status(&self, path: &str) -> FsResult<Vec<curvine_common::state::FileStatus>> {
+        if self.enforce_metadata_barrier {
+            self.master_fs.list_status(path)
+        } else {
+            self.master_fs.list_status_unchecked(path)
         }
     }
 
@@ -140,7 +159,7 @@ impl LoadJobRunner {
         }
 
         // Target not present in Curvine yet — must load.
-        let cv_status = match self.master_fs.file_status(target_path.path()) {
+        let cv_status = match self.file_status(target_path.path()) {
             Ok(cv_status) => cv_status,
             Err(FsError::FileNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
@@ -502,10 +521,16 @@ impl LoadJobRunner {
         let submit_futures: Vec<_> = tasks
             .take()
             .into_iter()
-            .map(|(id, task)| async move {
-                let worker = task.task.worker.clone();
+            .map(|(id, detail)| async move {
+                let worker = detail.task.worker.clone();
                 let client = self.factory.get_worker_client(&worker).await?;
-                client.submit_load_task(task.task).await?;
+                client
+                    .submit_load_task(
+                        detail.task,
+                        detail.skip_final_cv_attr,
+                        detail.metadata_read_bypass_token,
+                    )
+                    .await?;
                 debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
             })
@@ -523,7 +548,7 @@ impl LoadJobRunner {
         run_id: u64,
     ) -> FsResult<PlannedLoadJob> {
         let source_status = if source_path.is_cv() {
-            self.master_fs.file_status(source_path.path())?
+            self.file_status(source_path.path())?
         } else {
             let ufs = self.factory.get_ufs(mnt)?;
             ufs.get_status(source_path).await?
@@ -546,7 +571,7 @@ impl LoadJobRunner {
                 let dir_path = Path::from_str(status.path)?;
                 let childs = if dir_path.is_cv() {
                     // Traverse Curvine directory
-                    self.master_fs.list_status(dir_path.path())?
+                    self.list_status(dir_path.path())?
                 } else {
                     // Traverse UFS directory
                     let ufs = self.factory.get_ufs(mnt)?;
@@ -589,7 +614,12 @@ impl LoadJobRunner {
                     target_path: target_path.clone_uri(),
                     create_time: LocalTime::mills() as i64,
                 };
-                tasks.insert(task_id.clone(), TaskDetail::new(task));
+                let replay_cv_export = !self.enforce_metadata_barrier && source_path.is_cv();
+                let detail = TaskDetail::new(task).with_replay_options(
+                    replay_cv_export,
+                    replay_cv_export.then(|| self.master_fs.metadata_read_bypass_token()),
+                );
+                tasks.insert(task_id.clone(), detail);
 
                 if tasks.len() > self.job_max_files {
                     return err_box!("Job {} files exceeds {}", job.job_id, self.job_max_files);

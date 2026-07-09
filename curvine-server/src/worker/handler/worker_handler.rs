@@ -108,7 +108,11 @@ impl WorkerHandler {
         let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
         let task_id = task.task_id.clone();
 
-        self.task_manager.submit_task(task)?;
+        self.task_manager.submit_task(
+            task,
+            req.skip_final_cv_attr.unwrap_or(false),
+            req.metadata_read_bypass_token,
+        )?;
         let response = SubmitTaskResponse { task_id };
 
         Ok(Builder::success(msg).proto_header(response).build())

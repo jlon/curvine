@@ -28,7 +28,7 @@ use curvine_common::state::{
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::error;
+use log::{error, warn};
 use orpc::err_box;
 use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
@@ -418,7 +418,21 @@ impl MasterHandler {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
 
-        let blocks = self.fs.get_block_locations(req.path)?;
+        let can_bypass = self
+            .fs
+            .can_bypass_metadata_read_barrier(req.metadata_read_bypass_token.as_deref());
+        if req.metadata_read_bypass_token.is_some() && !can_bypass {
+            warn!(
+                "Reject metadata read barrier bypass for get_block_locations, path {}",
+                req.path
+            );
+        }
+
+        let blocks = if can_bypass {
+            self.fs.get_block_locations_unchecked(req.path)?
+        } else {
+            self.fs.get_block_locations(req.path)?
+        };
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
@@ -438,7 +452,7 @@ impl MasterHandler {
         let status = HeartbeatStatus::from(header.status);
         let address = ProtoUtils::worker_address_from_pb(&header.address);
         if matches!(status, HeartbeatStatus::Start) {
-            self.fs.reset_full_block_report(address.worker_id);
+            self.fs.begin_full_block_report(address.worker_id);
         }
 
         let mut wm = self.fs.worker_manager.write();

@@ -41,10 +41,17 @@ impl JobWorkerClient {
         RpcUtils::proto_rpc(&self.client, self.timeout, code, header).await
     }
 
-    pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
+    pub async fn submit_load_task(
+        &self,
+        task: LoadTaskInfo,
+        skip_final_cv_attr: bool,
+        metadata_read_bypass_token: Option<String>,
+    ) -> FsResult<()> {
         let request = SubmitTaskRequest {
             task_type: JobTaskType::Load.into(),
             task_command: SerdeUtils::serialize(&task)?,
+            skip_final_cv_attr: Some(skip_final_cv_attr),
+            metadata_read_bypass_token,
         };
 
         let _: SubmitTaskResponse = self.rpc(RpcCode::SubmitTask, request).await?;

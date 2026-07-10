@@ -1,4 +1,5 @@
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::state::RenameFlags;
 use curvine_common::state::{
     BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, StorageType, WorkerInfo,
 };
@@ -36,6 +37,13 @@ fn new_fs(name: &str) -> (MasterFilesystem, JournalSystem) {
     let fs = MasterFilesystem::with_js(&conf, &js);
     fs.add_test_worker(WorkerInfo::default());
     (fs, js)
+}
+
+fn assert_mem_store_consistent(fs: &MasterFilesystem) {
+    let fs_dir = fs.fs_dir.read();
+    let mem_hash = fs_dir.root_dir().sum_hash().unwrap();
+    let state_hash = fs_dir.create_tree().unwrap().sum_hash().unwrap();
+    assert_eq!(mem_hash, state_hash);
 }
 
 #[test]
@@ -247,8 +255,33 @@ fn disjoint_namespace_writes_preserve_mem_store_consistency() {
         }
     }
 
-    let fs_dir = fs.fs_dir.read();
-    let mem_hash = fs_dir.root_dir().sum_hash().unwrap();
-    let state_hash = fs_dir.create_tree().unwrap().sum_hash().unwrap();
-    assert_eq!(mem_hash, state_hash);
+    assert_mem_store_consistent(&fs);
+}
+
+#[test]
+fn stale_create_parent_lock_cache_does_not_write_to_renamed_parent() {
+    let (fs, _js) = new_fs("stale-create-cache-rename");
+    fs.mkdir("/cache/a", true).unwrap();
+    fs.create("/cache/a/warmup.log", false).unwrap();
+
+    fs.rename("/cache/a", "/cache/b", RenameFlags::empty())
+        .unwrap();
+    fs.create("/cache/a/new.log", true).unwrap();
+
+    assert!(fs.exists("/cache/a/new.log").unwrap());
+    assert!(fs.exists("/cache/b/warmup.log").unwrap());
+    assert!(!fs.exists("/cache/b/new.log").unwrap());
+    assert_mem_store_consistent(&fs);
+}
+
+#[test]
+fn create_parent_lock_cache_relocks_when_target_exists() {
+    let (fs, _js) = new_fs("stale-create-cache-target");
+    fs.mkdir("/cache/parent", true).unwrap();
+    fs.create("/cache/parent/warmup.log", false).unwrap();
+
+    fs.mkdir("/cache/parent/existing", false).unwrap();
+    assert!(fs.mkdir("/cache/parent/existing", false).is_err());
+    assert!(fs.exists("/cache/parent/existing").unwrap());
+    assert_mem_store_consistent(&fs);
 }

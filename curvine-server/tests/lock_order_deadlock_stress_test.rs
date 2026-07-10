@@ -1,16 +1,22 @@
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::RenameFlags;
 use curvine_common::state::{
     BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, StorageType, WorkerInfo,
 };
+use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::MasterFilesystem;
-use curvine_server::master::journal::JournalSystem;
+use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::NamespaceCommitGate;
 use curvine_server::master::Master;
 use orpc::common::Utils;
+use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::CommonResult;
+use raft::eraftpb::Entry;
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Barrier,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,12 +28,12 @@ fn new_fs(name: &str) -> (MasterFilesystem, JournalSystem) {
         format_master: true,
         testing: true,
         master: MasterConf {
-            meta_dir: Utils::test_sub_dir(format!("deadlock-stress/meta-{}", name)),
+            meta_dir: temp_stress_dir(&format!("meta-{}", name)),
             ..Default::default()
         },
         journal: JournalConf {
             enable: false,
-            journal_dir: Utils::test_sub_dir(format!("deadlock-stress/journal-{}", name)),
+            journal_dir: temp_stress_dir(&format!("journal-{}", name)),
             ..Default::default()
         },
         ..Default::default()
@@ -44,6 +50,240 @@ fn assert_mem_store_consistent(fs: &MasterFilesystem) {
     let mem_hash = fs_dir.root_dir().sum_hash().unwrap();
     let state_hash = fs_dir.create_tree().unwrap().sum_hash().unwrap();
     assert_eq!(mem_hash, state_hash);
+}
+
+fn temp_stress_dir(name: &str) -> String {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "curvine-lock-order-deadlock-stress-{}-{}",
+        name,
+        Utils::rand_str(6)
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).unwrap();
+    path.display().to_string()
+}
+
+fn new_journal_pair(
+    name: &str,
+) -> (
+    MasterFilesystem,
+    JournalSystem,
+    JournalLoader,
+    JournalSystem,
+    MasterFilesystem,
+) {
+    Master::init_test_metrics();
+    let suffix = Utils::rand_str(6);
+    let mut conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: temp_stress_dir(&format!("meta-{}-leader-{}", name, suffix)),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            journal_dir: temp_stress_dir(&format!("journal-{}-leader-{}", name, suffix)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let worker = WorkerInfo::default();
+
+    let leader_js = JournalSystem::from_conf(&conf).unwrap();
+    let leader_fs = MasterFilesystem::with_js(&conf, &leader_js);
+    leader_fs.add_test_worker(worker.clone());
+
+    conf.master.meta_dir = temp_stress_dir(&format!("meta-{}-follower-{}", name, suffix));
+    conf.journal.journal_dir = temp_stress_dir(&format!("journal-{}-follower-{}", name, suffix));
+    let follower_js = JournalSystem::from_conf(&conf).unwrap();
+    let follower_fs = MasterFilesystem::with_js(&conf, &follower_js);
+    follower_fs.add_test_worker(worker);
+    let loader = follower_js.journal_loader();
+
+    (leader_fs, leader_js, loader, follower_js, follower_fs)
+}
+
+fn apply_journal_entries(loader: &JournalLoader, entries: &[JournalEntry]) -> CommonResult<()> {
+    let rt = AsyncRuntime::single();
+    rt.block_on(async {
+        for (offset, entry) in entries.iter().cloned().enumerate() {
+            let index = offset as u64 + 1;
+            let mut batch = JournalBatch::new(index);
+            batch.push(entry);
+            let raft_entry = Entry {
+                term: 1,
+                index,
+                data: SerdeUtils::serialize(&batch)?,
+                ..Default::default()
+            };
+            loader.apply(true, ApplyMsg::new_entry(raft_entry)).await?;
+        }
+        Ok(())
+    })
+}
+
+fn assert_journal_entries_consistent(entries: &[JournalEntry], expected_entries: usize) {
+    assert_eq!(
+        entries.len(),
+        expected_entries,
+        "journal entry count changed"
+    );
+
+    let mut op_ids = HashSet::new();
+    let mut inode_ids = HashSet::new();
+    for entry in entries {
+        assert!(op_ids.insert(entry.op_id()), "duplicate op_id in journal");
+        if let Some(inode_id) = entry.inode_id() {
+            assert!(inode_ids.insert(inode_id), "duplicate inode_id in journal");
+        }
+    }
+}
+
+fn assert_journal_replay_matches(
+    leader_fs: &MasterFilesystem,
+    leader_js: &JournalSystem,
+    loader: &JournalLoader,
+    follower_fs: &MasterFilesystem,
+    expected_entries: usize,
+) {
+    assert_mem_store_consistent(leader_fs);
+    let entries = leader_js.fs().fs_dir.read().take_entries();
+    assert!(!entries.is_empty(), "journal must contain replay entries");
+    assert_journal_entries_consistent(&entries, expected_entries);
+    apply_journal_entries(loader, &entries).unwrap();
+    assert!(
+        follower_fs.fs_dir.read().take_entries().is_empty(),
+        "journal replay must not enqueue new journal entries"
+    );
+    assert_mem_store_consistent(follower_fs);
+    assert_eq!(leader_fs.last_inode_id(), follower_fs.last_inode_id());
+    assert_eq!(
+        leader_fs.sum_hash().unwrap(),
+        follower_fs.sum_hash().unwrap()
+    );
+}
+
+fn run_same_parent_metadata_mutation_stress(
+    fs: Arc<MasterFilesystem>,
+    thread_count: usize,
+    files_per_thread: usize,
+) {
+    let barrier = Arc::new(Barrier::new(thread_count));
+    let mut handles = Vec::new();
+
+    for thread_id in 0..thread_count {
+        let fs = fs.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for index in 0..files_per_thread {
+                let base_path = format!("/stress/hot/t{:02}-{:04}.log", thread_id, index);
+                let final_path = if index % 2 == 0 {
+                    let renamed_path = format!("/stress/hot/t{:02}-{:04}.done", thread_id, index);
+                    fs.create(&base_path, false).unwrap();
+                    fs.rename(&base_path, &renamed_path, RenameFlags::empty())
+                        .unwrap();
+                    renamed_path
+                } else {
+                    fs.create(&base_path, false).unwrap();
+                    base_path
+                };
+
+                if index % 5 == 0 {
+                    fs.delete(&final_path, false).unwrap();
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    for thread_id in 0..thread_count {
+        for index in 0..files_per_thread {
+            let base_path = format!("/stress/hot/t{:02}-{:04}.log", thread_id, index);
+            let final_path = if index % 2 == 0 {
+                format!("/stress/hot/t{:02}-{:04}.done", thread_id, index)
+            } else {
+                base_path.clone()
+            };
+
+            assert_eq!(
+                fs.exists(&final_path).unwrap(),
+                index % 5 != 0,
+                "unexpected final path state for {}",
+                final_path
+            );
+            if index % 2 == 0 {
+                assert!(
+                    !fs.exists(&base_path).unwrap(),
+                    "renamed source path must not remain: {}",
+                    base_path
+                );
+            }
+        }
+    }
+
+    let kept_files = fs.list_status("/stress/hot").unwrap();
+    assert_eq!(
+        kept_files.len(),
+        thread_count * files_per_thread - thread_count * files_per_thread.div_ceil(5)
+    );
+}
+
+fn run_parent_recreate_create_pressure(
+    fs: Arc<MasterFilesystem>,
+    creator_count: usize,
+    files_per_creator: usize,
+    archive_count: usize,
+) {
+    let barrier = Arc::new(Barrier::new(creator_count + 1));
+    let mut handles = Vec::new();
+
+    for creator_id in 0..creator_count {
+        let fs = fs.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for index in 0..files_per_creator {
+                let path = format!("/volatile/hot/c{:02}-{:04}.log", creator_id, index);
+                fs.create(path, true).unwrap();
+            }
+        }));
+    }
+
+    let fs_for_rename = fs.clone();
+    let barrier_for_rename = barrier.clone();
+    handles.push(thread::spawn(move || {
+        barrier_for_rename.wait();
+        for index in 0..archive_count {
+            let archive_path = format!("/volatile/archive-{:04}", index);
+            fs_for_rename
+                .rename("/volatile/hot", &archive_path, RenameFlags::empty())
+                .unwrap();
+            fs_for_rename.mkdir("/volatile/hot", true).unwrap();
+        }
+    }));
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert!(fs.exists("/volatile/hot").unwrap());
+    for index in 0..archive_count {
+        assert!(
+            fs.exists(format!("/volatile/archive-{:04}", index))
+                .unwrap(),
+            "archive dir missing after parent churn: {}",
+            index
+        );
+    }
+
+    let files = fs.list_status("/volatile/*/*.log").unwrap();
+    assert_eq!(files.len(), creator_count * files_per_creator + 1);
 }
 
 #[test]
@@ -256,6 +496,79 @@ fn disjoint_namespace_writes_preserve_mem_store_consistency() {
     }
 
     assert_mem_store_consistent(&fs);
+}
+
+#[test]
+fn concurrent_same_parent_metadata_mutations_preserve_consistency() {
+    let (fs, _js) = new_fs("same-parent-metadata-stress");
+    fs.mkdir("/stress/hot", true).unwrap();
+
+    let fs = Arc::new(fs);
+    let thread_count = 16usize;
+    let files_per_thread = 160usize;
+    run_same_parent_metadata_mutation_stress(fs.clone(), thread_count, files_per_thread);
+    assert_mem_store_consistent(&fs);
+}
+
+#[test]
+fn concurrent_same_parent_metadata_mutations_replay_from_journal() {
+    let (leader_fs, leader_js, loader, _follower_js, follower_fs) =
+        new_journal_pair("same-parent-journal-stress");
+    leader_fs.mkdir("/stress/hot", true).unwrap();
+
+    let leader_fs = Arc::new(leader_fs);
+    let thread_count = 12usize;
+    let files_per_thread = 120usize;
+    run_same_parent_metadata_mutation_stress(leader_fs.clone(), thread_count, files_per_thread);
+
+    let expected_entries = 2 + thread_count
+        * (files_per_thread + files_per_thread.div_ceil(2) + files_per_thread.div_ceil(5));
+    assert_journal_replay_matches(
+        &leader_fs,
+        &leader_js,
+        &loader,
+        &follower_fs,
+        expected_entries,
+    );
+}
+
+#[test]
+fn concurrent_parent_recreate_create_pressure_preserves_consistency() {
+    let (fs, _js) = new_fs("parent-recreate-create-stress");
+    fs.mkdir("/volatile/hot", true).unwrap();
+    fs.create("/volatile/hot/warmup.log", false).unwrap();
+
+    let fs = Arc::new(fs);
+    run_parent_recreate_create_pressure(fs.clone(), 8, 160, 48);
+    assert_mem_store_consistent(&fs);
+}
+
+#[test]
+fn concurrent_parent_recreate_create_pressure_replay_from_journal() {
+    let (leader_fs, leader_js, loader, _follower_js, follower_fs) =
+        new_journal_pair("parent-recreate-journal-stress");
+    leader_fs.mkdir("/volatile/hot", true).unwrap();
+    leader_fs.create("/volatile/hot/warmup.log", false).unwrap();
+
+    let leader_fs = Arc::new(leader_fs);
+    let creator_count = 6usize;
+    let files_per_creator = 120usize;
+    let archive_count = 36usize;
+    run_parent_recreate_create_pressure(
+        leader_fs.clone(),
+        creator_count,
+        files_per_creator,
+        archive_count,
+    );
+
+    let expected_entries = 3 + creator_count * files_per_creator + archive_count * 2;
+    assert_journal_replay_matches(
+        &leader_fs,
+        &leader_js,
+        &loader,
+        &follower_fs,
+        expected_entries,
+    );
 }
 
 #[test]

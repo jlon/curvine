@@ -14,7 +14,6 @@
 
 use super::object_lock_pool::ObjectLockPool;
 use parking_lot::{ArcRwLockReadGuard, ArcRwLockWriteGuard};
-use std::collections::BTreeMap;
 
 #[cfg(debug_assertions)]
 use std::collections::BTreeSet;
@@ -98,6 +97,10 @@ impl InodeLockManager {
 
     pub fn lock_many<'a>(&'a self, requests: &[InodeLockRequest]) -> InodeLockSet<'a> {
         let normalized = Self::normalize_requests(requests);
+        if normalized.len() == 1 {
+            return self.lock_normalized_one(normalized[0]);
+        }
+
         let inode_ids = normalized
             .iter()
             .map(|request| request.inode_id)
@@ -121,50 +124,127 @@ impl InodeLockManager {
         mark_locks_held(&inode_ids);
 
         InodeLockSet {
-            manager: self,
-            guards,
-            inode_ids,
-            held_locks: normalized,
+            _marker: std::marker::PhantomData,
+            inner: InodeLockSetInner::Many {
+                guards,
+                inode_ids,
+                held_locks: normalized,
+            },
+        }
+    }
+
+    fn lock_normalized_one<'a>(&'a self, request: NormalizedInodeLock) -> InodeLockSet<'a> {
+        assert_no_reentrant_lock(request.inode_id);
+        let guard = self.lock_one_guard(request);
+        mark_lock_held(request.inode_id);
+        InodeLockSet {
+            _marker: std::marker::PhantomData,
+            inner: InodeLockSetInner::One {
+                guard: Some(guard),
+                held_lock: request,
+            },
+        }
+    }
+
+    fn lock_one_guard(&self, request: NormalizedInodeLock) -> InodeGuard {
+        let lock = self.locks.get_or_create_lock(inode_key(request.inode_id));
+        match request.mode {
+            InodeLockMode::Read => InodeGuard::Read {
+                _guard: lock.read_arc(),
+            },
+            InodeLockMode::Write => InodeGuard::Write {
+                _guard: lock.write_arc(),
+            },
         }
     }
 
     fn normalize_requests(requests: &[InodeLockRequest]) -> Vec<NormalizedInodeLock> {
-        let mut by_inode = BTreeMap::new();
-        for request in requests {
-            by_inode
-                .entry(request.inode_id)
-                .and_modify(|existing: &mut NormalizedInodeLock| {
-                    existing.depth = existing.depth.min(request.depth);
-                    existing.mode = existing.mode.merge(request.mode);
-                })
-                .or_insert(NormalizedInodeLock {
-                    depth: request.depth,
-                    inode_id: request.inode_id,
-                    mode: request.mode,
-                });
+        if requests.is_empty() {
+            return Vec::new();
         }
 
-        let mut normalized = by_inode.into_values().collect::<Vec<_>>();
+        let mut normalized = requests
+            .iter()
+            .map(|request| NormalizedInodeLock {
+                depth: request.depth,
+                inode_id: request.inode_id,
+                mode: request.mode,
+            })
+            .collect::<Vec<_>>();
         normalized.sort_by_key(|request| request.inode_id);
+
+        let mut write_index = 0;
+        for read_index in 1..normalized.len() {
+            if normalized[read_index].inode_id == normalized[write_index].inode_id {
+                normalized[write_index].depth = normalized[write_index]
+                    .depth
+                    .min(normalized[read_index].depth);
+                normalized[write_index].mode = normalized[write_index]
+                    .mode
+                    .merge(normalized[read_index].mode);
+            } else {
+                write_index += 1;
+                if write_index != read_index {
+                    normalized[write_index] = normalized[read_index];
+                }
+            }
+        }
+        normalized.truncate(write_index + 1);
         normalized
     }
 }
 
 pub struct InodeLockSet<'a> {
-    manager: &'a InodeLockManager,
-    guards: Vec<InodeGuard>,
-    inode_ids: Vec<i64>,
-    held_locks: Vec<NormalizedInodeLock>,
+    _marker: std::marker::PhantomData<&'a InodeLockManager>,
+    inner: InodeLockSetInner,
+}
+
+enum InodeLockSetInner {
+    One {
+        guard: Option<InodeGuard>,
+        held_lock: NormalizedInodeLock,
+    },
+    Many {
+        guards: Vec<InodeGuard>,
+        inode_ids: Vec<i64>,
+        held_locks: Vec<NormalizedInodeLock>,
+    },
 }
 
 impl InodeLockSet<'_> {
-    pub fn covers_requests(&self, requests: &[InodeLockRequest]) -> bool {
-        let required = InodeLockManager::normalize_requests(requests);
-        required.into_iter().all(|required| {
-            self.held_locks
-                .iter()
-                .any(|held| held.inode_id == required.inode_id && held.mode.covers(required.mode))
+    pub fn covers_request(&self, request: InodeLockRequest) -> bool {
+        self.covers_normalized(NormalizedInodeLock {
+            depth: request.depth,
+            inode_id: request.inode_id,
+            mode: request.mode,
         })
+    }
+
+    pub fn covers_requests(&self, requests: &[InodeLockRequest]) -> bool {
+        if requests.len() == 1 {
+            let required = NormalizedInodeLock {
+                depth: requests[0].depth,
+                inode_id: requests[0].inode_id,
+                mode: requests[0].mode,
+            };
+            return self.covers_normalized(required);
+        }
+
+        let required = InodeLockManager::normalize_requests(requests);
+        required
+            .into_iter()
+            .all(|required| self.covers_normalized(required))
+    }
+
+    fn covers_normalized(&self, required: NormalizedInodeLock) -> bool {
+        match &self.inner {
+            InodeLockSetInner::One { held_lock, .. } => {
+                held_lock.inode_id == required.inode_id && held_lock.mode.covers(required.mode)
+            }
+            InodeLockSetInner::Many { held_locks, .. } => held_locks
+                .iter()
+                .any(|held| held.inode_id == required.inode_id && held.mode.covers(required.mode)),
+        }
     }
 }
 
@@ -179,20 +259,39 @@ enum InodeGuard {
 
 impl Drop for InodeLockSet<'_> {
     fn drop(&mut self) {
-        self.guards.clear();
-        mark_locks_released(&self.inode_ids);
-        let keys = self
-            .inode_ids
-            .iter()
-            .map(|inode_id| inode_key(*inode_id))
-            .collect::<Vec<_>>();
-        self.manager.locks.cleanup_locks(&keys);
+        match &mut self.inner {
+            InodeLockSetInner::One { guard, held_lock } => {
+                guard.take();
+                mark_lock_released(held_lock.inode_id);
+            }
+            InodeLockSetInner::Many {
+                guards, inode_ids, ..
+            } => {
+                guards.clear();
+                mark_locks_released(inode_ids);
+            }
+        }
     }
 }
 
 fn inode_key(inode_id: i64) -> u64 {
     inode_id as u64
 }
+
+#[cfg(debug_assertions)]
+fn assert_no_reentrant_lock(inode_id: i64) {
+    HELD_INODE_LOCKS.with(|held| {
+        let held = held.borrow();
+        assert!(
+            !held.contains(&inode_id),
+            "reentrant inode lock on inode {}",
+            inode_id
+        );
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn assert_no_reentrant_lock(_inode_id: i64) {}
 
 #[cfg(debug_assertions)]
 fn assert_no_reentrant_locks(inode_ids: &[i64]) {
@@ -212,6 +311,16 @@ fn assert_no_reentrant_locks(inode_ids: &[i64]) {
 fn assert_no_reentrant_locks(_inode_ids: &[i64]) {}
 
 #[cfg(debug_assertions)]
+fn mark_lock_held(inode_id: i64) {
+    HELD_INODE_LOCKS.with(|held| {
+        held.borrow_mut().insert(inode_id);
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn mark_lock_held(_inode_id: i64) {}
+
+#[cfg(debug_assertions)]
 fn mark_locks_held(inode_ids: &[i64]) {
     HELD_INODE_LOCKS.with(|held| {
         let mut held = held.borrow_mut();
@@ -223,6 +332,16 @@ fn mark_locks_held(inode_ids: &[i64]) {
 
 #[cfg(not(debug_assertions))]
 fn mark_locks_held(_inode_ids: &[i64]) {}
+
+#[cfg(debug_assertions)]
+fn mark_lock_released(inode_id: i64) {
+    HELD_INODE_LOCKS.with(|held| {
+        held.borrow_mut().remove(&inode_id);
+    });
+}
+
+#[cfg(not(debug_assertions))]
+fn mark_lock_released(_inode_id: i64) {}
 
 #[cfg(debug_assertions)]
 fn mark_locks_released(inode_ids: &[i64]) {

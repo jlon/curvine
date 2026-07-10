@@ -45,15 +45,32 @@ impl ObjectLockPool {
 
     pub(in crate::master::meta) fn get_or_create_lock(&self, key: u64) -> ObjectLock {
         let shard_index = self.shard_index(key);
+        {
+            let shard = self.shards[shard_index].read();
+            if let Some(lock) = shard.locks.get(&key) {
+                return lock.clone();
+            }
+        }
+
         let mut shard = self.shards[shard_index].write();
-        shard
+        let lock = shard
             .locks
             .entry(key)
             .or_insert_with(|| Arc::new(RwLock::new(())))
-            .clone()
+            .clone();
+
+        if shard.locks.len() > self.max_idle_locks_per_shard {
+            Self::cleanup_shard(&mut shard, self.max_idle_locks_per_shard);
+        }
+
+        lock
     }
 
     pub(in crate::master::meta) fn cleanup_locks(&self, keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+
         let mut shard_indexes = keys
             .iter()
             .map(|key| self.shard_index(*key))
@@ -62,35 +79,42 @@ impl ObjectLockPool {
         shard_indexes.dedup();
 
         for shard_index in shard_indexes {
+            {
+                let shard = self.shards[shard_index].read();
+                if shard.locks.len() <= self.max_idle_locks_per_shard {
+                    continue;
+                }
+            }
             let mut shard = self.shards[shard_index].write();
-            if shard.locks.len() <= self.max_idle_locks_per_shard {
-                continue;
-            }
-
-            let remove_count = shard
-                .locks
-                .len()
-                .saturating_sub(self.max_idle_locks_per_shard);
-            let removable = shard
-                .locks
-                .iter()
-                .filter_map(|(key, lock)| {
-                    if Arc::strong_count(lock) == 1 {
-                        Some(*key)
-                    } else {
-                        None
-                    }
-                })
-                .take(remove_count)
-                .collect::<Vec<_>>();
-
-            for key in removable {
-                shard.locks.remove(&key);
-            }
+            Self::cleanup_shard(&mut shard, self.max_idle_locks_per_shard);
         }
     }
 
     fn shard_index(&self, key: u64) -> usize {
         key as usize % self.shards.len()
+    }
+
+    fn cleanup_shard(shard: &mut ObjectLockShard, max_idle_locks: usize) {
+        if shard.locks.len() <= max_idle_locks {
+            return;
+        }
+
+        let remove_count = shard.locks.len().saturating_sub(max_idle_locks);
+        let removable = shard
+            .locks
+            .iter()
+            .filter_map(|(key, lock)| {
+                if Arc::strong_count(lock) == 1 {
+                    Some(*key)
+                } else {
+                    None
+                }
+            })
+            .take(remove_count)
+            .collect::<Vec<_>>();
+
+        for key in removable {
+            shard.locks.remove(&key);
+        }
     }
 }

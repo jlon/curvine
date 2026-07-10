@@ -67,7 +67,7 @@ impl NamespaceCommitGate {
         let mut state = self.state.lock().expect("namespace commit gate poisoned");
         assert!(
             state.in_flight > 0,
-            "namespace commit gate leave without matching enter"
+            "namespace commit gate in-flight underflow"
         );
         state.in_flight -= 1;
         if state.in_flight == 0 {
@@ -75,12 +75,9 @@ impl NamespaceCommitGate {
         }
     }
 
-    fn open(&self) {
+    fn open_one(&self) {
         let mut state = self.state.lock().expect("namespace commit gate poisoned");
-        assert!(
-            state.closed > 0,
-            "namespace commit gate open without matching close"
-        );
+        assert!(state.closed > 0, "namespace commit gate close underflow");
         state.closed -= 1;
         if state.closed == 0 {
             state.open = true;
@@ -111,6 +108,6 @@ pub struct NamespaceCommitBarrier<'a> {
 
 impl Drop for NamespaceCommitBarrier<'_> {
     fn drop(&mut self) {
-        self.gate.open();
+        self.gate.open_one();
     }
 }

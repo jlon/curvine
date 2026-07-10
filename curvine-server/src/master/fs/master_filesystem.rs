@@ -41,6 +41,7 @@ use orpc::common::{LocalTime, Utils};
 use orpc::sync::{ArcRwLock, AtomicCounter};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -77,6 +78,12 @@ const FULL_BLOCK_REPORT_TTL_MS: u64 = 60 * 60 * 1000;
 const MAX_FULL_BLOCK_REPORT_BLOCKS: u64 = 100_000_000;
 const FULL_BLOCK_RECONCILE_BATCH_SIZE: usize = 4096;
 const NAMESPACE_LOCK_RETRY_LIMIT: usize = 128;
+const CREATE_PARENT_LOCK_CACHE_LIMIT: usize = 256;
+
+thread_local! {
+    static CREATE_PARENT_LOCK_CACHE: RefCell<HashMap<String, Vec<InodeLockRequest>>> =
+        RefCell::new(HashMap::new());
+}
 
 impl MasterFilesystem {
     pub fn new(
@@ -212,42 +219,76 @@ impl MasterFilesystem {
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
         self.run_namespace_write(|| {
-            let _inode_locks = self.lock_path_for_write(path, InodeLockMode::Write, true)?;
-            let _journal_scope = self
-                .reserve_journal_scope(self.estimate_create_entries(path, opts.create_parent)?)?;
-            let fs_dir = self.fs_dir.read();
-            let inp = Self::resolve_path(&fs_dir, path)?;
-
-            // Creation of root directory is not allowed
-            if inp.is_root() {
-                return err_box!("Not allowed to create existing root path: {}", inp.path());
-            }
-
-            if inp.is_full() {
-                if opts.create_parent {
-                    if let Some(last_inode) = inp.get_last_inode() {
-                        if last_inode.is_dir() {
-                            let status = last_inode.to_file_status(inp.path())?;
-                            return Ok(status);
+            for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
+                let (inode_locks, parent_cache_key, used_cached_locks) =
+                    self.lock_create_path_for_write(path, InodeLockMode::Write, true)?;
+                let fs_dir = self.fs_dir.read();
+                let inp = Self::resolve_path(&fs_dir, path)?;
+                if !Self::create_inode_locks_cover(&inode_locks, &inp, InodeLockMode::Write, true) {
+                    if used_cached_locks {
+                        if let Some(parent_path) = &parent_cache_key {
+                            Self::remove_create_parent_lock_cache(parent_path);
                         }
                     }
+                    drop(fs_dir);
+                    drop(inode_locks);
+                    Self::retry_namespace_lock(path, attempt)?;
+                    continue;
                 }
-                return err_ext!(FsError::file_exists(inp.path()));
+
+                if !used_cached_locks && Self::path_has_existing_parent_only(&inp) {
+                    if let Some(parent_path) = &parent_cache_key {
+                        let requests = Self::create_inode_lock_requests_from_memory(
+                            &inp,
+                            InodeLockMode::Write,
+                            true,
+                        );
+                        Self::put_create_parent_lock_cache(parent_path, requests);
+                    }
+                }
+
+                let _inode_locks = inode_locks;
+                let _journal_scope = self.reserve_journal_scope(
+                    Self::create_entries_for_resolved_path(&inp, opts.create_parent),
+                )?;
+
+                // Creation of root directory is not allowed
+                if inp.is_root() {
+                    return err_box!("Not allowed to create existing root path: {}", inp.path());
+                }
+
+                if inp.is_full() {
+                    if opts.create_parent {
+                        if let Some(last_inode) = inp.get_last_inode() {
+                            if last_inode.is_dir() {
+                                let status = last_inode.to_file_status(inp.path())?;
+                                return Ok(status);
+                            }
+                        }
+                    }
+                    return err_ext!(FsError::file_exists(inp.path()));
+                }
+
+                // Check whether the directory can be created recursively.
+                if !opts.create_parent {
+                    Self::check_parent(&inp)?;
+                }
+
+                let inp = fs_dir.mkdir(inp, opts)?;
+                let last = try_option!(
+                    inp.get_last_inode(),
+                    "Path {} has no inode after mkdir",
+                    inp.path()
+                );
+                let status = last.to_file_status(inp.path())?;
+                return Ok(status);
             }
 
-            // Check whether the directory can be created recursively.
-            if !opts.create_parent {
-                Self::check_parent(&inp)?;
-            }
-
-            let inp = fs_dir.mkdir(inp, opts)?;
-            let last = try_option!(
-                inp.get_last_inode(),
-                "Path {} has no inode after mkdir",
-                inp.path()
-            );
-            let status = last.to_file_status(inp.path())?;
-            Ok(status)
+            err_box!(
+                "namespace path {} changed while acquiring mkdir locks after {} retries",
+                path,
+                NAMESPACE_LOCK_RETRY_LIMIT
+            )
         })
     }
 
@@ -388,20 +429,38 @@ impl MasterFilesystem {
                 );
             }
 
-            let _inode_locks = self.lock_path_for_write(path, InodeLockMode::Write, true)?;
-            let _journal_scope = self
-                .reserve_journal_scope(self.estimate_create_entries(path, opts.create_parent)?)?;
-            let overwrite_block_ids = if flags.overwrite() {
-                let store = self.rocks_store()?;
-                let block_ids = StorePathResolver::new(&store).collect_block_ids(path, false)?;
-                block_ids
-            } else {
-                Vec::new()
-            };
-            let _block_locks = self.block_location_locks.write_blocks(&overwrite_block_ids);
-            let (status, clean_result) = {
+            for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
+                let (inode_locks, parent_cache_key, used_cached_locks) =
+                    self.lock_create_path_for_write(path, InodeLockMode::Write, true)?;
                 let fs_dir = self.fs_dir.read();
                 let inp = Self::resolve_path(&fs_dir, path)?;
+                if !Self::create_inode_locks_cover(&inode_locks, &inp, InodeLockMode::Write, true) {
+                    if used_cached_locks {
+                        if let Some(parent_path) = &parent_cache_key {
+                            Self::remove_create_parent_lock_cache(parent_path);
+                        }
+                    }
+                    drop(fs_dir);
+                    drop(inode_locks);
+                    Self::retry_namespace_lock(path, attempt)?;
+                    continue;
+                }
+
+                if !used_cached_locks && Self::path_has_existing_parent_only(&inp) {
+                    if let Some(parent_path) = &parent_cache_key {
+                        let requests = Self::create_inode_lock_requests_from_memory(
+                            &inp,
+                            InodeLockMode::Write,
+                            true,
+                        );
+                        Self::put_create_parent_lock_cache(parent_path, requests);
+                    }
+                }
+
+                let _inode_locks = inode_locks;
+                let _journal_scope = self.reserve_journal_scope(
+                    Self::create_entries_for_resolved_path(&inp, opts.create_parent),
+                )?;
 
                 let last_inode = inp.get_last_inode();
                 if let Some(inode) = &last_inode {
@@ -414,33 +473,41 @@ impl MasterFilesystem {
                     }
                 }
 
+                let clean_result;
                 if !opts.create_parent {
                     Self::check_parent(&inp)?;
                 }
 
-                let mut clean_result = None;
-                let inp = if last_inode.is_some() {
+                let inp = if let Some(existing_inode) = &last_inode {
                     if flags.overwrite() {
+                        let overwrite_block_ids = existing_inode.as_file_ref()?.block_ids();
+                        let _block_locks =
+                            self.block_location_locks.write_blocks(&overwrite_block_ids);
                         clean_result = Some(self.truncate(&fs_dir, &inp, opts)?);
                     } else {
                         return err_ext!(FsError::file_exists(inp.path()));
                     }
                     inp
                 } else {
+                    clean_result = None;
                     fs_dir.create_file(inp, opts)?
                 };
 
                 let status = fs_dir.file_status(&inp)?;
-                (status, clean_result)
-            };
-
-            if let Some(clean_result) = clean_result {
-                if !clean_result.blocks.is_empty() {
-                    self.worker_manager.write().remove_blocks(&clean_result);
+                if let Some(clean_result) = clean_result {
+                    if !clean_result.blocks.is_empty() {
+                        self.worker_manager.write().remove_blocks(&clean_result);
+                    }
                 }
+
+                return Ok(status);
             }
 
-            Ok(status)
+            err_box!(
+                "namespace path {} changed while acquiring create locks after {} retries",
+                path,
+                NAMESPACE_LOCK_RETRY_LIMIT
+            )
         })
     }
 
@@ -604,12 +671,12 @@ impl MasterFilesystem {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
-    fn lock_path_for_write<'a>(
-        &'a self,
+    fn lock_path_for_write(
+        &self,
         path: &str,
         target_mode: InodeLockMode,
         parent_write: bool,
-    ) -> CommonResult<InodeLockSet<'a>> {
+    ) -> CommonResult<InodeLockSet<'_>> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -636,11 +703,95 @@ impl MasterFilesystem {
         )
     }
 
-    fn lock_path_and_inode_for_write<'a>(
-        &'a self,
+    fn lock_path_for_write_unchecked(
+        &self,
+        path: &str,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> CommonResult<InodeLockSet<'_>> {
+        let store = self.rocks_store()?;
+        let resolved = StorePathResolver::new(&store).resolve(path)?;
+        let requests =
+            Self::create_inode_lock_requests_from_store(&resolved, target_mode, parent_write);
+        Ok(self.inode_locks.lock_many(&requests))
+    }
+
+    fn lock_create_path_for_write(
+        &self,
+        path: &str,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> CommonResult<(InodeLockSet<'_>, Option<String>, bool)> {
+        let parent_cache_key = if parent_write {
+            Self::parent_path_for_create_cache(path)
+        } else {
+            None
+        };
+
+        if let Some(parent_path) = &parent_cache_key {
+            if let Some(requests) = Self::get_create_parent_lock_cache(parent_path) {
+                return Ok((
+                    self.inode_locks.lock_many(&requests),
+                    parent_cache_key,
+                    true,
+                ));
+            }
+        }
+
+        Ok((
+            self.lock_path_for_write_unchecked(path, target_mode, parent_write)?,
+            parent_cache_key,
+            false,
+        ))
+    }
+
+    fn parent_path_for_create_cache(path: &str) -> Option<String> {
+        let path = path.trim_end_matches(PATH_SEPARATOR);
+        if path.is_empty() || path == PATH_SEPARATOR {
+            return None;
+        }
+
+        let split = path.rfind(PATH_SEPARATOR)?;
+        if split == 0 {
+            Some(PATH_SEPARATOR.to_string())
+        } else {
+            Some(path[..split].to_string())
+        }
+    }
+
+    fn get_create_parent_lock_cache(parent_path: &str) -> Option<Vec<InodeLockRequest>> {
+        CREATE_PARENT_LOCK_CACHE.with(|cache| cache.borrow().get(parent_path).cloned())
+    }
+
+    fn put_create_parent_lock_cache(parent_path: &str, requests: Vec<InodeLockRequest>) {
+        CREATE_PARENT_LOCK_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= CREATE_PARENT_LOCK_CACHE_LIMIT && !cache.contains_key(parent_path) {
+                cache.clear();
+            }
+            cache.insert(parent_path.to_string(), requests);
+        });
+    }
+
+    fn remove_create_parent_lock_cache(parent_path: &str) {
+        CREATE_PARENT_LOCK_CACHE.with(|cache| {
+            cache.borrow_mut().remove(parent_path);
+        });
+    }
+
+    fn create_inode_lock_requests_from_store(
+        path: &StoreResolvedPath,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> Vec<InodeLockRequest> {
+        Self::store_inode_lock_requests(path, target_mode, parent_write)
+    }
+
+    fn lock_path_and_inode_for_write(
+        &self,
         path: &str,
         inode_id: Option<i64>,
-    ) -> CommonResult<InodeLockSet<'a>> {
+    ) -> CommonResult<InodeLockSet<'_>> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -678,11 +829,11 @@ impl MasterFilesystem {
         requests
     }
 
-    fn lock_delete_path<'a>(
-        &'a self,
+    fn lock_delete_path(
+        &self,
         path: &str,
         recursive: bool,
-    ) -> CommonResult<(InodeLockSet<'a>, Vec<i64>)> {
+    ) -> CommonResult<(InodeLockSet<'_>, Vec<i64>)> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -733,11 +884,11 @@ impl MasterFilesystem {
         requests
     }
 
-    fn lock_free_path<'a>(
-        &'a self,
+    fn lock_free_path(
+        &self,
         path: &str,
         recursive: bool,
-    ) -> CommonResult<(InodeLockSet<'a>, Vec<i64>)> {
+    ) -> CommonResult<(InodeLockSet<'_>, Vec<i64>)> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -791,12 +942,12 @@ impl MasterFilesystem {
         requests
     }
 
-    fn lock_rename_paths<'a>(
-        &'a self,
+    fn lock_rename_paths(
+        &self,
         src: &str,
         dst: &str,
         flags: RenameFlags,
-    ) -> FsResult<(InodeLockSet<'a>, Vec<i64>)> {
+    ) -> FsResult<(InodeLockSet<'_>, Vec<i64>)> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -898,11 +1049,7 @@ impl MasterFilesystem {
         requests
     }
 
-    fn lock_set_attr_path<'a>(
-        &'a self,
-        path: &str,
-        recursive: bool,
-    ) -> CommonResult<InodeLockSet<'a>> {
+    fn lock_set_attr_path(&self, path: &str, recursive: bool) -> CommonResult<InodeLockSet<'_>> {
         for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
             let requests = {
                 let store = self.rocks_store()?;
@@ -980,6 +1127,80 @@ impl MasterFilesystem {
                 }
             })
             .collect()
+    }
+
+    fn inode_path_lock_requests(
+        path: &InodePath,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> Vec<InodeLockRequest> {
+        let last_index = path.inodes.len().saturating_sub(1);
+        let parent_index = if path.is_full() {
+            last_index.saturating_sub(1)
+        } else {
+            last_index
+        };
+
+        path.inodes
+            .iter()
+            .enumerate()
+            .map(|(index, inode)| {
+                let mode = if parent_write && index == parent_index {
+                    InodeLockMode::Write
+                } else if path.is_full() && index == last_index {
+                    target_mode
+                } else {
+                    InodeLockMode::Read
+                };
+                InodeLockRequest {
+                    depth: index,
+                    inode_id: inode.id(),
+                    mode,
+                }
+            })
+            .collect()
+    }
+
+    fn create_inode_lock_requests_from_memory(
+        path: &InodePath,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> Vec<InodeLockRequest> {
+        Self::inode_path_lock_requests(path, target_mode, parent_write)
+    }
+
+    fn create_inode_locks_cover(
+        locks: &InodeLockSet,
+        path: &InodePath,
+        target_mode: InodeLockMode,
+        parent_write: bool,
+    ) -> bool {
+        if let Some(request) =
+            Self::single_create_inode_lock_request(path, target_mode, parent_write)
+        {
+            return locks.covers_request(request);
+        }
+
+        let requests =
+            Self::create_inode_lock_requests_from_memory(path, target_mode, parent_write);
+        locks.covers_requests(&requests)
+    }
+
+    fn single_create_inode_lock_request(
+        path: &InodePath,
+        target_mode: InodeLockMode,
+        _parent_write: bool,
+    ) -> Option<InodeLockRequest> {
+        if path.inodes.len() == 1 && path.is_full() {
+            let inode = path.inodes.first()?;
+            return Some(InodeLockRequest {
+                depth: 0,
+                inode_id: inode.id(),
+                mode: target_mode,
+            });
+        }
+
+        None
     }
 
     fn retry_namespace_lock(path: &str, attempt: usize) -> CommonResult<()> {
@@ -1133,21 +1354,19 @@ impl MasterFilesystem {
         )
     }
 
-    fn estimate_create_entries(&self, path: &str, create_parent: bool) -> CommonResult<usize> {
-        let store = self.rocks_store()?;
-        let resolved = StorePathResolver::new(&store).resolve(path)?;
-        if resolved.is_full() {
-            return Ok(1);
+    fn create_entries_for_resolved_path(path: &InodePath, create_parent: bool) -> usize {
+        if path.is_full() || !create_parent {
+            return 1;
         }
-        if create_parent {
-            Ok(resolved
-                .components
-                .len()
-                .saturating_sub(resolved.inodes.len())
-                .max(1))
-        } else {
-            Ok(1)
-        }
+
+        path.components
+            .len()
+            .saturating_sub(path.inodes.len())
+            .max(1)
+    }
+
+    fn path_has_existing_parent_only(path: &InodePath) -> bool {
+        !path.is_full() && path.existing_len().saturating_add(1) == path.len()
     }
 
     fn estimate_link_entries(&self, path: &str) -> CommonResult<usize> {

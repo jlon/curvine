@@ -738,6 +738,10 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
         let object_path = self.get_dir_path(path)?;
 
+        if object_path == "/" {
+            return Ok(true);
+        }
+
         self.operator
             .create_dir(&object_path)
             .await

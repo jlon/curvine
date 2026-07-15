@@ -46,6 +46,7 @@ pub struct JobManager {
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
+    transfer_enabled: bool,
 }
 
 impl JobManager {
@@ -68,6 +69,7 @@ impl JobManager {
             job_max_files: conf.job.job_max_files,
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
+            transfer_enabled: conf.transfer.enabled,
         }
     }
 
@@ -164,10 +166,21 @@ impl JobManager {
         &self.rt
     }
 
+    fn reject_legacy_submit(&self) -> FsResult<()> {
+        if self.transfer_enabled {
+            return err_box!(
+                "Legacy Master SubmitJob is disabled because transfer.enabled=true; use curvine-transfer SubmitTransfer instead"
+            );
+        }
+        Ok(())
+    }
+
     /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
     /// submits for the same path while a load is running return the **existing** run’s
     /// result; the new command’s options are not applied (first submitter wins).
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.reject_legacy_submit()?;
+
         let source_path = Path::from_str(&command.source_path)?;
 
         // Check mount info for both UFS and CV paths. Public load jobs import
@@ -215,6 +228,8 @@ impl JobManager {
     }
 
     pub async fn submit_export_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        self.reject_legacy_submit()?;
+
         let source_path = Path::from_str(&command.source_path)?;
 
         let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {

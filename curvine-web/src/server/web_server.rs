@@ -22,10 +22,11 @@ use axum::Json;
 use log::{error, info};
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::{ServerConf, ServerMonitor, ServerStateListener};
+use orpc::server::{ServerConf, ServerMonitor, ServerShutdownHandle, ServerStateListener};
 use orpc::CommonResult;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower::ServiceBuilder;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -45,6 +46,8 @@ pub struct WebServer<S> {
     conf: ServerConf,
     address: InetAddr,
     monitor: ServerMonitor,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl<S> WebServer<S>
@@ -55,23 +58,29 @@ where
     pub fn new(conf: ServerConf, service: S) -> Self {
         let address = InetAddr::new(&conf.hostname, conf.port);
         let rt = Arc::new(conf.create_runtime());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             rt,
             service,
             conf,
             address,
             monitor: ServerMonitor::new(),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
     pub fn with_rt(rt: Arc<Runtime>, conf: ServerConf, service: S) -> Self {
         let address = InetAddr::new(&conf.hostname, conf.port);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             rt,
             service,
             conf,
             address,
             monitor: ServerMonitor::new(),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
@@ -111,6 +120,10 @@ where
             Self::start0(self).await;
         });
         listener
+    }
+
+    pub fn shutdown_handle(&self) -> ServerShutdownHandle {
+        ServerShutdownHandle::new(self.shutdown_tx.clone())
     }
 
     pub async fn wait_bind(
@@ -204,7 +217,12 @@ where
                         )
                     })),
             );
-        axum::serve(listener, app).await?;
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                wait_shutdown(&mut shutdown_rx).await;
+            })
+            .await?;
         Ok(())
     }
 
@@ -217,6 +235,17 @@ where
         );
         self.monitor.advance_running();
         self.serve_listener(listener).await
+    }
+}
+
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
     }
 }
 

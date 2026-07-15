@@ -33,8 +33,10 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
-use orpc::runtime::Runtime;
+use orpc::runtime::{GroupExecutor, Runtime};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -44,6 +46,11 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) heartbeat_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) block_report_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) control_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) list_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) get_block_locations_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
 }
@@ -57,6 +64,11 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
+        heartbeat_rpc_executor: Arc<GroupExecutor>,
+        block_report_rpc_executor: Arc<GroupExecutor>,
+        control_rpc_executor: Arc<GroupExecutor>,
+        list_rpc_executor: Arc<GroupExecutor>,
+        get_block_locations_rpc_executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
@@ -69,6 +81,11 @@ impl MasterHandler {
             conn_state,
             mount_manager,
             job_handler,
+            heartbeat_rpc_executor,
+            block_report_rpc_executor,
+            control_rpc_executor,
+            list_rpc_executor,
+            get_block_locations_rpc_executor,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
         }
@@ -472,6 +489,14 @@ impl MasterHandler {
             status,
             address,
             weight,
+            header.worker_session_id.unwrap_or_default(),
+            curvine_common::state::TransferWorkerCapabilities {
+                task_submit: header.transfer_task_submit.unwrap_or(false),
+                report_target: header.transfer_report_target.unwrap_or(false),
+                query_task: header.transfer_query_task.unwrap_or(false),
+                attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
+                source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
+            },
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         Ok(cmds)
@@ -729,6 +754,173 @@ impl MasterHandler {
                 .observe(used_us as f64);
         };
     }
+
+    async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> FsResult<T> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        executor.try_spawn(move || {
+            let res = panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| err_box!("master rpc lane task panicked"));
+            let _ = tx.send(res);
+        })?;
+        rx.await?
+    }
+
+    async fn async_get_block_locations(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetBlockLocationsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.to_string()), None);
+        let fs = self.fs.clone();
+        let blocks =
+            Self::run_master_rpc_task(self.get_block_locations_rpc_executor.clone(), move || {
+                Self::process_get_block_locations(fs, req.path)
+            })
+            .await?;
+        let rep_header = GetBlockLocationsResponse {
+            blocks: ProtoUtils::file_blocks_to_pb(blocks),
+        };
+        ctx.response(rep_header)
+    }
+
+    async fn async_get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetMasterInfoRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            Self::process_get_master_info(fs)
+        })
+        .await?;
+        let rep_header = ProtoUtils::master_info_to_pb(info);
+        ctx.response(rep_header)
+    }
+
+    async fn async_get_cv_metadata_snapshot_page(
+        &self,
+        ctx: &mut RpcContext<'_>,
+    ) -> FsResult<Message> {
+        let req: GetCvMetadataSnapshotPageRequest = ctx.parse_header()?;
+        ctx.set_audit(Some("cv-metadata-snapshot".to_string()), None);
+        let fs = self.fs.clone();
+        let rep_header = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            let page = fs.cv_metadata_snapshot_page(
+                req.page_token,
+                req.page_size.unwrap_or(10_000) as usize,
+            )?;
+            Ok(GetCvMetadataSnapshotPageResponse {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(|entry| CvMetadataSnapshotEntryProto {
+                        status: ProtoUtils::file_status_to_pb(entry.status),
+                        blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token,
+                epoch: page.epoch,
+            })
+        })
+        .await?;
+        ctx.response(rep_header)
+    }
+
+    async fn async_get_cv_metadata_delta_page(
+        &self,
+        ctx: &mut RpcContext<'_>,
+    ) -> FsResult<Message> {
+        let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
+        ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
+        let fs = self.fs.clone();
+        let rep_header = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            let page = fs.cv_metadata_delta_page(
+                req.from_epoch,
+                req.target_epoch,
+                req.page_token,
+                req.page_size.unwrap_or(10_000) as usize,
+            )?;
+            Ok(GetCvMetadataDeltaPageResponse {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(|entry| CvMetadataDeltaEntryProto {
+                        path: entry.path,
+                        entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
+                            status: ProtoUtils::file_status_to_pb(entry.status),
+                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                        }),
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token,
+                from_epoch: page.from_epoch,
+                to_epoch: page.to_epoch,
+                full_snapshot_required: page.full_snapshot_required,
+            })
+        })
+        .await?;
+        ctx.response(rep_header)
+    }
+
+    async fn async_list_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(self.list_rpc_executor.clone(), move || {
+            Self::process_list_status(fs, header.path)
+        })
+        .await?;
+        let statuses = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        ctx.response(ListStatusResponse { statuses })
+    }
+
+    async fn async_list_options(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListOptionsRequest = ctx.parse_header()?;
+        if header.options.limit.unwrap_or(0) < 0 {
+            return err_box!("list options limit must be greater than 0");
+        }
+        let opts = ProtoUtils::list_options_from_pb(header.options);
+        let audit_path = format!("{}[{}]", header.path, opts);
+        ctx.set_audit(Some(audit_path), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(self.list_rpc_executor.clone(), move || {
+            Self::process_list_options(fs, header.path, opts)
+        })
+        .await?;
+        let statuses = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        ctx.response(ListOptionsResponse { statuses })
+    }
+
+    async fn async_worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let cmds = Self::run_master_rpc_task(self.heartbeat_rpc_executor.clone(), move || {
+            Self::process_worker_heartbeat(fs, header)
+        })
+        .await?;
+        let rep_header = WorkerHeartbeatResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
+        ctx.response(rep_header)
+    }
+
+    async fn async_worker_block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: BlockReportListRequest = ctx.parse_header()?;
+        let fs = self.fs.clone();
+        let replication_handler = self.replication_handler.clone();
+        let cmds = Self::run_master_rpc_task(self.block_report_rpc_executor.clone(), move || {
+            Self::process_block_report(fs, replication_handler, header)
+        })
+        .await?;
+        let rep_header = BlockReportListResponse {
+            cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+        };
+        ctx.response(rep_header)
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -738,7 +930,18 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         !matches!(
             code,
-            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+            RpcCode::SubmitJob
+                | RpcCode::GetJobStatus
+                | RpcCode::CancelJob
+                | RpcCode::ReportTask
+                | RpcCode::GetBlockLocations
+                | RpcCode::GetMasterInfo
+                | RpcCode::GetCvMetadataSnapshotPage
+                | RpcCode::GetCvMetadataDeltaPage
+                | RpcCode::ListStatus
+                | RpcCode::ListOptions
+                | RpcCode::WorkerHeartbeat
+                | RpcCode::WorkerBlockReport
         )
     }
 
@@ -848,6 +1051,16 @@ impl MessageHandler for MasterHandler {
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
+                RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
+                RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
+                RpcCode::GetCvMetadataSnapshotPage => {
+                    self.async_get_cv_metadata_snapshot_page(ctx).await
+                }
+                RpcCode::GetCvMetadataDeltaPage => self.async_get_cv_metadata_delta_page(ctx).await,
+                RpcCode::ListStatus => self.async_list_status(ctx).await,
+                RpcCode::ListOptions => self.async_list_options(ctx).await,
+                RpcCode::WorkerHeartbeat => self.async_worker_heartbeat(ctx).await,
+                RpcCode::WorkerBlockReport => self.async_worker_block_report(ctx).await,
 
                 v => err_box!("unsupported operation {:?}", v),
             }

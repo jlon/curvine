@@ -158,7 +158,7 @@ impl MountTable {
     }
 
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
-        info!("add mount: {:?}", info);
+        info!("add mount: {:?}", redacted_mount_info(&info));
 
         let mut inner = self.write_inner()?;
         inner
@@ -320,4 +320,26 @@ impl MountTable {
         inner.mountpath2id.remove(&info.cv_path);
         Ok(())
     }
+}
+
+fn redacted_mount_info(info: &MountInfo) -> MountInfo {
+    let mut redacted = info.clone();
+    for (key, value) in &mut redacted.properties {
+        if is_sensitive_mount_property(key) {
+            *value = "******".to_string();
+        }
+    }
+    redacted
+}
+
+fn is_sensitive_mount_property(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("credential")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("access_key")
+        || key.ends_with(".access")
+        || key.ends_with(".ak")
+        || key.ends_with(".sk")
 }

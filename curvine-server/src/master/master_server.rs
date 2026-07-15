@@ -23,8 +23,8 @@ use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::{HandlerService, LimitConf};
 use orpc::io::net::ConnState;
-use orpc::runtime::{AsyncRuntime, RpcRuntime, Runtime};
-use orpc::server::{RpcServer, ServerStateListener};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
+use orpc::server::{RpcServer, ServerShutdownHandle, ServerStateListener};
 use orpc::{err_box, CommonError, CommonResult};
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
@@ -46,6 +46,11 @@ pub struct MasterService {
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     actor_rt: Arc<Runtime>,
+    heartbeat_rpc_executor: Arc<GroupExecutor>,
+    block_report_rpc_executor: Arc<GroupExecutor>,
+    control_rpc_executor: Arc<GroupExecutor>,
+    list_rpc_executor: Arc<GroupExecutor>,
+    get_block_locations_rpc_executor: Arc<GroupExecutor>,
     replication_manager: Arc<MasterReplicationManager>,
     limit: LimitConf,
     metrics: &'static MasterMetrics,
@@ -71,6 +76,22 @@ impl MasterService {
             conf.master.actor_threads,
         ));
         let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
+        let heartbeat_rpc_executor = Arc::new(GroupExecutor::new("master-heartbeat-rpc", 2, 1024));
+        let block_report_rpc_executor =
+            Arc::new(GroupExecutor::new("master-block-report-rpc", 2, 128));
+        let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
+        let read_lane_threads = conf.master.worker_threads.saturating_sub(4).max(1);
+        let read_lane_queue = conf.master.worker_threads.saturating_mul(2).max(1);
+        let list_rpc_executor = Arc::new(GroupExecutor::new(
+            "master-list-rpc",
+            read_lane_threads,
+            read_lane_queue,
+        ));
+        let get_block_locations_rpc_executor = Arc::new(GroupExecutor::new(
+            "master-get-block-locations-rpc",
+            read_lane_threads,
+            read_lane_queue,
+        ));
         Self {
             conf,
             fs,
@@ -79,6 +100,11 @@ impl MasterService {
             job_manager,
             rt,
             actor_rt,
+            heartbeat_rpc_executor,
+            block_report_rpc_executor,
+            control_rpc_executor,
+            list_rpc_executor,
+            get_block_locations_rpc_executor,
             replication_manager,
             limit,
             metrics,
@@ -118,6 +144,11 @@ impl HandlerService for MasterService {
             client_state,
             self.mount_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
+            self.heartbeat_rpc_executor.clone(),
+            self.block_report_rpc_executor.clone(),
+            self.control_rpc_executor.clone(),
+            self.list_rpc_executor.clone(),
+            self.get_block_locations_rpc_executor.clone(),
             self.replication_manager.clone(),
             self.actor_rt.clone(),
             self.metrics,
@@ -155,6 +186,19 @@ pub struct Master {
     mount_manager: Arc<MountManager>,
     job_manager: Arc<JobManager>,
     replication_manager: Arc<MasterReplicationManager>,
+}
+
+#[derive(Clone)]
+pub struct MasterShutdown {
+    rpc: ServerShutdownHandle,
+    web: ServerShutdownHandle,
+}
+
+impl MasterShutdown {
+    pub fn shutdown(&self) {
+        self.web.shutdown();
+        self.rpc.shutdown();
+    }
 }
 
 impl Master {
@@ -277,6 +321,18 @@ impl Master {
         };
         let mut status = rt.block_on(async { self.start().await })?;
         rt.block_on(async { status.wait_stop().await })
+    }
+
+    pub fn shutdown_handle(&self) -> CommonResult<MasterShutdown> {
+        let rpc = match self.rpc_server.as_ref() {
+            Some(server) => server.shutdown_handle(),
+            None => return err_box!("master rpc server is not initialized"),
+        };
+        let web = match self.web_server.as_ref() {
+            Some(server) => server.shutdown_handle(),
+            None => return err_box!("master web server is not initialized"),
+        };
+        Ok(MasterShutdown { rpc, web })
     }
 
     pub fn get_metrics<'a>() -> CommonResult<&'a MasterMetrics> {

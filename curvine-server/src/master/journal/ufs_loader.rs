@@ -20,7 +20,7 @@ use curvine_client::unified::MountValue;
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{JobTaskState, LoadJobCommand};
+use curvine_common::state::{is_transfer_temp_path, JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::DurationUnit;
@@ -138,6 +138,9 @@ impl UfsLoader {
         if !e.file.is_complete() || e.file.ufs_only() {
             return Ok(());
         }
+        if is_transfer_temp_path(&e.path) {
+            return Ok(());
+        }
 
         let path = Path::from_str(&e.path)?;
         if let Some((_, mnt)) = self.get_mnt(&path)? {
@@ -149,6 +152,10 @@ impl UfsLoader {
     }
 
     pub async fn rename(&self, e: &RenameEntry) -> CommonResult<()> {
+        if is_transfer_temp_path(&e.src) || is_transfer_temp_path(&e.dst) {
+            return Ok(());
+        }
+
         let src = Path::from_str(&e.src)?;
         let dst = Path::from_str(&e.dst)?;
         if let Some((src_ufs_path, mnt)) = self.get_mnt(&src)? {

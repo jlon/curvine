@@ -42,6 +42,8 @@ linked-hash-map = { workspace = true }
 dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
+mysql = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
@@ -51,6 +53,6 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 byteorder = { workspace = true }
-
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
+crossbeam = { workspace = true }

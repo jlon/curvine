@@ -23,6 +23,22 @@ use socket2::SockRef;
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+#[derive(Clone)]
+pub struct ServerShutdownHandle {
+    tx: watch::Sender<bool>,
+}
+
+impl ServerShutdownHandle {
+    pub fn new(tx: watch::Sender<bool>) -> Self {
+        Self { tx }
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(true);
+    }
+}
 
 pub struct RpcServer<S> {
     rt: Arc<Runtime>,
@@ -31,6 +47,8 @@ pub struct RpcServer<S> {
     addr: InetAddr,
     monitor: ServerMonitor,
     shutdown_hook: Mutex<Vec<Box<dyn FnOnce() + Send + Sync + 'static>>>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl<S> RpcServer<S>
@@ -44,6 +62,7 @@ where
         let addr = InetAddr::new(conf.hostname.clone(), conf.port);
         let rt = Arc::new(conf.create_runtime());
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         RpcServer {
             rt,
             service,
@@ -51,12 +70,15 @@ where
             addr,
             monitor: ServerMonitor::new(),
             shutdown_hook: Mutex::new(vec![]),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
     pub fn with_rt(rt: Arc<Runtime>, conf: ServerConf, service: S) -> Self {
         let addr = InetAddr::new(conf.hostname.clone(), conf.port);
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         RpcServer {
             rt,
             service,
@@ -64,6 +86,8 @@ where
             addr,
             monitor: ServerMonitor::new(),
             shutdown_hook: Mutex::new(vec![]),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 
@@ -88,6 +112,7 @@ where
     // Start server asynchronously
     async fn start0(&self) {
         let ctrl_c = tokio::signal::ctrl_c();
+        let mut shutdown_rx = self.shutdown_rx.clone();
 
         #[cfg(target_os = "linux")]
         {
@@ -109,6 +134,10 @@ where
                 _ = unix_sig.recv()  => {
                       info!("Received SIGTERM, shutting down {} gracefully...", self.conf.name);
                 }
+
+                _ = wait_shutdown(&mut shutdown_rx) => {
+                    info!("Received programmatic shutdown, shutting down {}", self.conf.name);
+                }
             }
         }
 
@@ -123,6 +152,10 @@ where
 
                 _ = ctrl_c => {
                     info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
+                }
+
+                _ = wait_shutdown(&mut shutdown_rx) => {
+                    info!("Received programmatic shutdown, shutting down {}", self.conf.name);
                 }
             }
         }
@@ -234,6 +267,10 @@ where
         state.push(Box::new(hook));
     }
 
+    pub fn shutdown_handle(&self) -> ServerShutdownHandle {
+        ServerShutdownHandle::new(self.shutdown_tx.clone())
+    }
+
     fn do_shutdown_hook(&self) {
         let mut state = self.shutdown_hook.lock().unwrap();
         let mut hooks = vec![];
@@ -252,5 +289,16 @@ where
     fn get_bind_addr(&self) -> String {
         let hostname = env::var(Self::ORPC_BIND_HOSTNAME).unwrap_or(self.addr.hostname.to_string());
         format!("{}:{}", hostname, self.addr.port)
+    }
+}
+
+async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
     }
 }

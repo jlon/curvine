@@ -24,6 +24,7 @@ use curvine_fault::FaultHttpControl;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
+use orpc::common::Utils;
 use orpc::common::{LocalTime, Logger};
 use orpc::error::StringError;
 use orpc::handler::HandlerService;
@@ -31,7 +32,7 @@ use orpc::io::net::ConnState;
 #[cfg(feature = "spdk")]
 use orpc::io::spdk_env::SpdkEnv;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::{RpcServer, ServerStateListener};
+use orpc::server::{RpcServer, ServerShutdownHandle, ServerStateListener};
 use orpc::sync::FastMutex;
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
@@ -52,12 +53,16 @@ pub struct WorkerService {
 }
 
 impl WorkerService {
-    pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
+    pub fn with_conf(
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+        worker_session_id: String,
+    ) -> CommonResult<Self> {
         let fault_http = FaultHttpControl::from_env(&conf.fault_injection)
             .map_err(|error| CommonError::from(error.to_string()))?;
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
-        let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
+        let task_manager = TaskManager::with_rt(rt.clone(), conf, worker_session_id)?;
 
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());
@@ -114,6 +119,19 @@ pub struct Worker {
     rpc_server: Option<RpcServer<WorkerService>>,
     web_server: Option<WebServer<WorkerService>>,
     block_actor: BlockActor,
+}
+
+#[derive(Clone)]
+pub struct WorkerShutdown {
+    rpc: ServerShutdownHandle,
+    web: ServerShutdownHandle,
+}
+
+impl WorkerShutdown {
+    pub fn shutdown(&self) {
+        self.web.shutdown();
+        self.rpc.shutdown();
+    }
 }
 
 impl Worker {
@@ -185,7 +203,9 @@ impl Worker {
         }
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
-        let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
+        let worker_session_id = Utils::uuid();
+        let service: WorkerService =
+            WorkerService::with_conf(&conf, rt.clone(), worker_session_id.clone())?;
         let worker_id = service.store.worker_id()?;
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
@@ -209,6 +229,7 @@ impl Worker {
             rt.clone(),
             &conf,
             addr.clone(),
+            worker_session_id,
             block_store.clone(),
             rpc_server.new_state_ctl(),
         )?;
@@ -284,6 +305,20 @@ impl Worker {
 
         let mut rpc_status = rt.block_on(async { self.start().await })?;
         rt.block_on(async { rpc_status.wait_stop().await })
+    }
+
+    pub fn shutdown_handle(&self) -> CommonResult<WorkerShutdown> {
+        let rpc = self
+            .rpc_server
+            .as_ref()
+            .ok_or_else(|| CommonError::from("worker rpc server is not initialized"))?
+            .shutdown_handle();
+        let web = self
+            .web_server
+            .as_ref()
+            .ok_or_else(|| CommonError::from("worker web server is not initialized"))?
+            .shutdown_handle();
+        Ok(WorkerShutdown { rpc, web })
     }
 
     // Start a standalone worker.

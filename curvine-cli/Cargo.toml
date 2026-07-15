@@ -17,3 +17,7 @@ chrono = { workspace = true }
 bytes = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false}
 comfy-table = { version = "7.2.2", default-features = false }
+
+[dev-dependencies]
+curvine-server = { workspace = true }
+toml = { workspace = true }

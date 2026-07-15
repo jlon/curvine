@@ -40,6 +40,7 @@ fn main() {
         "master.proto",
         "worker.proto",
         "job.proto",
+        "transfer.proto",
         "mount.proto",
         "replication.proto",
     ];

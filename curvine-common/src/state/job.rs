@@ -235,6 +235,19 @@ pub struct LoadTaskInfo {
     pub source_path: String,
     pub target_path: String,
     pub create_time: i64,
+    #[serde(default)]
+    pub source_read_plan_json: String,
+    #[serde(default)]
+    pub transfer_report: Option<TransferTaskReportInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferTaskReportInfo {
+    pub run_id: u64,
+    pub attempt_id: u64,
+    pub worker_id: u32,
+    pub worker_session_id: String,
+    pub report_target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -39,6 +39,9 @@ pub use self::ufs_conf::UfsConfBuilder;
 mod job_conf;
 pub use self::job_conf::JobConf;
 
+mod transfer_conf;
+pub use self::transfer_conf::*;
+
 mod cli_conf;
 pub use self::cli_conf::CliConf;
 

@@ -22,7 +22,7 @@ mod heartbeat_status;
 pub use self::heartbeat_status::HeartbeatStatus;
 
 mod worker_info;
-pub use self::worker_info::WorkerInfo;
+pub use self::worker_info::{TransferWorkerCapabilities, WorkerInfo};
 
 mod worker_node_tree;
 pub use self::worker_node_tree::WorkerNodeTree;
@@ -70,6 +70,9 @@ pub use self::opts::*;
 
 mod job;
 pub use self::job::*;
+
+mod transfer;
+pub use self::transfer::*;
 
 mod metrics;
 pub use self::metrics::*;

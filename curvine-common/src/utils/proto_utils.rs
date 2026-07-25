@@ -216,7 +216,10 @@ impl ProtoUtils {
         }
     }
 
-    pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
+    pub fn file_status_to_pb(mut status: FileStatus) -> FileStatusProto {
+        let has_ctime = status.x_attr.contains_key(INTERNAL_CTIME_XATTR);
+        let ctime = status.ctime();
+        status.x_attr.remove(INTERNAL_CTIME_XATTR);
         FileStatusProto {
             id: status.id,
             path: status.path,
@@ -238,10 +241,18 @@ impl ProtoUtils {
             mode: status.mode,
             target: status.target,
             nlink: status.nlink,
+            ctime: has_ctime.then_some(ctime),
         }
     }
 
     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
+        let mut x_attr = status.x_attr;
+        if let Some(ctime) = status.ctime {
+            x_attr.insert(
+                INTERNAL_CTIME_XATTR.to_string(),
+                ctime.to_le_bytes().to_vec(),
+            );
+        }
         FileStatus {
             id: status.id,
             path: status.path,
@@ -255,7 +266,7 @@ impl ProtoUtils {
             replicas: status.replicas,
             block_size: status.block_size,
             file_type: FileType::from(status.file_type),
-            x_attr: status.x_attr,
+            x_attr,
             storage_policy: Self::storage_policy_from_pb(status.storage_policy),
             owner: status.owner,
             group: status.group,
@@ -724,8 +735,9 @@ impl ProtoUtils {
 
 #[cfg(test)]
 mod tests {
-    use crate::state::{AccessMode, MountInfo, MountOptions};
+    use crate::state::{AccessMode, FileStatus, MountInfo, MountOptions, INTERNAL_CTIME_XATTR};
     use crate::utils::ProtoUtils;
+    use std::collections::HashMap;
 
     #[test]
     fn test_mount_info_proto_round_trip_auto_cache_and_access_mode() {
@@ -757,5 +769,40 @@ mod tests {
 
         assert_eq!(round_trip.auto_cache, Some(false));
         assert_eq!(round_trip.access_mode, Some(AccessMode::ReadWrite));
+    }
+
+    #[test]
+    fn file_status_proto_preserves_ctime_and_falls_back_for_legacy_peers() {
+        let status = FileStatus {
+            mtime: 1_000,
+            x_attr: HashMap::from([(
+                INTERNAL_CTIME_XATTR.to_string(),
+                2_000_i64.to_le_bytes().to_vec(),
+            )]),
+            ..Default::default()
+        };
+
+        let mut pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, Some(2_000));
+        assert!(!pb.x_attr.contains_key(INTERNAL_CTIME_XATTR));
+        assert_eq!(ProtoUtils::file_status_from_pb(pb.clone()).ctime(), 2_000);
+
+        pb.ctime = None;
+        assert_eq!(ProtoUtils::file_status_from_pb(pb).ctime(), 1_000);
+    }
+
+    #[test]
+    fn file_status_proto_keeps_legacy_ctime_optional() {
+        let status = FileStatus {
+            mtime: 1_000,
+            ..Default::default()
+        };
+
+        let pb = ProtoUtils::file_status_to_pb(status);
+        assert_eq!(pb.ctime, None);
+
+        let round_trip = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(round_trip.ctime(), 1_000);
+        assert!(!round_trip.x_attr.contains_key(INTERNAL_CTIME_XATTR));
     }
 }

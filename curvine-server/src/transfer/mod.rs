@@ -33,3 +33,6 @@ pub use self::planner::{PlannedTransfer, TransferPlanner};
 
 mod service;
 pub use self::service::TransferService;
+
+mod scheduler;
+pub use self::scheduler::TransferScheduler;

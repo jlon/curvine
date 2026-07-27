@@ -48,6 +48,7 @@ impl WorkerManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn heartbeat(
         &mut self,
         cluster_id: &str,

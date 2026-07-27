@@ -331,6 +331,7 @@ impl TransferTenantsCommand {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn list_transfer_pages(
     client: &TransferClient,
     kind: Option<TransferKind>,
@@ -796,7 +797,7 @@ fn format_timestamp(timestamp_ms: i64) -> String {
 }
 
 fn transfer_is_terminal(state: i32) -> bool {
-    matches!(state, 6 | 7 | 8 | 9)
+    matches!(state, 6..=9)
 }
 
 fn kind_name(kind: i32) -> &'static str {

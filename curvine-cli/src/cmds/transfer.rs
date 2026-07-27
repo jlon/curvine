@@ -47,7 +47,7 @@ enum TransferSubCommand {
     /// Cancel one transfer job
     Cancel(TransferCancelCommand),
 
-    /// Retry a failed or canceled transfer job
+    /// Retry a failed, canceled, or partially successful transfer as a new job
     Retry(TransferRetryCommand),
 
     /// Summarize transfer jobs by tenant
@@ -189,6 +189,7 @@ enum TransferStateArg {
     Completed,
     Failed,
     Canceled,
+    PartialSuccess,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -262,7 +263,7 @@ impl TransferStatusCommand {
             }
             first = false;
             let job = status_to_job(&response);
-            print_status_summary(&job, self.verbose);
+            print_status_summary(&job, response.task_summary.as_ref(), self.verbose);
             if self.verbose {
                 print_tasks_table(&response.tasks, self.full_id, true);
                 print_next_page(response.next_page_token.as_deref());
@@ -524,6 +525,7 @@ impl From<TransferStateArg> for TransferState {
             TransferStateArg::Completed => TransferState::Completed,
             TransferStateArg::Failed => TransferState::Failed,
             TransferStateArg::Canceled => TransferState::Canceled,
+            TransferStateArg::PartialSuccess => TransferState::PartialSuccess,
         }
     }
 }
@@ -572,7 +574,11 @@ fn print_jobs_table(jobs: &[TransferJobStatusProto], full_id: bool, verbose: boo
     println!("{table}");
 }
 
-fn print_status_summary(job: &TransferJobStatusProto, verbose: bool) {
+fn print_status_summary(
+    job: &TransferJobStatusProto,
+    task_summary: Option<&curvine_common::proto::TransferTaskSummaryProto>,
+    verbose: bool,
+) {
     let mut table = md_table();
     table.set_header(["FIELD", "VALUE"]);
     table.add_row(["Job ID".to_string(), job.job_id.clone()]);
@@ -585,6 +591,9 @@ fn print_status_summary(job: &TransferJobStatusProto, verbose: bool) {
         "Progress".to_string(),
         progress_text(job.progress.loaded_size, job.progress.total_size),
     ]);
+    if let Some(summary) = task_summary {
+        table.add_row(["Tasks".to_string(), task_summary_text(summary)]);
+    }
     if !job.progress.message.is_empty() {
         table.add_row(["Message".to_string(), job.progress.message.clone()]);
     }
@@ -668,6 +677,7 @@ fn print_tenants_table(tenants: &[TransferTenantSummaryProto]) {
         "COMPLETED",
         "FAILED",
         "CANCELED",
+        "PARTIAL",
         "TOTAL",
     ]);
     for tenant in tenants {
@@ -682,10 +692,33 @@ fn print_tenants_table(tenants: &[TransferTenantSummaryProto]) {
             tenant.completed.to_string(),
             tenant.failed.to_string(),
             tenant.canceled.to_string(),
+            tenant.partial_success.to_string(),
             tenant.total.to_string(),
         ]);
     }
     println!("{table}");
+}
+
+fn task_summary_text(summary: &curvine_common::proto::TransferTaskSummaryProto) -> String {
+    let mut parts = vec![
+        format!("{} completed", summary.completed),
+        format!("{} failed", summary.failed),
+        format!("{} running", summary.running),
+    ];
+    if summary.pending > 0 {
+        parts.push(format!("{} pending", summary.pending));
+    }
+    if summary.canceled > 0 {
+        parts.push(format!("{} canceled", summary.canceled));
+    }
+    if summary.stale > 0 {
+        parts.push(format!("{} stale", summary.stale));
+    }
+    parts.push(format!(
+        "{} cached",
+        bytes_to_string(summary.completed_size.max(0))
+    ));
+    parts.join(", ")
 }
 
 fn print_next_page(next_page_token: Option<&str>) {
@@ -763,7 +796,7 @@ fn format_timestamp(timestamp_ms: i64) -> String {
 }
 
 fn transfer_is_terminal(state: i32) -> bool {
-    matches!(state, 6 | 7 | 8)
+    matches!(state, 6 | 7 | 8 | 9)
 }
 
 fn kind_name(kind: i32) -> &'static str {
@@ -784,6 +817,7 @@ fn state_name(state: i32) -> &'static str {
         6 => "Completed",
         7 => "Failed",
         8 => "Canceled",
+        9 => "PartialSuccess",
         _ => "Unknown",
     }
 }

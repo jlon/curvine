@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_client::rpc::{JobMasterClient, TransferClient};
-use curvine_common::state::JobTaskState;
+use curvine_common::state::{JobTaskState, TransferState};
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -118,10 +118,7 @@ impl LoadStatusCommand {
             println!("Press Ctrl+C to stop watching.");
 
             let state = print_transfer_status(&transfer_client, &self.job_id).await?;
-            if matches!(
-                state,
-                JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
-            ) {
+            if state.is_terminal() {
                 break;
             }
 
@@ -135,26 +132,27 @@ impl LoadStatusCommand {
 async fn print_transfer_status(
     client: &TransferClient,
     job_id: &str,
-) -> CommonResult<JobTaskState> {
+) -> CommonResult<TransferState> {
     let status = handle_rpc_result(client.status(job_id)).await;
-    let state = transfer_state_to_job_state(status.state);
+    let state = TransferState::from(status.state);
     println!("Job ID: {}", status.job_id);
     println!("Run ID: {}", status.run_id);
     println!("State: {:?}", state);
     println!(
         "Progress: {} / {}, message={}",
-        status.progress.loaded_size, status.progress.total_size, status.progress.message
+        bytes_to_string(status.progress.loaded_size.max(0)),
+        bytes_to_string(status.progress.total_size.max(0)),
+        status.progress.message
     );
-    Ok(state)
-}
-
-fn transfer_state_to_job_state(state: i32) -> JobTaskState {
-    match state {
-        1 => JobTaskState::Pending,
-        2..=5 => JobTaskState::Loading,
-        6 => JobTaskState::Completed,
-        7 => JobTaskState::Failed,
-        8 => JobTaskState::Canceled,
-        _ => JobTaskState::UNKNOWN,
+    if let Some(summary) = status.task_summary {
+        println!(
+            "Tasks: {} completed, {} failed, {} running, {} pending; {} cached",
+            summary.completed,
+            summary.failed,
+            summary.running,
+            summary.pending,
+            bytes_to_string(summary.completed_size.max(0)),
+        );
     }
+    Ok(state)
 }

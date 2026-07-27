@@ -840,7 +840,7 @@ async fn wait_transfer_complete0(
         let state = TransferState::from(status.state);
         match state {
             TransferState::Completed => return Ok(()),
-            TransferState::Failed | TransferState::Canceled => {
+            TransferState::Failed | TransferState::Canceled | TransferState::PartialSuccess => {
                 return err_box!(
                     "transfer {} {:?}: {}",
                     status.job_id,

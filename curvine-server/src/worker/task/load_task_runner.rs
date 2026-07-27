@@ -71,15 +71,26 @@ impl LoadTaskRunner {
     ) -> Self {
         let master_client = JobMasterClient::new(fs.fs_client());
         let transfer_client = match task.info.transfer_report.as_ref() {
-            Some(report) if report.report_target.is_empty() => transfer_client,
+            Some(report)
+                if report.report_endpoints.is_empty() && report.report_target.is_empty() =>
+            {
+                transfer_client
+            }
             Some(report) => {
-                match TransferClient::with_endpoint(&fs.fs_context(), report.report_target.clone())
-                {
+                let report_endpoints = if report.report_endpoints.is_empty() {
+                    vec![report.report_target.clone()]
+                } else {
+                    report.report_endpoints.clone()
+                };
+                match TransferClient::with_report_endpoints(
+                    &fs.fs_context(),
+                    report_endpoints.clone(),
+                ) {
                     Ok(client) => Some(client),
                     Err(err) => {
                         warn!(
-                            "transfer task {} has invalid report target {}: {}",
-                            task.info.task_id, report.report_target, err
+                            "transfer task {} has invalid report endpoints {:?}: {}",
+                            task.info.task_id, report_endpoints, err
                         );
                         None
                     }
@@ -532,10 +543,15 @@ impl LoadTaskRunner {
         let task = &self.task.info;
         if let Some(report_info) = &task.transfer_report {
             let Some(client) = &self.transfer_client else {
+                let report_endpoints = if report_info.report_endpoints.is_empty() {
+                    vec![report_info.report_target.clone()]
+                } else {
+                    report_info.report_endpoints.clone()
+                };
                 return err_box!(
-                    "Transfer task {} has no transfer client for report target {}",
+                    "Transfer task {} has no transfer client for report endpoints {:?}",
                     task.task_id,
-                    report_info.report_target
+                    report_endpoints
                 );
             };
             let accepted = tokio::time::timeout(

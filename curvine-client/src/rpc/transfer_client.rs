@@ -52,10 +52,17 @@ impl TransferClient {
     }
 
     pub fn with_endpoint(context: &Arc<FsContext>, endpoint: impl Into<String>) -> FsResult<Self> {
+        Self::with_report_endpoints(context, vec![endpoint.into()])
+    }
+
+    pub fn with_report_endpoints(
+        context: &Arc<FsContext>,
+        endpoints: Vec<String>,
+    ) -> FsResult<Self> {
         Self::with_endpoints(
             context.conf.client_rpc_conf(),
             context.clone_runtime(),
-            vec![endpoint.into()],
+            endpoints,
         )
     }
 

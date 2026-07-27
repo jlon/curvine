@@ -63,7 +63,7 @@ fn print_transfer_cancel_result(state: i32) {
             println!("│ ✅ Job cancel request accepted");
             println!("│ State: {:?}", state);
         }
-        TransferState::Completed | TransferState::Failed => {
+        TransferState::Completed | TransferState::Failed | TransferState::PartialSuccess => {
             println!("│ ℹ️ Job is already terminal");
             println!("│ State: {:?}", state);
         }

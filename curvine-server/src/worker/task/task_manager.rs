@@ -161,9 +161,12 @@ impl TaskManager {
     ///      context** (a later `submit_task` may have superseded it)
     pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<TaskSubmitResult> {
         if let Some(report) = &task.transfer_report {
-            if self.transfer_client.is_none() {
+            if report.report_endpoints.is_empty()
+                && report.report_target.is_empty()
+                && self.transfer_client.is_none()
+            {
                 return Ok(TaskSubmitResult::rejected(format!(
-                    "Reject transfer task {} because transfer client is unavailable",
+                    "Reject transfer task {} because no Transfer report endpoint is available",
                     task.task_id
                 )));
             }

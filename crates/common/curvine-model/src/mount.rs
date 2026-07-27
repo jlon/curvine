@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::ClientConf;
-use crate::fs::Path;
 use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
+use crate::{ClientConfDefaults, CurvinePath};
 use bincode::Options;
 use log::warn;
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -194,25 +193,25 @@ impl MountInfo {
         }
     }
 
-    pub fn get_ufs_path(&self, path: &Path) -> CommonResult<Path> {
+    pub fn get_ufs_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
         if !path.is_cv() {
             return err_box!("path {} is not cv path", path);
         }
 
         let sub_path = path.path().replacen(&self.cv_path, "", 1);
-        Path::from_str(format!("{}/{}", self.ufs_path, sub_path))
+        P::from_str(format!("{}/{}", self.ufs_path, sub_path))
     }
 
-    pub fn get_cv_path(&self, path: &Path) -> CommonResult<Path> {
+    pub fn get_cv_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
         if path.is_cv() {
             return err_box!("path {} is not ufs path", path);
         }
 
         let sub_path = path.full_path().replacen(&self.ufs_path, "", 1);
-        Path::from_str(format!("{}/{}", self.cv_path, sub_path))
+        P::from_str(format!("{}/{}", self.cv_path, sub_path))
     }
 
-    pub fn toggle_path(&self, path: &Path) -> CommonResult<Path> {
+    pub fn toggle_path<P: CurvinePath>(&self, path: &P) -> CommonResult<P> {
         if path.is_cv() {
             self.get_ufs_path(path)
         } else {
@@ -220,12 +219,17 @@ impl MountInfo {
         }
     }
 
-    pub fn get_create_opts(&self, conf: &ClientConf) -> CreateFileOpts {
+    pub fn get_create_opts(&self, conf: &impl ClientConfDefaults) -> CreateFileOpts {
         let opts = CreateFileOptsBuilder::with_conf(conf).build();
         self.merge_create_opts(opts)
     }
 
-    pub fn get_sync_opts(&self, conf: &ClientConf, ufs_mtime: i64, ufs_len: i64) -> CreateFileOpts {
+    pub fn get_sync_opts(
+        &self,
+        conf: &impl ClientConfDefaults,
+        ufs_mtime: i64,
+        ufs_len: i64,
+    ) -> CreateFileOpts {
         let opts = CreateFileOptsBuilder::with_conf(conf)
             .ufs_mtime_len(ufs_mtime, ufs_len)
             .build();
@@ -376,13 +380,13 @@ impl MountOptionsBuilder {
         }
     }
 
-    pub fn with_conf(conf: &ClientConf, update: bool) -> Self {
+    pub fn with_conf(conf: &impl ClientConfDefaults, update: bool) -> Self {
         let builder = Self::new();
         if update {
             return builder;
         }
 
-        builder.ttl_ms(conf.ttl_ms).ttl_action(conf.ttl_action)
+        builder.ttl_ms(conf.ttl_ms()).ttl_action(conf.ttl_action())
     }
 
     pub fn update(mut self, update: bool) -> Self {
@@ -513,8 +517,39 @@ impl TryFrom<&str> for WriteType {
 
 #[cfg(test)]
 mod tests {
-    use crate::fs::Path;
     use crate::state::{AccessMode, MountInfo, MountOptions, WriteType};
+    use crate::CurvinePath;
+    use curvine_fs_api::Path;
+    use std::fmt;
+
+    /// Thin test adapter over the real `Path` parser so mount tests track
+    /// production normalization without duplicating path logic here.
+    #[derive(Clone)]
+    struct TestPath(Path);
+
+    impl CurvinePath for TestPath {
+        fn is_cv(&self) -> bool {
+            self.0.is_cv()
+        }
+
+        fn path(&self) -> &str {
+            self.0.path()
+        }
+
+        fn full_path(&self) -> &str {
+            self.0.full_path()
+        }
+
+        fn from_str(path: impl AsRef<str>) -> orpc::CommonResult<Self> {
+            Path::from_str(path).map(Self)
+        }
+    }
+
+    impl fmt::Display for TestPath {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(&self.0, f)
+        }
+    }
 
     #[test]
     fn test_access_mode_parse() {
@@ -591,31 +626,31 @@ mod tests {
             cv_path: "/spark/test1".to_string(),
             ..Default::default()
         };
-        let path = Path::from_str("s3://spark/test1/1.csv").unwrap();
+        let path = TestPath::from_str("s3://spark/test1/1.csv").unwrap();
         assert_eq!(
             info.get_cv_path(&path).unwrap().full_path(),
             "/spark/test1/1.csv"
         );
 
-        let path = Path::from_str("s3://spark/test1/test/dt=2025/1.csv").unwrap();
+        let path = TestPath::from_str("s3://spark/test1/test/dt=2025/1.csv").unwrap();
         assert_eq!(
             info.get_cv_path(&path).unwrap().full_path(),
             "/spark/test1/test/dt=2025/1.csv"
         );
 
-        let path = Path::from_str("/spark/test1/1.csv").unwrap();
+        let path = TestPath::from_str("/spark/test1/1.csv").unwrap();
         assert_eq!(
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/test1/1.csv"
         );
 
-        let path = Path::from_str("/spark/test1/test/dt=2025/1.csv").unwrap();
+        let path = TestPath::from_str("/spark/test1/test/dt=2025/1.csv").unwrap();
         assert_eq!(
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/test1/test/dt=2025/1.csv"
         );
 
-        let path = Path::from_str("cv://curvine-pro/spark/test1/test/dt=2025/1.csv").unwrap();
+        let path = TestPath::from_str("cv://curvine-pro/spark/test1/test/dt=2025/1.csv").unwrap();
         assert_eq!(
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/test1/test/dt=2025/1.csv"
@@ -629,22 +664,22 @@ mod tests {
             cv_path: "/my".to_string(),
             ..Default::default()
         };
-        let path = Path::from_str("s3://spark/a/b/1.csv").unwrap();
+        let path = TestPath::from_str("s3://spark/a/b/1.csv").unwrap();
         assert_eq!(info.get_cv_path(&path).unwrap().full_path(), "/my/1.csv");
 
-        let path = Path::from_str("s3://spark/a/b/c/dt=2025/1.csv").unwrap();
+        let path = TestPath::from_str("s3://spark/a/b/c/dt=2025/1.csv").unwrap();
         assert_eq!(
             info.get_cv_path(&path).unwrap().full_path(),
             "/my/c/dt=2025/1.csv"
         );
 
-        let path = Path::from_str("/my/1.csv").unwrap();
+        let path = TestPath::from_str("/my/1.csv").unwrap();
         assert_eq!(
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/a/b/1.csv"
         );
 
-        let path = Path::from_str("/my/c/dt=2025/1.csv").unwrap();
+        let path = TestPath::from_str("/my/c/dt=2025/1.csv").unwrap();
         assert_eq!(
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/a/b/c/dt=2025/1.csv"
@@ -661,7 +696,8 @@ mod tests {
         };
 
         // Test 1: UFS → CV (Import) - root level file
-        let ufs_path = Path::from_str("s3://flink/user/batch_add_path_migrate_task.py").unwrap();
+        let ufs_path =
+            TestPath::from_str("s3://flink/user/batch_add_path_migrate_task.py").unwrap();
         let cv_result = info.get_cv_path(&ufs_path).unwrap();
         assert_eq!(
             cv_result.full_path(),
@@ -669,7 +705,7 @@ mod tests {
         );
 
         // Test 2: CV → UFS (Export) - root level file
-        let cv_path = Path::from_str("/mnt/s3/batch_add_path_migrate_task.py").unwrap();
+        let cv_path = TestPath::from_str("/mnt/s3/batch_add_path_migrate_task.py").unwrap();
         let ufs_result = info.get_ufs_path(&cv_path).unwrap();
         assert_eq!(
             ufs_result.full_path(),
@@ -677,18 +713,19 @@ mod tests {
         );
 
         // Test 3: UFS → CV (Import) - nested directory
-        let ufs_nested = Path::from_str("s3://flink/user/dir1/dir2/file.txt").unwrap();
+        let ufs_nested = TestPath::from_str("s3://flink/user/dir1/dir2/file.txt").unwrap();
         let cv_nested = info.get_cv_path(&ufs_nested).unwrap();
         assert_eq!(cv_nested.full_path(), "/mnt/s3/dir1/dir2/file.txt");
 
         // Test 4: CV → UFS (Export) - nested directory
-        let cv_nested = Path::from_str("/mnt/s3/dir1/dir2/file.txt").unwrap();
+        let cv_nested = TestPath::from_str("/mnt/s3/dir1/dir2/file.txt").unwrap();
         let ufs_nested = info.get_ufs_path(&cv_nested).unwrap();
         assert_eq!(ufs_nested.full_path(), "s3://flink/user/dir1/dir2/file.txt");
 
         // Test 5: UFS → CV (Import) - special characters in path
         let ufs_special =
-            Path::from_str("s3://flink/user/test_data/dt=2025-01-30/part-00000.parquet").unwrap();
+            TestPath::from_str("s3://flink/user/test_data/dt=2025-01-30/part-00000.parquet")
+                .unwrap();
         let cv_special = info.get_cv_path(&ufs_special).unwrap();
         assert_eq!(
             cv_special.full_path(),
@@ -697,7 +734,7 @@ mod tests {
 
         // Test 6: CV → UFS (Export) - special characters in path
         let cv_special =
-            Path::from_str("/mnt/s3/test_data/dt=2025-01-30/part-00000.parquet").unwrap();
+            TestPath::from_str("/mnt/s3/test_data/dt=2025-01-30/part-00000.parquet").unwrap();
         let ufs_special = info.get_ufs_path(&cv_special).unwrap();
         assert_eq!(
             ufs_special.full_path(),
@@ -709,13 +746,13 @@ mod tests {
         assert!(!ufs_path.is_cv());
 
         // Test 8: Round-trip conversion (UFS → CV → UFS)
-        let original_ufs = Path::from_str("s3://flink/user/data/test.csv").unwrap();
+        let original_ufs = TestPath::from_str("s3://flink/user/data/test.csv").unwrap();
         let to_cv = info.get_cv_path(&original_ufs).unwrap();
         let back_to_ufs = info.get_ufs_path(&to_cv).unwrap();
         assert_eq!(original_ufs.full_path(), back_to_ufs.full_path());
 
         // Test 9: Round-trip conversion (CV → UFS → CV)
-        let original_cv = Path::from_str("/mnt/s3/data/test.csv").unwrap();
+        let original_cv = TestPath::from_str("/mnt/s3/data/test.csv").unwrap();
         let to_ufs = info.get_ufs_path(&original_cv).unwrap();
         let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
         assert_eq!(original_cv.full_path(), back_to_cv.full_path());

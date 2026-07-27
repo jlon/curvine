@@ -178,10 +178,6 @@ impl TransferServer {
         } else {
             conf.transfer.instance_id.clone()
         };
-        let report_target =
-            conf.transfer.endpoints.first().cloned().unwrap_or_else(|| {
-                format!("{}:{}", conf.transfer.hostname, conf.transfer.rpc_port)
-            });
         let planner = TransferPlanner::new(
             cv_metadata.clone(),
             factory.clone(),
@@ -196,7 +192,7 @@ impl TransferServer {
             cache.clone(),
             factory,
             owner,
-            report_target,
+            conf.transfer.endpoints.clone(),
             conf.transfer.clone(),
         );
 

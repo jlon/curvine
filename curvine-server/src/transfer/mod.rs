@@ -60,6 +60,26 @@ pub use self::router_handler::TransferRouterHandler;
 mod transfer_server;
 pub use self::transfer_server::{TransferServer, TransferServerShutdown};
 
+pub(crate) fn apply_task_report_progress(
+    summary: &mut curvine_common::state::TransferProgress,
+    previous: &curvine_common::state::TransferProgress,
+    current: &curvine_common::state::TransferProgress,
+    now_ms: i64,
+) {
+    summary.loaded_size = summary
+        .loaded_size
+        .saturating_sub(previous.loaded_size)
+        .saturating_add(current.loaded_size)
+        .max(0);
+    summary.total_size = summary
+        .total_size
+        .saturating_sub(previous.total_size)
+        .saturating_add(current.total_size)
+        .max(0);
+    summary.update_time = now_ms;
+    summary.message = current.message.clone();
+}
+
 pub(crate) fn transfer_failure_message(
     kind: curvine_common::state::TransferKind,
     source_path: &str,
@@ -95,8 +115,15 @@ pub(crate) fn transfer_failure_message(
             "Transfer metadata store is unavailable; retry after it recovers".to_string()
         }
         ErrorKind::TransferOverloaded => "Transfer service is busy; retry later".to_string(),
-        _ => format!(
-            "transfer from {source_path} to {target_path} failed; check the Transfer service logs"
-        ),
+        _ => {
+            let details = err.to_string();
+            if details.is_empty() {
+                format!(
+                    "transfer from {source_path} to {target_path} failed; check the Transfer service logs"
+                )
+            } else {
+                format!("transfer from {source_path} to {target_path} failed: {details}")
+            }
+        }
     }
 }

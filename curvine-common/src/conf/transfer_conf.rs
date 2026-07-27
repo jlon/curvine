@@ -181,6 +181,11 @@ impl TransferConf {
             }
             _ => {}
         }
+        if self.endpoints.len() > 1 && self.effective_store_type() != TransferStoreType::Mysql {
+            return Err(FsError::common(
+                "multiple transfer.endpoints require transfer.store_url=mysql:// so instances share one TransferStore",
+            ));
+        }
         if self.enabled && self.effective_store_type() == TransferStoreType::Mysql {
             self.validate_mysql_store()?;
         }

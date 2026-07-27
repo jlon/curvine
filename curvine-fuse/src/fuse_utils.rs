@@ -513,14 +513,35 @@ impl FuseUtils {
             .build()
     }
 
+    /// Kernel dentry/attribute cache lifetimes for FUSE replies.
+    ///
+    /// When userspace permission checks are enabled, timeouts must be zero so the
+    /// kernel revalidates after parent mode changes (e.g. chmod removing search).
+    /// Otherwise cached LOOKUP/GETATTR can skip path-prefix X_OK and report success
+    /// where POSIX requires EACCES (LTP lstat02/stat03/readlink03).
+    pub fn kernel_cache_timeouts(conf: &FuseConf) -> (u64, u32, u64, u32) {
+        if conf.check_permission {
+            (0, 0, 0, 0)
+        } else {
+            (
+                conf.entry_ttl.as_secs(),
+                conf.entry_ttl.subsec_nanos(),
+                conf.attr_ttl.as_secs(),
+                conf.attr_ttl.subsec_nanos(),
+            )
+        }
+    }
+
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
+        let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
+            Self::kernel_cache_timeouts(conf);
         fuse_entry_out {
             nodeid: attr.ino,
             generation: 0,
-            entry_valid: conf.entry_ttl.as_secs(),
-            attr_valid: conf.attr_ttl.as_secs(),
-            entry_valid_nsec: conf.entry_ttl.subsec_nanos(),
-            attr_valid_nsec: conf.attr_ttl.subsec_nanos(),
+            entry_valid,
+            attr_valid,
+            entry_valid_nsec,
+            attr_valid_nsec,
             attr,
         }
     }
@@ -529,9 +550,39 @@ impl FuseUtils {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
-    /// Whether the caller's effective gid matches `file_gid`; supplementary groups are unavailable.
-    pub fn caller_in_file_group(effective_gid: u32, file_gid: u32) -> bool {
-        effective_gid == file_gid
+    /// Supplementary groups for the FUSE requester, resolved from `/proc/<pid>/status`.
+    ///
+    /// `fuse_in_header` exposes only the effective gid; chmod(2) setgid handling and
+    /// chown gid changes must also consider supplementary groups of the caller pid.
+    pub fn caller_supplementary_groups(pid: u32) -> Vec<u32> {
+        if pid == 0 {
+            return Vec::new();
+        }
+
+        let status_path = format!("/proc/{pid}/status");
+        let Ok(content) = std::fs::read_to_string(status_path) else {
+            return Vec::new();
+        };
+
+        content
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .map(|groups| {
+                groups
+                    .split_whitespace()
+                    .filter_map(|gid| gid.parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the caller belongs to `file_gid` via effective or supplementary groups.
+    pub fn caller_in_file_group(effective_gid: u32, file_gid: u32, pid: u32) -> bool {
+        if effective_gid == file_gid {
+            return true;
+        }
+
+        Self::caller_supplementary_groups(pid).contains(&file_gid)
     }
 
     /// Apply Linux chmod/fchmod security rules for special mode bits. For non-root
@@ -793,9 +844,18 @@ mod tests {
     }
 
     #[test]
-    fn caller_in_file_group_matches_effective_gid_only() {
-        assert!(FuseUtils::caller_in_file_group(100, 100));
-        assert!(!FuseUtils::caller_in_file_group(100, 200));
+    fn caller_in_file_group_matches_effective_gid() {
+        assert!(FuseUtils::caller_in_file_group(100, 100, 0));
+        assert!(!FuseUtils::caller_in_file_group(100, 200, 0));
+    }
+
+    #[test]
+    fn caller_in_file_group_considers_supplementary_groups() {
+        let pid = std::process::id();
+        let groups = FuseUtils::caller_supplementary_groups(pid);
+        if let Some(&gid) = groups.first() {
+            assert!(FuseUtils::caller_in_file_group(0, gid, pid));
+        }
     }
 
     #[test]

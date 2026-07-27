@@ -434,17 +434,27 @@ impl CurvineFileSystem {
             }
         };
 
+        let meta_ttl = self.conf.meta_cache_ttl.as_millis() as u64;
         while dir_ino != 0 {
             let check_header = fuse_in_header {
                 uid: header.uid,
                 gid: header.gid,
+                pid: header.pid,
                 nodeid: dir_ino,
                 ..Default::default()
             };
+            // Only trust ACL bits from a valid dcache entry. The mount-root placeholder
+            // starts as Lifecycle::Invalid; using it fail-closes every non-root traverse
+            // with EACCES (breaks LTP chmod/chown under nobody).
             let cached_status = {
                 let dir = self.state.dir_read();
-                dir.get_inode(dir_ino, None)
-                    .map(|inode| inode.clone_status())
+                dir.get_inode(dir_ino, None).and_then(|inode| {
+                    if inode.cache_valid(meta_ttl) {
+                        Some(inode.clone_status())
+                    } else {
+                        None
+                    }
+                })
             };
             if let Some(status) = cached_status {
                 self.check_access_permissions(&status, &check_header, libc::X_OK as u32)?;
@@ -479,6 +489,7 @@ impl CurvineFileSystem {
             status.mode,
             header.uid,
             header.gid,
+            header.pid,
             file_uid,
             file_gid,
         );
@@ -546,18 +557,23 @@ impl CurvineFileSystem {
         }
     }
 
-    /// Determine which permission bits to check based on user relationship to file
+    /// Determine which permission bits to check based on user relationship to file.
+    ///
+    /// Group membership includes the caller's effective gid and supplementary groups
+    /// from `/proc/<pid>/status` (same source as setattr setgid checks).
     fn get_effective_permission_bits(
         &self,
         mode: u32,
         current_uid: u32,
         current_gid: u32,
+        caller_pid: u32,
         file_uid: u32,
         file_gid: u32,
     ) -> u32 {
         if current_uid == file_uid {
             (mode >> 6) & 0o7
-        } else if current_gid == file_gid {
+        } else if FuseUtils::caller_in_file_group(current_gid, file_gid, caller_pid) {
+            // Group permissions (bits 5-7)
             (mode >> 3) & 0o7
         } else {
             mode & 0o7
@@ -627,6 +643,7 @@ impl CurvineFileSystem {
         check_permission: bool,
         caller_uid: u32,
         caller_gid: u32,
+        caller_pid: u32,
         file_uid: u32,
         valid: u32,
         target_gid: Option<u32>,
@@ -652,7 +669,7 @@ impl CurvineFileSystem {
                 );
             }
             if let Some(gid) = target_gid {
-                if !FuseUtils::caller_in_file_group(caller_gid, gid) {
+                if !FuseUtils::caller_in_file_group(caller_gid, gid, caller_pid) {
                     return err_fuse!(
                         libc::EPERM,
                         "setattr gid change denied for gid {} not in caller groups",
@@ -673,7 +690,135 @@ impl CurvineFileSystem {
         Ok(())
     }
 
-    /// Negotiate init reply flags via an explicit daemon-supported allowlist.
+    const SETATTR_TIME_VALID: u32 = FATTR_ATIME | FATTR_MTIME | FATTR_ATIME_NOW | FATTR_MTIME_NOW;
+
+    fn is_time_only_setattr(valid: u32) -> bool {
+        valid != 0 && (valid & !Self::SETATTR_TIME_VALID) == 0
+    }
+
+    /// Linux `fs.protected_symlinks`: in sticky+world-writable directories, following a
+    /// symlink is allowed only if the follower owns the symlink, or the directory
+    /// owner matches the symlink owner. CAP_DAC_OVERRIDE does **not** bypass this
+    /// (root as sticky-dir owner still gets EACCES for another user's symlink).
+    ///
+    /// FUSE may not reliably apply VFS `may_follow_link` (attribute/sticky reporting
+    /// differences), so enforce the same policy in userspace when `check_permission`.
+    fn check_protected_symlink_follow(
+        check_permission: bool,
+        follower_uid: u32,
+        symlink_uid: u32,
+        parent_uid: u32,
+        parent_mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission {
+            return Ok(());
+        }
+        if follower_uid == symlink_uid || parent_uid == symlink_uid {
+            return Ok(());
+        }
+        let sticky_world = (libc::S_ISVTX as u32) | (libc::S_IWOTH as u32);
+        if (parent_mode & sticky_world) != sticky_world {
+            return Ok(());
+        }
+        err_fuse!(
+            libc::EACCES,
+            "protected_symlinks: uid {} may not follow symlink owned by uid {} \
+             in sticky world-writable dir owned by uid {}",
+            follower_uid,
+            symlink_uid,
+            parent_uid
+        )
+    }
+
+    /// Linux `fs.protected_hardlinks` / `may_linkat`: non-owners may hardlink a
+    /// regular file only when it is a safe source (no setuid / dangerous setgid)
+    /// and the caller has read+write permission. Otherwise EPERM. Root/owner always
+    /// allowed (capability / ownership bypass).
+    fn check_protected_hardlink(
+        check_permission: bool,
+        caller_uid: u32,
+        file_uid: u32,
+        file_type: FileType,
+        mode: u32,
+        has_read_write: bool,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 || caller_uid == file_uid {
+            return Ok(());
+        }
+        if file_type != FileType::File {
+            return err_fuse!(
+                libc::EPERM,
+                "protected_hardlinks: non-owner may not hardlink non-regular file"
+            );
+        }
+        if (mode & libc::S_ISUID as u32) != 0 {
+            return err_fuse!(
+                libc::EPERM,
+                "protected_hardlinks: non-owner may not hardlink setuid file"
+            );
+        }
+        if (mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32))
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+        {
+            return err_fuse!(
+                libc::EPERM,
+                "protected_hardlinks: non-owner may not hardlink setgid+group-exec file"
+            );
+        }
+        if !has_read_write {
+            return err_fuse!(
+                libc::EPERM,
+                "protected_hardlinks: non-owner needs read+write on source"
+            );
+        }
+        Ok(())
+    }
+
+    /// Linux utime(2): owner/root may always set times; NULL/`*_NOW` also allow W_OK.
+    #[allow(clippy::too_many_arguments)]
+    fn check_utime_setattr_permission(
+        check_permission: bool,
+        valid: u32,
+        caller_uid: u32,
+        caller_gid: u32,
+        caller_pid: u32,
+        file_uid: u32,
+        file_gid: u32,
+        mode: u32,
+    ) -> FuseResult<()> {
+        if !check_permission || caller_uid == 0 || caller_uid == file_uid {
+            return Ok(());
+        }
+
+        let setting_now = (valid & (FATTR_ATIME_NOW | FATTR_MTIME_NOW)) != 0;
+        if setting_now {
+            let permission_bits =
+                if FuseUtils::caller_in_file_group(caller_gid, file_gid, caller_pid) {
+                    (mode >> 3) & 0o7
+                } else {
+                    mode & 0o7
+                };
+            if Self::permission_mask_allows(permission_bits, libc::W_OK as u32) {
+                return Ok(());
+            }
+            return err_fuse!(
+                libc::EACCES,
+                "utime denied without write access for uid {}",
+                caller_uid
+            );
+        }
+
+        err_fuse!(libc::EPERM, "utime denied for non-owner uid {}", caller_uid)
+    }
+
+    /// Negotiate init reply flags as an explicit allowlist, not a blind echo:
+    /// 1. Kernel-negotiated: `SUPPORTED_INIT_FLAGS & kernel_flags` (only caps the
+    ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
+    ///    what that deliberately excludes).
+    /// 2. Config-gated, forced on regardless of the kernel offer:
+    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
+    ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
+    ///    on config alone).
     fn negotiate_out_flags(kernel_flags: u32, write_back_cache: bool, enable_splice: bool) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
         if write_back_cache {
@@ -987,9 +1132,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
         self.state.update_writer_len(&mut fuse_attr).await;
+        let (_, _, attr_valid, attr_valid_nsec) = FuseUtils::kernel_cache_timeouts(&self.conf);
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr: fuse_attr,
         };
@@ -1002,9 +1148,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         self.ensure_writable_path(&path, RpcCode::SetAttr).await?;
 
-        self.check_traverse_permissions(op.header.nodeid, op.header)
-            .await?;
-
         let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
         let file_uid = self.resolve_file_uid(&cur_status.owner);
         let file_gid = self.resolve_file_gid(&cur_status.group);
@@ -1013,21 +1156,53 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             None
         };
-        Self::check_setattr_permission(
-            self.conf.check_permission,
-            op.header.uid,
-            op.header.gid,
-            file_uid,
-            op.arg.valid,
-            target_gid,
-        )?;
+
+        // Path-based chmod(2)/chown(2)/truncate must still traverse the path prefix
+        // regardless of file ownership (POSIX search permission). Only fh-based
+        // fchmod/fchown (FATTR_FH) skips traverse — open-file descriptors do not
+        // re-check path search permission.
+        let skip_traverse = (op.arg.valid & FATTR_FH) != 0;
+
+        if !skip_traverse {
+            self.check_traverse_permissions(op.header.nodeid, op.header)
+                .await?;
+        }
+
+        if Self::is_time_only_setattr(op.arg.valid) {
+            Self::check_utime_setattr_permission(
+                self.conf.check_permission,
+                op.arg.valid,
+                op.header.uid,
+                op.header.gid,
+                op.header.pid,
+                file_uid,
+                file_gid,
+                cur_status.mode,
+            )?;
+        } else {
+            Self::check_setattr_permission(
+                self.conf.check_permission,
+                op.header.uid,
+                op.header.gid,
+                op.header.pid,
+                file_uid,
+                op.arg.valid,
+                target_gid,
+            )?;
+        }
+
+        // truncate(2) / ftruncate: write permission required on the named file.
+        if (op.arg.valid & FATTR_SIZE) != 0 && self.conf.check_permission && op.header.uid != 0 {
+            self.check_access_permissions(&cur_status, op.header, libc::W_OK as u32)?;
+        }
 
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = FuseUtils::fuse_setattr_to_opts(op.arg)?;
 
         if (op.arg.valid & FATTR_MODE) != 0 {
             if let Some(mode) = opts.mode {
-                let in_file_group = FuseUtils::caller_in_file_group(op.header.gid, file_gid);
+                let in_file_group =
+                    FuseUtils::caller_in_file_group(op.header.gid, file_gid, op.header.pid);
                 opts.mode = Some(FuseUtils::normalize_chmod_mode(
                     mode,
                     op.header.uid,
@@ -1073,9 +1248,10 @@ impl fs::FileSystem for CurvineFileSystem {
         attr.ino = op.header.nodeid;
         // Metadata-only setattr may race ahead of writer commit; never shrink below accepted bytes.
         self.state.update_writer_len(&mut attr).await;
+        let (_, _, attr_valid, attr_valid_nsec) = FuseUtils::kernel_cache_timeouts(&self.conf);
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr,
         };
@@ -1294,14 +1470,16 @@ impl fs::FileSystem for CurvineFileSystem {
             );
         }
 
+        let (entry_valid, entry_valid_nsec, attr_valid, attr_valid_nsec) =
+            FuseUtils::kernel_cache_timeouts(&self.conf);
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino(),
                 generation: 0,
-                entry_valid: self.conf.entry_ttl.as_secs(),
-                attr_valid: self.conf.attr_ttl.as_secs(),
-                entry_valid_nsec: self.conf.entry_ttl.subsec_nanos(),
-                attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+                entry_valid,
+                attr_valid,
+                entry_valid_nsec,
+                attr_valid_nsec,
                 attr,
             },
             fuse_open_out {
@@ -1424,6 +1602,23 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&src_path, RpcCode::Link).await?;
         self.ensure_writable_path(&des_path, RpcCode::Link).await?;
 
+        // fs.protected_hardlinks (LTP prot_hsymlinks): deny unsafe non-owner hardlinks.
+        if self.conf.check_permission {
+            let src_status = self.state.fs_stat(oldnodeid, None).await?;
+            let file_uid = self.resolve_file_uid(&src_status.owner);
+            let has_read_write = self
+                .check_access_permissions(&src_status, op.header, (libc::R_OK | libc::W_OK) as u32)
+                .is_ok();
+            Self::check_protected_hardlink(
+                true,
+                op.header.uid,
+                file_uid,
+                src_status.file_type,
+                src_status.mode,
+                has_read_write,
+            )?;
+        }
+
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
             src_path, des_path, oldnodeid, op.header.nodeid
@@ -1502,12 +1697,36 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Read the target of a symbolic link
     async fn readlink(&self, op: Readlink<'_>) -> FuseResult<BytesMut> {
+        // Path-based readlink(2) requires search permission on every directory in
+        // the path prefix (LTP readlink03 EACCES).
+        self.check_traverse_permissions(op.header.nodeid, op.header)
+            .await?;
+
         // Get file status to read the symlink target
         let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
         // Check if it's actually a symlink
         if status.file_type != FileType::Link {
             return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", status.path);
+        }
+
+        // fs.protected_symlinks (LTP prot_hsymlinks): VFS may_follow_link is not
+        // reliably enforced for this FUSE mount, so apply the same sticky-dir policy
+        // when the kernel issues READLINK to follow a symlink. Root is not exempt.
+        if self.conf.check_permission {
+            let symlink_uid = self.resolve_file_uid(&status.owner);
+            let parent_ino = self.state.get_parent_ino(op.header.nodeid)?;
+            if parent_ino != 0 {
+                let parent_status = self.state.fs_stat(parent_ino, None).await?;
+                let parent_uid = self.resolve_file_uid(&parent_status.owner);
+                Self::check_protected_symlink_follow(
+                    true,
+                    op.header.uid,
+                    symlink_uid,
+                    parent_uid,
+                    parent_status.mode,
+                )?;
+            }
         }
 
         // Get the target from the file status
@@ -1708,8 +1927,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
 #[cfg(test)]
 mod tests {
-    use crate::{FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_UID};
-    use curvine_common::state::{FileAllocMode, INTERNAL_CTIME_XATTR};
+    use crate::{FATTR_ATIME_NOW, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_MTIME_NOW, FATTR_UID};
+    use curvine_common::state::{FileAllocMode, FileType, INTERNAL_CTIME_XATTR};
 
     #[test]
     fn posix_access_requires_mode_check_for_root() {
@@ -1871,7 +2090,7 @@ mod tests {
     #[test]
     fn setattr_permission_denies_non_owner_chown() {
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 0, FATTR_UID, None,
+            true, 1000, 1000, 0, 0, FATTR_UID, None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -1880,7 +2099,7 @@ mod tests {
     #[test]
     fn setattr_permission_denies_owner_uid_change() {
         let err = super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 1000, FATTR_UID, None,
+            true, 1000, 1000, 0, 1000, FATTR_UID, None,
         )
         .unwrap_err();
         assert_eq!(err.errno(), libc::EPERM);
@@ -1888,14 +2107,14 @@ mod tests {
 
     #[test]
     fn setattr_permission_allows_root_chown() {
-        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 1000, FATTR_UID, None)
+        super::CurvineFileSystem::check_setattr_permission(true, 0, 0, 0, 1000, FATTR_UID, None)
             .unwrap();
     }
 
     #[test]
     fn setattr_permission_allows_owner_mode_change() {
         super::CurvineFileSystem::check_setattr_permission(
-            true, 1000, 1000, 1000, FATTR_MODE, None,
+            true, 1000, 1000, 0, 1000, FATTR_MODE, None,
         )
         .unwrap();
     }
@@ -1906,6 +2125,7 @@ mod tests {
             true,
             1000,
             100,
+            0,
             1000,
             FATTR_GID,
             Some(200),
@@ -1920,6 +2140,7 @@ mod tests {
             true,
             1000,
             100,
+            0,
             1000,
             FATTR_GID,
             Some(100),
@@ -1929,8 +2150,149 @@ mod tests {
 
     #[test]
     fn setattr_permission_ignores_mtime_only_changes() {
-        super::CurvineFileSystem::check_setattr_permission(true, 1000, 1000, 0, FATTR_MTIME, None)
+        super::CurvineFileSystem::check_setattr_permission(
+            true,
+            1000,
+            1000,
+            0,
+            0,
+            FATTR_MTIME,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn is_time_only_setattr_detects_utime_flags() {
+        assert!(super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW
+        ));
+        assert!(super::CurvineFileSystem::is_time_only_setattr(FATTR_MTIME));
+        assert!(!super::CurvineFileSystem::is_time_only_setattr(
+            FATTR_MTIME | FATTR_MODE
+        ));
+    }
+
+    #[test]
+    fn utime_setattr_allows_non_owner_with_write_for_now() {
+        super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o660,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn utime_setattr_denies_non_owner_explicit_times() {
+        let err = super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_MTIME,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o666,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn utime_setattr_denies_non_owner_now_without_write() {
+        let err = super::CurvineFileSystem::check_utime_setattr_permission(
+            true,
+            FATTR_ATIME_NOW | FATTR_MTIME_NOW,
+            1000,
+            100,
+            0,
+            0,
+            100,
+            0o555,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EACCES);
+    }
+
+    #[test]
+    fn protected_symlinks_denies_sticky_dir_owner_following_foreign_link() {
+        // prot_hsymlinks link_4: root owns sticky dir, hsym owns symlink.
+        let err =
+            super::CurvineFileSystem::check_protected_symlink_follow(true, 0, 1000, 0, 0o1777)
+                .unwrap_err();
+        assert_eq!(err.errno(), libc::EACCES);
+
+        // prot_hsymlinks link_5: hsym owns sticky dir, root owns symlink.
+        let err =
+            super::CurvineFileSystem::check_protected_symlink_follow(true, 1000, 0, 1000, 0o1777)
+                .unwrap_err();
+        assert_eq!(err.errno(), libc::EACCES);
+    }
+
+    #[test]
+    fn protected_symlinks_allows_owner_match_or_non_sticky() {
+        // Follower owns the symlink.
+        super::CurvineFileSystem::check_protected_symlink_follow(true, 1000, 1000, 0, 0o1777)
             .unwrap();
+        // Directory owner matches symlink owner.
+        super::CurvineFileSystem::check_protected_symlink_follow(true, 0, 1000, 1000, 0o1777)
+            .unwrap();
+        // Not sticky+world-writable.
+        super::CurvineFileSystem::check_protected_symlink_follow(true, 0, 1000, 0, 0o0777).unwrap();
+        // check_permission disabled.
+        super::CurvineFileSystem::check_protected_symlink_follow(false, 0, 1000, 0, 0o1777)
+            .unwrap();
+    }
+
+    #[test]
+    fn protected_hardlinks_denies_non_owner_without_rw() {
+        let err = super::CurvineFileSystem::check_protected_hardlink(
+            true,
+            1000,
+            0,
+            FileType::File,
+            0o644,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn protected_hardlinks_allows_owner_root_or_rw_source() {
+        super::CurvineFileSystem::check_protected_hardlink(
+            true,
+            0,
+            0,
+            FileType::File,
+            0o644,
+            false,
+        )
+        .unwrap();
+        super::CurvineFileSystem::check_protected_hardlink(
+            true,
+            1000,
+            1000,
+            FileType::File,
+            0o644,
+            false,
+        )
+        .unwrap();
+        super::CurvineFileSystem::check_protected_hardlink(
+            true,
+            1000,
+            0,
+            FileType::File,
+            0o666,
+            true,
+        )
+        .unwrap();
     }
 
     #[test]

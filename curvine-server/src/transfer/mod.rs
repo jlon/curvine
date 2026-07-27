@@ -9,3 +9,13 @@ pub use self::sqlite_store::SqliteTransferStore;
 
 mod mysql_store;
 pub use self::mysql_store::MysqlTransferStore;
+
+mod metrics;
+pub use self::metrics::{MetadataReplicaRefreshObservation, TransferMetrics};
+
+mod backend;
+pub(crate) use self::backend::is_store_unavailable_error;
+pub use self::backend::TransferStoreBackend;
+
+mod cluster_cache;
+pub use self::cluster_cache::ClusterMetadataCache;

@@ -14,8 +14,8 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
-use crate::master::Master;
-use crate::worker::Worker;
+use crate::master::{Master, MasterShutdown};
+use crate::worker::{Worker, WorkerShutdown};
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::raft::{NodeId, RaftPeer};
@@ -29,7 +29,7 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
@@ -43,6 +43,22 @@ pub struct MiniCluster {
 
     pub master_entries: DashMap<usize, MasterEntry>,
     pub client_rt: Arc<Runtime>,
+    shutdown_handles: Mutex<Vec<ClusterServerShutdown>>,
+    server_threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+enum ClusterServerShutdown {
+    Master(MasterShutdown),
+    Worker(WorkerShutdown),
+}
+
+impl ClusterServerShutdown {
+    fn shutdown(&self) {
+        match self {
+            Self::Master(handle) => handle.shutdown(),
+            Self::Worker(handle) => handle.shutdown(),
+        }
+    }
 }
 
 static RESERVED_TEST_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
@@ -71,6 +87,8 @@ impl MiniCluster {
             worker_conf,
             master_entries: Default::default(),
             client_rt,
+            shutdown_handles: Mutex::new(vec![]),
+            server_threads: Mutex::new(vec![]),
         }
     }
 
@@ -106,28 +124,58 @@ impl MiniCluster {
     pub fn start_master(&self) {
         for (index, conf) in self.master_conf.iter().enumerate() {
             let master = Master::with_conf(conf.clone()).unwrap();
+            let shutdown = master
+                .shutdown_handle()
+                .expect("master shutdown handle should be available before startup");
             self.master_entries.insert(
                 index,
                 MasterEntry(master.get_fs(), master.get_replication_manager()),
             );
-            thread::spawn(move || {
+            let handle = thread::spawn(move || {
                 if let Err(e) = master.block_on_start() {
                     log::error!("mini cluster master failed to start: {}", e);
                     std::process::abort();
                 }
             });
+            self.shutdown_handles
+                .lock()
+                .unwrap()
+                .push(ClusterServerShutdown::Master(shutdown));
+            self.server_threads.lock().unwrap().push(handle);
         }
     }
 
     pub fn start_worker(&self) {
         for conf in &self.worker_conf {
             let worker = Worker::with_conf(conf.clone()).unwrap();
-            thread::spawn(move || {
+            let shutdown = worker
+                .shutdown_handle()
+                .expect("worker shutdown handle should be available before startup");
+            let handle = thread::spawn(move || {
                 if let Err(e) = worker.block_on_start() {
                     log::error!("mini cluster worker failed to start: {}", e);
                     std::process::abort();
                 }
             });
+            self.shutdown_handles
+                .lock()
+                .unwrap()
+                .push(ClusterServerShutdown::Worker(shutdown));
+            self.server_threads.lock().unwrap().push(handle);
+        }
+    }
+
+    pub fn shutdown(&self) {
+        let mut shutdown_handles = self.shutdown_handles.lock().unwrap();
+        for handle in shutdown_handles.iter().rev() {
+            handle.shutdown();
+        }
+        shutdown_handles.clear();
+        drop(shutdown_handles);
+
+        let mut server_threads = self.server_threads.lock().unwrap();
+        for handle in server_threads.drain(..) {
+            let _ = handle.join();
         }
     }
 
@@ -367,5 +415,11 @@ impl MiniCluster {
 impl Default for MiniCluster {
     fn default() -> Self {
         Self::with_num(&ClusterConf::default(), 1, 1)
+    }
+}
+
+impl Drop for MiniCluster {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

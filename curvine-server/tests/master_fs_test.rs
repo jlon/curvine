@@ -41,7 +41,7 @@ use orpc::handler::MessageHandler;
 use orpc::message::Builder;
 #[cfg(feature = "fault-injection")]
 use orpc::message::ResponseStatus;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -188,6 +188,7 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         rt.clone(),
         &conf,
     ));
+    let rpc_lane = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
     MasterHandler::new(
         &conf,
         fs,
@@ -195,6 +196,11 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
+        rpc_lane.clone(),
+        rpc_lane.clone(),
+        rpc_lane.clone(),
+        rpc_lane.clone(),
+        rpc_lane,
         replication_manager,
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
@@ -248,7 +254,7 @@ fn test_master_sync_and_async_rpc_points_follow_dispatch_paths() -> CommonResult
 }
 
 #[test]
-fn only_job_requests_use_the_async_handler() {
+fn control_plane_requests_use_the_async_handler() {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
 
@@ -257,24 +263,20 @@ fn only_job_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
-    ] {
-        let msg = Builder::new_rpc(code).build();
-        assert!(
-            !handler.is_sync(&msg),
-            "{code:?} must use the async handler"
-        );
-    }
-
-    for code in [
         RpcCode::GetBlockLocations,
         RpcCode::GetMasterInfo,
+        RpcCode::GetCvMetadataSnapshotPage,
+        RpcCode::GetCvMetadataDeltaPage,
         RpcCode::ListStatus,
         RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
         RpcCode::WorkerBlockReport,
     ] {
         let msg = Builder::new_rpc(code).build();
-        assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
+        assert!(
+            !handler.is_sync(&msg),
+            "{code:?} must use the async handler"
+        );
     }
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();

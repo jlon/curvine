@@ -12,23 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod error_impl;
-pub use self::error_impl::ErrorImpl;
-
-mod string_error;
-pub use self::string_error::StringError;
-
-mod error_ext;
-pub use self::error_ext::ErrorExt;
-
-mod result_ext;
-pub use self::result_ext::ResultExt;
-
-mod error_encoder;
-pub use self::error_encoder::ErrorEncoder;
-
-mod error_decoder;
-pub use self::error_decoder::ErrorDecoder;
-
-mod common_error_ext;
-pub use self::common_error_ext::CommonErrorExt;
+// Runtime primitives will migrate here from the compatibility facade.

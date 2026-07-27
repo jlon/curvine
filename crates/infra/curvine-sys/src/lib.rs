@@ -12,25 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::ErrorExt;
-
-// Extended Result type, which requires support for setting the wrong context.
-pub trait ResultExt<T, E>: Sized
-where
-    E: ErrorExt,
-{
-    fn ctx(self, ctx: impl Into<String>) -> Result<T, E>;
-}
-
-impl<T, E> ResultExt<T, E> for Result<T, E>
-where
-    E: ErrorExt,
-{
-    // Append 1 wrong context information.
-    fn ctx(self, ctx: impl Into<String>) -> Result<T, E> {
-        match self {
-            Err(e) => Err(e.ctx(ctx)),
-            _ => self,
-        }
-    }
-}
+// Low-level system primitives will migrate here from the compatibility facade.

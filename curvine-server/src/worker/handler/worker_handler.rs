@@ -126,7 +126,11 @@ impl WorkerHandler {
         let task_id = task.task_id.clone();
 
         self.task_manager.submit_task(task)?;
-        let response = SubmitTaskResponse { task_id };
+        let response = SubmitTaskResponse {
+            task_id,
+            accepted: Some(true),
+            reject_reason: None,
+        };
 
         Ok(Builder::success(msg).proto_header(response).build())
     }

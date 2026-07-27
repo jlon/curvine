@@ -53,6 +53,6 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 byteorder = { workspace = true }
+crossbeam = { workspace = true }
 [dev-dependencies]
 curvine-fault = { workspace = true, features = ["http-client"] }
-crossbeam = { workspace = true }

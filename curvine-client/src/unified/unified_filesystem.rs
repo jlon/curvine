@@ -523,7 +523,7 @@ impl UnifiedFileSystem {
         } else {
             (requested_path.clone(), mount.get_cv_path(requested_path)?)
         };
-        mount.ufs.get_status(&source).await?;
+        mount.ufs()?.get_status(&source).await?;
 
         Ok(TransferCommand {
             kind: TransferKind::Load,

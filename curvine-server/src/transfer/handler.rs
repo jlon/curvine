@@ -154,7 +154,7 @@ where
 {
     type Error = FsError;
 
-    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+    fn handle(&self, msg: &Message) -> FsResult<Message> {
         match RpcCode::from(msg.code()) {
             RpcCode::SubmitTransfer => self.submit_transfer(msg),
             RpcCode::GetTransferStatus => self.get_transfer_status(msg),

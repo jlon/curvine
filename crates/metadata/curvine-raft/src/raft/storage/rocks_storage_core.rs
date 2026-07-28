@@ -74,6 +74,7 @@ impl RocksStorageCore {
     }
 
     pub fn init_state(&mut self) -> RaftResult<RaftState> {
+        self.validate_hard_state_commit(self.raft_state.hard_state.commit)?;
         Ok(self.raft_state.clone())
     }
 
@@ -104,22 +105,43 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
-        self.raft_state.hard_state = hs.clone();
+        self.validate_hard_state_commit(hs.commit)?;
 
         let mut batch = StoreWriteBatch::new(&self.db);
         batch.set_state(&hs)?;
         batch.commit()?;
 
+        self.raft_state.hard_state = hs;
+
         Ok(())
     }
 
     pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
-        self.mut_hard_state().set_commit(commit);
+        self.validate_hard_state_commit(commit)?;
+
+        let mut hard_state = self.raft_state.hard_state.clone();
+        hard_state.set_commit(commit);
 
         let mut batch = StoreWriteBatch::new(&self.db);
-        batch.set_state(&self.raft_state.hard_state)?;
+        batch.set_state(&hard_state)?;
         batch.commit()?;
 
+        self.raft_state.hard_state = hard_state;
+
+        Ok(())
+    }
+
+    fn validate_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
+        let snapshot_index = self.snapshot_metadata.index;
+        let last_index = self.last_index();
+        if commit < snapshot_index || commit > last_index {
+            return err_box!(
+                "invalid hard_state commit {} outside durable range [{}, {}]",
+                commit,
+                snapshot_index,
+                last_index
+            );
+        }
         Ok(())
     }
 

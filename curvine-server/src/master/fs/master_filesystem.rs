@@ -924,6 +924,18 @@ impl MasterFilesystem {
                     };
                     match state {
                         BlockInodeState::File => checked.push((item, Some(BlockInodeState::File))),
+                        BlockInodeState::Missing if item.status == BlockReportStatus::Writing => {
+                            warn!(
+                                "block_report deferred deletion for writing block {} on worker {} because its inode is missing",
+                                item.id, list.worker_id
+                            );
+                        }
+                        BlockInodeState::NotFile if item.status == BlockReportStatus::Writing => {
+                            warn!(
+                                "block_report deferred deletion for writing block {} on worker {} because its inode is not a file",
+                                item.id, list.worker_id
+                            );
+                        }
                         BlockInodeState::Missing => {
                             missing_blocks += 1;
                             delete_blocks.push(item.id);

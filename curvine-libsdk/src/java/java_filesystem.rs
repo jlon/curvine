@@ -25,11 +25,19 @@ use curvine_common::FsResult;
 use jni::objects::{JByteArray, JString};
 use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
-use orpc::try_err;
+use orpc::{err_box, try_err};
 use prost::Message;
 
 pub struct JavaFilesystem {
     inner: LibFilesystem,
+}
+
+fn decode_mount_options(bytes: &[u8]) -> FsResult<curvine_common::state::MountOptions> {
+    if bytes.is_empty() {
+        return err_box!("mount options cannot be empty");
+    }
+    let options = try_err!(MountOptionsProto::decode(bytes));
+    Ok(ProtoUtils::mount_options_from_pb(options))
 }
 
 impl JavaFilesystem {
@@ -125,12 +133,8 @@ impl JavaFilesystem {
         let options = env
             .convert_byte_array(&options)
             .map_err(FsError::from_error)?;
-        let options = try_err!(MountOptionsProto::decode(options.as_slice()));
-        self.inner.mount(
-            ufs_path,
-            cv_path,
-            ProtoUtils::mount_options_from_pb(options),
-        )
+        self.inner
+            .mount(ufs_path, cv_path, decode_mount_options(&options)?)
     }
 
     pub fn unmount(&self, env: &mut JNIEnv, cv_path: JString) -> FsResult<()> {
@@ -225,5 +229,16 @@ impl JavaFilesystem {
 
     pub fn cleanup(&self) {
         self.inner.cleanup()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_mount_options;
+
+    #[test]
+    fn rejects_empty_mount_options() {
+        let error = decode_mount_options(&[]).unwrap_err();
+        assert!(error.to_string().contains("mount options cannot be empty"));
     }
 }

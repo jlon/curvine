@@ -85,6 +85,13 @@ public final class MountRequest {
             return this;
         }
 
+        /**
+         * Select replacement-style update semantics for an existing mount.
+         *
+         * <p>All options in this request, including defaults for options not explicitly set,
+         * are sent to the master and can replace existing mount settings. Include each setting's
+         * current value in the request when it must be preserved.
+         */
         public Builder update(boolean update) {
             this.update = update;
             return this;

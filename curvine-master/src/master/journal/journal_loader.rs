@@ -373,22 +373,45 @@ impl JournalLoader {
                     }
 
                     let high = (last_applied + self.batch_size).min(commit_index + 1);
-                    let list = self.log_store.scan_entries(last_applied + 1, high)?;
+                    let expected_start = last_applied + 1;
+                    let list = self.log_store.scan_entries(expected_start, high)?;
 
                     if list.is_empty() {
-                        return Ok(());
+                        return err_box!(
+                            "local raft journal is missing committed entries: expected index {} \
+                             before hard_state.commit={}. Restore a consistent master \
+                             meta+journal pair from a healthy voter; do not restart this voter \
+                             from an empty or partial local directory.",
+                            expected_start,
+                            commit_index
+                        )
+                        .into();
                     };
 
                     info!(
                         "replay-scan, start_index: {}, entries: {}, commit_index: {}",
-                        last_applied + 1,
+                        expected_start,
                         list.len(),
                         commit_index
                     );
 
+                    let mut expected_index = expected_start;
                     for entry in list {
+                        if entry.index != expected_index {
+                            return err_box!(
+                                "local raft journal has a committed entry gap: expected index {}, \
+                                 found index {}, hard_state.commit={}. Restore a consistent \
+                                 master meta+journal pair from a healthy voter; do not restart \
+                                 this voter from an empty or partial local directory.",
+                                expected_index,
+                                entry.index,
+                                commit_index
+                            )
+                            .into();
+                        }
                         self.apply0(is_leader, &entry, skip_ufs_error).await?;
                         last_applied = entry.index;
+                        expected_index += 1;
                         if skip_ufs_error {
                             return Ok(());
                         }

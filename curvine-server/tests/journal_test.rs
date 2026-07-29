@@ -34,30 +34,31 @@ use curvine_server::master::journal::{
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use raft::eraftpb::Entry;
+use raft::{eraftpb::Entry, StateRole};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-fn replay_entries(
-    loader: &JournalLoader,
-    entries: Vec<curvine_server::master::journal::JournalEntry>,
-) -> CommonResult<()> {
+fn replay_entries(loader: &JournalLoader, entries: Vec<JournalEntry>) -> CommonResult<()> {
     let rt = AsyncRuntime::single();
     rt.block_on(async move {
         for (offset, entry) in entries.into_iter().enumerate() {
-            let mut batch = JournalBatch::new(offset as u64 + 1);
-            batch.push(entry);
-            let entry = Entry {
-                term: 1,
-                index: offset as u64 + 1,
-                data: SerdeUtils::serialize(&batch)?,
-                ..Default::default()
-            };
+            let entry = raft_entry(offset as u64 + 1, entry)?;
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
         }
         Ok(())
+    })
+}
+
+fn raft_entry(index: u64, entry: JournalEntry) -> CommonResult<Entry> {
+    let mut batch = JournalBatch::new(index);
+    batch.push(entry);
+    Ok(Entry {
+        term: 1,
+        index,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
     })
 }
 
@@ -141,6 +142,137 @@ fn replay_accepts_versioned_legacy_journal_batch() -> CommonResult<()> {
         .block_on(async { loader.apply(true, ApplyMsg::new_entry(raft_entry)).await })?;
 
     assert!(target_fs.file_status("/versioned-legacy").is_ok());
+    Ok(())
+}
+
+#[test]
+fn promotion_applies_committed_metadata_before_returning() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir(format!("promotion-source-{}", Utils::rand_str(6)));
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir("/committed-before-promotion", false)?;
+    let entry = source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("promotion-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target.fs();
+    let loader = target.journal_loader();
+    let raft_entry = raft_entry(1, entry)?;
+    target.set_committed_entries_for_test(&[raft_entry], 1)?;
+
+    AsyncRuntime::single().block_on(async { loader.role_change(StateRole::Leader).await })?;
+
+    assert!(target_fs.file_status("/committed-before-promotion").is_ok());
+    Ok(())
+}
+
+#[test]
+fn replay_rejects_duplicate_allocated_inode_id() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut first_source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    first_source_conf.change_test_meta_dir(format!("duplicate-id-source-a-{}", Utils::rand_str(6)));
+    let first_source_fs = JournalSystem::fs_only_for_test(&first_source_conf)?;
+    first_source_fs.mkdir("/first", false)?;
+    let first = first_source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    let mut second_source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    second_source_conf
+        .change_test_meta_dir(format!("duplicate-id-source-b-{}", Utils::rand_str(6)));
+    let second_source_fs = JournalSystem::fs_only_for_test(&second_source_conf)?;
+    second_source_fs.mkdir("/second", false)?;
+    let second = second_source_fs
+        .fs_dir
+        .read()
+        .take_entries()
+        .into_iter()
+        .next()
+        .expect("mkdir must emit a journal entry");
+
+    assert_eq!(first.allocated_inode_id(), second.allocated_inode_id());
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir(format!("duplicate-id-target-{}", Utils::rand_str(6)));
+    let target = JournalSystem::from_conf(&target_conf)?;
+    let loader = target.journal_loader();
+    let first_entry = raft_entry(1, first)?;
+    let second_entry = raft_entry(2, second)?;
+
+    let result = AsyncRuntime::single().block_on(async {
+        loader.apply(true, ApplyMsg::new_entry(first_entry)).await?;
+        loader.apply(true, ApplyMsg::new_entry(second_entry)).await
+    });
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn replay_scan_rejects_committed_log_gap() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.change_test_meta_dir(format!("journal-gap-{}", Utils::rand_str(6)));
+    let journal_system = JournalSystem::from_conf(&conf)?;
+    let loader = journal_system.journal_loader();
+
+    let entry1 = Entry {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    };
+    let entry3 = Entry {
+        term: 1,
+        index: 3,
+        ..Default::default()
+    };
+    journal_system.set_committed_entries_for_test(&[entry1, entry3], 3)?;
+
+    let result = AsyncRuntime::single().block_on(async {
+        loader
+            .apply(true, ApplyMsg::new_scan(AppliedIndex::default()))
+            .await
+    });
+
+    let err = result.expect_err("replay must reject committed journal gaps");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("committed entry gap") && err_msg.contains("hard_state.commit=3"),
+        "unexpected error: {}",
+        err_msg
+    );
     Ok(())
 }
 

@@ -70,6 +70,11 @@ impl RocksStorageCore {
             core.raft_state.hard_state = HardState::decode(data.as_ref()).unwrap_or_default();
         }
 
+        if let Some(data) = core.db.get_cf(Self::CF_META, Self::SNAP_KEY).unwrap() {
+            let snapshot = Snapshot::decode(data.as_ref()).unwrap_or_default();
+            core.snapshot_metadata = snapshot.get_metadata().clone();
+        }
+
         core
     }
 
@@ -133,13 +138,20 @@ impl RocksStorageCore {
 
     fn validate_hard_state_commit(&self, commit: u64) -> RaftResult<()> {
         let snapshot_index = self.snapshot_metadata.index;
+        let first_index = self.first_index();
+        let lower_bound = first_index.saturating_sub(1);
         let last_index = self.last_index();
-        if commit < snapshot_index || commit > last_index {
+        if commit < lower_bound || commit > last_index {
             return err_box!(
-                "invalid hard_state commit {} outside durable range [{}, {}]",
+                "invalid local raft storage: hard_state.commit={} is outside durable range \
+                 [{}, {}], first_index={}, snapshot_index={}. Restore a consistent master \
+                 meta+journal pair from a healthy voter; do not restart this voter from an empty \
+                 or partial local directory.",
                 commit,
-                snapshot_index,
-                last_index
+                lower_bound,
+                last_index,
+                first_index,
+                snapshot_index
             );
         }
         Ok(())
@@ -188,15 +200,30 @@ impl RocksStorageCore {
             )));
         }
 
+        let mut hard_state = self.raft_state.hard_state.clone();
+        hard_state.term = cmp::max(hard_state.term, meta.term);
+        hard_state.commit = cmp::max(hard_state.commit, index);
+
         // Non-initialized snapshots need to be saved.
         if index > LOG_START_INDEX {
-            self.db
-                .put_cf(Self::CF_META, Self::SNAP_KEY, snapshot.encode_to_vec())?;
+            let next_index = index.saturating_add(1);
+            let old_first = self.first_index();
+            let old_last = self.last_index();
+            let new_last = cmp::max(old_last, index);
+
+            let mut batch = StoreWriteBatch::new(&self.db);
+            batch.delete_entry(old_first, next_index)?;
+            batch.append_index_range(next_index, new_last)?;
+            batch.append_snapshot(&snapshot)?;
+            batch.set_state(&hard_state)?;
+            batch.commit()?;
+
+            self.first_index = Some(next_index);
+            self.last_index = Some(new_last);
         }
 
         self.snapshot_metadata = meta.clone();
-        self.raft_state.hard_state.term = cmp::max(self.raft_state.hard_state.term, meta.term);
-        self.raft_state.hard_state.commit = cmp::max(self.raft_state.hard_state.commit, index);
+        self.raft_state.hard_state = hard_state;
         self.raft_state.conf_state = meta.get_conf_state().clone();
 
         Ok(())

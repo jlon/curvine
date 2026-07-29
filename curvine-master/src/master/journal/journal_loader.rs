@@ -695,6 +695,7 @@ impl JournalLoader {
                     Ok(())
                 }
             }
+            MetadataCommand::SetAttr(entry) => self.set_attr(entry),
         }
     }
 

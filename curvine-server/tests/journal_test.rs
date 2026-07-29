@@ -17,7 +17,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, WorkerInfo, WriteType,
+    RenameFlags, SetAttrOptsBuilder, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -195,11 +195,18 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     active.mkdir("/committed-dir", false)?;
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
+    active.set_attr(
+        "/renamed-file",
+        SetAttrOptsBuilder::new().owner("committed-owner").build(),
+    )?;
     let legacy_entries = active.fs_dir.read().take_entries();
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
             entry,
-            JournalEntry::Mkdir(_) | JournalEntry::CreateFile(_) | JournalEntry::Rename(_)
+            JournalEntry::Mkdir(_)
+                | JournalEntry::CreateFile(_)
+                | JournalEntry::Rename(_)
+                | JournalEntry::SetAttr(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -207,10 +214,13 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if standby.file_status("/committed-dir").is_ok()
-            && standby.file_status("/renamed-file").is_ok()
             && standby.file_status("/committed-file").is_err()
         {
-            return Ok(());
+            if let Ok(status) = standby.file_status("/renamed-file") {
+                if status.owner == "committed-owner" {
+                    return Ok(());
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
             return err_box!("standby did not apply committed namespace changes");

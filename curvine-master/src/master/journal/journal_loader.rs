@@ -14,16 +14,18 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{DeleteResult, MasterFilesystem};
 use crate::master::journal::*;
 use crate::master::meta::inode::InodeView::File;
-use crate::master::meta::inode::{InodePath, InodeView};
-use crate::master::meta::InodeId;
-use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
+use crate::master::meta::inode::{InodeFile, InodePath, InodeView};
+use crate::master::meta::{FsDir, InodeId};
+use crate::master::{
+    JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
+};
 use curvine_config::JournalConf;
 use curvine_core_error::{err_box, ternary, CommonResult};
 use curvine_error::FsError;
-use curvine_model::RenameFlags;
+use curvine_model::{FreeResult, RenameFlags};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
@@ -34,6 +36,7 @@ use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, C
 use log::{debug, error, info, warn};
 use raft::eraftpb::Entry;
 use raft::StateRole;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -44,6 +47,7 @@ use std::{fs, mem};
 pub struct JournalLoader {
     node_id: u64,
     fs_dir: SyncFsDir,
+    worker_manager: Option<SyncWorkerManager>,
     mnt_mgr: Arc<MountManager>,
     journal_writer: Arc<JournalWriter>,
     ufs_loader: UfsLoader,
@@ -74,6 +78,7 @@ impl JournalLoader {
         Self::build(
             rt,
             fs_dir,
+            None,
             mnt_mgr,
             conf,
             job_manager,
@@ -87,6 +92,7 @@ impl JournalLoader {
     pub(crate) fn new(
         rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
+        worker_manager: SyncWorkerManager,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -96,6 +102,7 @@ impl JournalLoader {
         Self::build(
             rt,
             fs_dir,
+            Some(worker_manager),
             mnt_mgr,
             conf,
             job_manager,
@@ -109,6 +116,7 @@ impl JournalLoader {
     fn build(
         rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
+        worker_manager: Option<SyncWorkerManager>,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
@@ -121,6 +129,7 @@ impl JournalLoader {
         let loader = Self {
             node_id: conf.node_id()?,
             fs_dir,
+            worker_manager,
             mnt_mgr,
             journal_writer,
             ufs_loader,
@@ -631,17 +640,32 @@ impl JournalLoader {
 
             JournalEntry::CreateFile(e) => self.create_file(e),
 
-            JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
+            JournalEntry::OverWriteFile(e) => {
+                self.overwrite_file(e)?;
+                Ok(())
+            }
 
             JournalEntry::AddBlock(e) => self.add_block(e),
 
-            JournalEntry::CompleteFile(e) => self.complete_file(e),
+            JournalEntry::CompleteFile(e) => {
+                self.complete_file(e)?;
+                Ok(())
+            }
 
-            JournalEntry::Rename(e) => self.rename(e),
+            JournalEntry::Rename(e) => {
+                self.rename(e)?;
+                Ok(())
+            }
 
-            JournalEntry::Delete(e) => self.delete(e),
+            JournalEntry::Delete(e) => {
+                self.delete(e)?;
+                Ok(())
+            }
 
-            JournalEntry::Free(e) => self.free(e),
+            JournalEntry::Free(e) => {
+                self.free(e)?;
+                Ok(())
+            }
 
             JournalEntry::CacheInvalidation(e) => self.cache_invalidation(e),
 
@@ -686,8 +710,29 @@ impl JournalLoader {
             }
             MetadataCommand::CreateFile(entry) => self.create_file(entry),
             MetadataCommand::ReopenFile(entry) => self.reopen_file(entry),
+            MetadataCommand::OverWriteFile(entry) => {
+                if let Some(del_res) = self.overwrite_file(entry)? {
+                    self.remove_deleted_blocks(is_leader, &del_res);
+                }
+                Ok(())
+            }
+            MetadataCommand::AddBlock(entry) => self.add_block_file(entry),
+            MetadataCommand::CompleteFile(entry) => {
+                if let Some(del_res) = self.complete_file(entry.clone())? {
+                    self.remove_deleted_blocks(is_leader, &del_res);
+                }
+                if is_leader {
+                    self.ufs_loader
+                        .apply_entry(&JournalEntry::CompleteFile(entry))
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
             MetadataCommand::Rename(entry) => {
-                self.rename(entry.clone())?;
+                if let Some(del_res) = self.rename(entry.clone())? {
+                    self.remove_deleted_blocks(is_leader, &del_res);
+                }
                 if is_leader {
                     self.ufs_loader
                         .apply_entry(&JournalEntry::Rename(entry))
@@ -696,9 +741,13 @@ impl JournalLoader {
                     Ok(())
                 }
             }
+            MetadataCommand::Mount(entry) => self.mount(entry),
+            MetadataCommand::UnMount(entry) => self.unmount(entry),
             MetadataCommand::SetAttr(entry) => self.set_attr(entry),
             MetadataCommand::Delete(entry) => {
-                self.delete(entry.clone())?;
+                if let Some(del_res) = self.delete(entry.clone())? {
+                    self.remove_deleted_blocks(is_leader, &del_res);
+                }
                 if is_leader {
                     self.ufs_loader
                         .apply_entry(&JournalEntry::Delete(entry))
@@ -707,10 +756,35 @@ impl JournalLoader {
                     Ok(())
                 }
             }
+            MetadataCommand::Free(entry) => {
+                let free_res = self.free(entry)?;
+                self.remove_freed_blocks(is_leader, free_res);
+                Ok(())
+            }
             MetadataCommand::Symlink(entry) => self.symlink(entry),
             MetadataCommand::Link(entry) => self.link(entry),
             MetadataCommand::SetLocks(entry) => self.set_locks(entry),
         }
+    }
+
+    fn remove_deleted_blocks(&self, is_leader: bool, del_res: &DeleteResult) {
+        if !is_leader || del_res.blocks.is_empty() {
+            return;
+        }
+        if let Some(worker_manager) = &self.worker_manager {
+            worker_manager.write().remove_blocks(del_res);
+        }
+    }
+
+    fn remove_freed_blocks(&self, is_leader: bool, free_res: FreeResult) {
+        if free_res.blocks.is_empty() {
+            return;
+        }
+        let del_res = DeleteResult {
+            inodes: free_res.inodes.max(0) as u64,
+            blocks: free_res.blocks,
+        };
+        self.remove_deleted_blocks(is_leader, &del_res);
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
@@ -753,7 +827,26 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
+    fn collect_replaced_blocks(
+        fs_dir: &FsDir,
+        old_file: &InodeFile,
+        new_file: &InodeFile,
+    ) -> CommonResult<DeleteResult> {
+        let retained_blocks: HashSet<i64> = new_file.blocks.iter().map(|block| block.id).collect();
+        let mut del_res = DeleteResult::new();
+        for block in &old_file.blocks {
+            if retained_blocks.contains(&block.id) {
+                continue;
+            }
+            let locations = fs_dir.get_block_locations(block.id)?;
+            if !locations.is_empty() {
+                del_res.blocks.insert(block.id, locations);
+            }
+        }
+        Ok(del_res)
+    }
+
+    fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<Option<DeleteResult>> {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
@@ -761,15 +854,17 @@ impl JournalLoader {
             Some(v) => v,
             None => {
                 warn!("overwrite_file: file not found: {:?}", entry);
-                return Ok(());
+                return Ok(None);
             }
         };
+        let old_file = inode.as_file_ref()?.clone();
+        let del_res = Self::collect_replaced_blocks(&fs_dir, &old_file, &entry.file)?;
         let file = inode.as_file_mut()?;
         let _ = mem::replace(file, entry.file);
 
         fs_dir.store.apply_overwrite_file(inode.as_ref())?;
 
-        Ok(())
+        Ok(Some(del_res))
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
@@ -793,7 +888,27 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+    fn add_block_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+
+        let mut inode =
+            match MasterFilesystem::resolve_file_inode(&fs_dir, &entry.path, Some(entry.file.id)) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("add_block_file: file not found: {:?} {}", entry, e);
+                    return Ok(());
+                }
+            };
+        let file = inode.as_file_mut()?;
+        let _ = mem::replace(file, entry.file);
+        fs_dir
+            .store
+            .apply_new_block(inode.as_ref(), &entry.commit_blocks)?;
+
+        Ok(())
+    }
+
+    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<Option<DeleteResult>> {
         let fs_dir = self.fs_dir.write();
 
         let mut inode =
@@ -801,9 +916,11 @@ impl JournalLoader {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("complete_file: file not found: {:?} {}", entry, e);
-                    return Ok(());
+                    return Ok(None);
                 }
             };
+        let old_file = inode.as_file_ref()?.clone();
+        let del_res = Self::collect_replaced_blocks(&fs_dir, &old_file, &entry.file)?;
         let file = inode.as_file_mut()?;
 
         let _ = mem::replace(file, entry.file);
@@ -812,18 +929,18 @@ impl JournalLoader {
             .store
             .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
 
-        Ok(())
+        Ok(Some(del_res))
     }
-    pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
+    pub fn rename(&self, entry: RenameEntry) -> CommonResult<Option<DeleteResult>> {
         let mut fs_dir = self.fs_dir.write();
         let entry_src = entry.src;
         let src_inp = InodePath::resolve(fs_dir.root_ptr(), &entry_src, &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
         if src_inp.get_last_inode().is_none() {
             warn!("Rename: source path not found: {}", entry_src);
-            return Ok(());
+            return Ok(None);
         }
-        fs_dir.unprotected_rename(
+        let del_res = fs_dir.unprotected_rename(
             &src_inp,
             &dst_inp,
             entry.mtime,
@@ -838,30 +955,28 @@ impl JournalLoader {
             },
         )?;
 
-        Ok(())
+        Ok(del_res)
     }
 
-    pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
+    pub fn delete(&self, entry: DeleteEntry) -> CommonResult<Option<DeleteResult>> {
         let mut fs_dir = self.fs_dir.write();
         let entry_path = entry.path;
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry_path, &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
             warn!("Delete: path not found: {}", entry_path);
-            return Ok(());
+            return Ok(None);
         }
-        fs_dir.unprotected_delete(&inp, entry.mtime)?;
-        Ok(())
+        Ok(Some(fs_dir.unprotected_delete(&inp, entry.mtime)?))
     }
 
-    pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
+    pub fn free(&self, entry: FreeEntry) -> CommonResult<FreeResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
         let Some(inode) = inp.get_last_inode() else {
             warn!("Free: path not found: {:?}", entry);
-            return Ok(());
+            return Ok(FreeResult::default());
         };
-        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
-        Ok(())
+        Ok(fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?)
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {

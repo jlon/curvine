@@ -16,8 +16,9 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileLock, LockFlags, LockType,
-    MountOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder, WorkerInfo, WriteType,
+    BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
+    CreateFileOpts, FileAllocOpts, FileLock, HeartbeatStatus, LockFlags, LockType, MountOptions,
+    OpenFlags, RenameFlags, SetAttrOptsBuilder, StorageType, WorkerCommand, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -167,30 +168,67 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     conf.journal.rpc_port = port1;
     let js1 = JournalSystem::from_conf(&conf)?;
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let mnt1 = js1.mount_manager();
     let monitor1 = js1.master_monitor();
 
     conf.change_test_meta_dir("active-committed-namespace-2");
     conf.journal.rpc_port = port2;
     let js2 = JournalSystem::from_conf(&conf)?;
     let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let mnt2 = js2.mount_manager();
     let monitor2 = js2.master_monitor();
 
     js1.start_blocking()?;
     js2.start_blocking()?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let (active, standby) = loop {
+    let (active, standby, active_mnt, standby_mnt) = loop {
         if monitor1.is_active() {
-            break (fs1.clone(), fs2.clone());
+            break (fs1.clone(), fs2.clone(), mnt1.clone(), mnt2.clone());
         }
         if monitor2.is_active() {
-            break (fs2.clone(), fs1.clone());
+            break (fs2.clone(), fs1.clone(), mnt2.clone(), mnt1.clone());
         }
         if std::time::Instant::now() >= deadline {
             return err_box!("Not found active master");
         }
         thread::sleep(Duration::from_millis(100));
     };
+
+    let worker = WorkerInfo::default();
+    active.add_test_worker(worker.clone());
+    standby.add_test_worker(worker.clone());
+    let mount_opts = MountOptions::builder().build();
+    let mount_ufs = new_test_ufs_uri("active-committed-mount")?;
+    active_mnt.mount(
+        None,
+        "/committed-mount",
+        mount_ufs.encode_uri().as_ref(),
+        &mount_opts,
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Mount(_))),
+        "active mount must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    let umount_ufs = new_test_ufs_uri("active-committed-umount")?;
+    active_mnt.mount(
+        None,
+        "/committed-umount",
+        umount_ufs.encode_uri().as_ref(),
+        &mount_opts,
+    )?;
+    let _ = active.fs_dir.read().take_entries();
+    active_mnt.umount("/committed-umount")?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::UnMount(_))),
+        "active umount must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
 
     let barrier = Arc::new(Barrier::new(2));
     let mut handles = vec![];
@@ -273,6 +311,340 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             .any(|entry| matches!(entry, JournalEntry::SetLocks(_))),
         "active set_lock must not emit legacy local-first journal entries: {legacy_entries:?}"
     );
+    active.create("/block-metadata-file", false)?;
+    let block_metadata = active.add_block(
+        "/block-metadata-file",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::AddBlock(_))),
+        "active add_block must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.complete_file(
+        "/block-metadata-file",
+        None,
+        9,
+        vec![CommitBlock {
+            block_id: block_metadata.block.id,
+            block_len: 9,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::CompleteFile(_))),
+        "active complete_file must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/rename-victim", false)?;
+    let old_block = active.add_block(
+        "/rename-victim",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    active.complete_file(
+        "/rename-victim",
+        None,
+        10,
+        vec![CommitBlock {
+            block_id: old_block.block.id,
+            block_len: 10,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    active.block_report(
+        BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker.worker_id(),
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                old_block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                old_block.block.len,
+            )],
+        },
+        None,
+    )?;
+    active.create("/rename-source", false)?;
+    active.rename("/rename-source", "/rename-victim", RenameFlags::empty())?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Rename(_))),
+        "active overwrite rename must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/delete-file", false)?;
+    let delete_block = active.add_block(
+        "/delete-file",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    active.complete_file(
+        "/delete-file",
+        None,
+        11,
+        vec![CommitBlock {
+            block_id: delete_block.block.id,
+            block_len: 11,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    active.block_report(
+        BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker.worker_id(),
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                delete_block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                delete_block.block.len,
+            )],
+        },
+        None,
+    )?;
+    active.create("/post-delete-flush", false)?;
+    active.delete("/delete-file", false)?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Delete(_))),
+        "active file delete must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/free-file", false)?;
+    let free_block = active.add_block(
+        "/free-file",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    active.complete_file(
+        "/free-file",
+        None,
+        12,
+        vec![CommitBlock {
+            block_id: free_block.block.id,
+            block_len: 12,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    active.block_report(
+        BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker.worker_id(),
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                free_block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                free_block.block.len,
+            )],
+        },
+        None,
+    )?;
+    active.create("/post-free-flush", false)?;
+    active.free("/free-file", false)?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Free(_))),
+        "active free must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/overwrite-file", false)?;
+    let overwrite_block = active.add_block(
+        "/overwrite-file",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    active.complete_file(
+        "/overwrite-file",
+        None,
+        13,
+        vec![CommitBlock {
+            block_id: overwrite_block.block.id,
+            block_len: 13,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    active.block_report(
+        BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker.worker_id(),
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                overwrite_block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                overwrite_block.block.len,
+            )],
+        },
+        None,
+    )?;
+    active.create("/post-overwrite-flush", false)?;
+    let _ = active.fs_dir.read().take_entries();
+    active.create_with_opts(
+        "/overwrite-file",
+        CreateFileOpts::with_create(false),
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::OverWriteFile(_))),
+        "active overwrite create must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/resize-file", false)?;
+    let resize_block = active.add_block(
+        "/resize-file",
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    active.complete_file(
+        "/resize-file",
+        None,
+        14,
+        vec![CommitBlock {
+            block_id: resize_block.block.id,
+            block_len: 14,
+            locations: vec![BlockLocation::with_id(worker.worker_id())],
+        }],
+        "",
+        false,
+        None,
+    )?;
+    active.block_report(
+        BlockReportList {
+            cluster_id: conf.cluster_id.clone(),
+            worker_id: worker.worker_id(),
+            full_report: false,
+            total_len: 0,
+            blocks: vec![BlockReportInfo::new(
+                resize_block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                resize_block.block.len,
+            )],
+        },
+        None,
+    )?;
+    active.create("/post-resize-flush", false)?;
+    let _ = active.fs_dir.read().take_entries();
+    active.resize("/resize-file", FileAllocOpts::with_truncate(0))?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::CompleteFile(_))),
+        "active resize must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/assign-worker-file", false)?;
+    let assign_blocks = active.resize("/assign-worker-file", FileAllocOpts::with_truncate(16))?;
+    let assign_block = assign_blocks
+        .block_locs
+        .into_iter()
+        .find(|block| block.should_assign())
+        .expect("resize-created block must require worker assignment");
+    let _ = active.fs_dir.read().take_entries();
+    active.assign_worker(
+        "/assign-worker-file",
+        assign_block.block,
+        ClientAddress::default(),
+        vec![],
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::AddBlock(_))),
+        "active assign_worker must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    let worker_cmds = active.worker_manager.write().heartbeat(
+        &conf.cluster_id,
+        HeartbeatStatus::Running,
+        worker.address.clone(),
+        worker.weight,
+        vec![],
+    )?;
+    assert!(
+        worker_cmds.iter().any(|cmd| matches!(
+            cmd,
+            WorkerCommand::DeleteBlock(delete) if delete.blocks.contains(&delete_block.block.id)
+        )),
+        "file delete must schedule old block deletion"
+    );
+    assert!(
+        worker_cmds.iter().any(|cmd| matches!(
+            cmd,
+            WorkerCommand::DeleteBlock(delete) if delete.blocks.contains(&old_block.block.id)
+        )),
+        "overwrite rename must schedule old block deletion"
+    );
+    assert!(
+        worker_cmds.iter().any(|cmd| matches!(
+            cmd,
+            WorkerCommand::DeleteBlock(delete) if delete.blocks.contains(&overwrite_block.block.id)
+        )),
+        "overwrite create must schedule old block deletion"
+    );
+    assert!(
+        worker_cmds.iter().any(|cmd| matches!(
+            cmd,
+            WorkerCommand::DeleteBlock(delete) if delete.blocks.contains(&resize_block.block.id)
+        )),
+        "resize truncate must schedule old block deletion"
+    );
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     active.set_attr(
@@ -293,6 +665,11 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
                 | JournalEntry::Symlink(_)
                 | JournalEntry::Link(_)
                 | JournalEntry::SetLocks(_)
+                | JournalEntry::AddBlock(_)
+                | JournalEntry::CompleteFile(_)
+                | JournalEntry::OverWriteFile(_)
+                | JournalEntry::Mount(_)
+                | JournalEntry::UnMount(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -300,6 +677,8 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if standby.file_status("/committed-dir").is_ok()
+            && standby.file_status("/committed-mount").is_ok()
+            && standby.file_status("/committed-umount").is_ok()
             && standby.file_status("/committed-file").is_err()
             && standby.file_status("/deleted-dir").is_err()
             && standby.file_status("/exclusive-race").is_ok()
@@ -307,9 +686,26 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             && standby.file_status("/committed-symlink").is_ok()
             && standby.file_status("/hardlink-dst").is_ok()
             && standby.file_status("/lockfile").is_ok()
+            && standby.file_status("/block-metadata-file").is_ok()
+            && standby.file_status("/rename-victim").is_ok()
+            && standby.file_status("/rename-source").is_err()
+            && standby.file_status("/delete-file").is_err()
+            && standby.file_status("/free-file").is_ok()
+            && standby.file_status("/overwrite-file").is_ok()
+            && standby.file_status("/assign-worker-file").is_ok()
         {
-            if let Ok(status) = standby.file_status("/renamed-file") {
-                if status.owner == "committed-owner" {
+            let standby_mounts = standby_mnt.get_mount_table().unwrap_or_default();
+            let mount_converged = standby_mounts
+                .iter()
+                .any(|mount| mount.cv_path == "/committed-mount")
+                && !standby_mounts
+                    .iter()
+                    .any(|mount| mount.cv_path == "/committed-umount");
+            if let (Ok(status), Ok(resized)) = (
+                standby.file_status("/renamed-file"),
+                standby.file_status("/resize-file"),
+            ) {
+                if status.owner == "committed-owner" && resized.len == 0 && mount_converged {
                     return Ok(());
                 }
             }

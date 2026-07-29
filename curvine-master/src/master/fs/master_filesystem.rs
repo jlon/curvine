@@ -226,7 +226,7 @@ impl MasterFilesystem {
         }
     }
 
-    fn active_metadata_write_guard(&self) -> (bool, Option<RwLockWriteGuard<'_, ()>>) {
+    pub(crate) fn active_metadata_write_guard(&self) -> (bool, Option<RwLockWriteGuard<'_, ()>>) {
         let active = self.master_monitor.is_active();
         let guard = if active {
             Some(self.metadata_admission_lock.write())
@@ -355,9 +355,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let (active, _metadata_write) = self.active_metadata_write_guard();
         if active {
-            if let Some(result) = self.delete_committed(path)? {
-                return Ok(result);
-            }
+            return self.delete_committed(path, recursive);
         }
 
         let mut fs_dir = self.fs_dir.write();
@@ -371,28 +369,31 @@ impl MasterFilesystem {
         Ok(true)
     }
 
-    fn delete_committed(&self, path: &str) -> FsResult<Option<bool>> {
+    fn delete_committed(&self, path: &str, recursive: bool) -> FsResult<bool> {
         let (commit, writer) = {
             let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
-            let Some(entry) =
-                fs_dir.prepare_empty_dir_delete_command(&inp, LocalTime::mills() as i64)?
-            else {
-                return Ok(None);
-            };
+            let entry =
+                fs_dir.prepare_delete_command(&inp, recursive, LocalTime::mills() as i64)?;
             let writer = fs_dir.journal_writer.clone();
             let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::Delete(entry)])?;
             (commit, writer)
         };
 
         writer.wait_metadata_commit(commit)?;
-        Ok(Some(true))
+        Ok(true)
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
+        let path = path.as_ref();
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
+            return self.free_committed(path, recursive);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
 
         let mut free_res = fs_dir.free(&inp, recursive)?;
         drop(fs_dir);
@@ -403,6 +404,21 @@ impl MasterFilesystem {
             blocks: std::mem::take(&mut free_res.blocks),
         });
 
+        Ok(free_res)
+    }
+
+    fn free_committed(&self, path: &str, recursive: bool) -> FsResult<FreeResult> {
+        let (free_res, commit, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let (entry, free_res) =
+                fs_dir.prepare_free_command(&inp, recursive, LocalTime::mills() as i64)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::Free(entry)])?;
+            (free_res, commit, writer)
+        };
+
+        writer.wait_metadata_commit(commit)?;
         Ok(free_res)
     }
 
@@ -482,9 +498,6 @@ impl MasterFilesystem {
                 }
             }
 
-            if dst_inp.get_last_inode().is_some() {
-                return Ok(None);
-            }
             Self::check_parent(&dst_inp)?;
 
             let entry = fs_dir.prepare_rename_command(
@@ -575,7 +588,7 @@ impl MasterFilesystem {
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
         let (commit, writer) = {
-            let mut fs_dir = self.fs_dir.write();
+            let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
 
             let last_inode = inp.get_last_inode();
@@ -593,18 +606,18 @@ impl MasterFilesystem {
                 Self::check_parent(&inp)?;
             }
 
-            if last_inode.is_some() {
-                if flags.overwrite() {
-                    self.truncate(&mut fs_dir, &inp, opts)?;
-                } else {
+            let writer = fs_dir.journal_writer.clone();
+            let commit = if last_inode.is_some() {
+                if !flags.overwrite() {
                     return err_ext!(FsError::file_exists(inp.path()));
                 }
-                return fs_dir.file_status(&inp);
-            }
-
-            let commands = fs_dir.prepare_create_file_commands(inp, opts)?;
-            let writer = fs_dir.journal_writer.clone();
-            let commit = writer.enqueue_metadata_commands(commands)?;
+                let entry =
+                    fs_dir.prepare_overwrite_file_command(&inp, opts, LocalTime::mills() as i64)?;
+                writer.enqueue_metadata_commands(vec![MetadataCommand::OverWriteFile(entry)])?
+            } else {
+                let commands = fs_dir.prepare_create_file_commands(inp, opts)?;
+                writer.enqueue_metadata_commands(commands)?
+            };
             (commit, writer)
         };
 
@@ -685,8 +698,8 @@ impl MasterFilesystem {
             self.validate_create_options(path, &opts)?;
         }
 
-        let (commit, writer) = {
-            let mut fs_dir = self.fs_dir.write();
+        let (commit, writer, truncated) = {
+            let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
 
             let Some(inode) = inp.get_last_inode() else {
@@ -704,20 +717,28 @@ impl MasterFilesystem {
             }
 
             if flags.truncate() {
-                self.truncate(&mut fs_dir, &inp, opts)?;
-                let status = fs_dir.file_status(&inp)?;
-                return Ok(FileBlocks::new(status, vec![]));
+                let entry =
+                    fs_dir.prepare_overwrite_file_command(&inp, opts, LocalTime::mills() as i64)?;
+                let writer = fs_dir.journal_writer.clone();
+                let commit = writer
+                    .enqueue_metadata_commands(vec![MetadataCommand::OverWriteFile(entry)])?;
+                (commit, writer, true)
+            } else {
+                let entry = fs_dir.prepare_reopen_file_command(&inp, opts.client_name)?;
+                let writer = fs_dir.journal_writer.clone();
+                let commit =
+                    writer.enqueue_metadata_commands(vec![MetadataCommand::ReopenFile(entry)])?;
+                (commit, writer, false)
             }
-
-            let entry = fs_dir.prepare_reopen_file_command(&inp, opts.client_name)?;
-            let writer = fs_dir.journal_writer.clone();
-            let commit =
-                writer.enqueue_metadata_commands(vec![MetadataCommand::ReopenFile(entry)])?;
-            (commit, writer)
         };
 
         writer.wait_metadata_commit(commit)?;
-        self.get_block_locations(path)
+        if truncated {
+            let status = self.file_status(path)?;
+            Ok(FileBlocks::new(status, vec![]))
+        } else {
+            self.get_block_locations(path)
+        }
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
@@ -886,6 +907,19 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            let _metadata_write = self.metadata_admission_lock.write();
+            return self.add_block_committed(
+                path,
+                inode_id,
+                client_addr,
+                commit_blocks,
+                exclude_workers,
+                file_len,
+                last_block,
+            );
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
@@ -924,6 +958,60 @@ impl MasterFilesystem {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn add_block_committed(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        client_addr: ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
+        exclude_workers: Vec<u32>,
+        file_len: i64,
+        last_block: Option<ExtendedBlock>,
+    ) -> FsResult<LocatedBlock> {
+        let (commit, writer, block, locs, has_spdk) = {
+            let fs_dir = self.fs_dir.write();
+            let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+            let file = inode.as_file_ref()?;
+
+            if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
+                let locs = fs_dir.get_block_locations(next.id)?;
+                let extend_block = ExtendedBlock {
+                    id: next.id,
+                    len: next.len(),
+                    storage_type: file.storage_policy.storage_type,
+                    file_type: file.file_type,
+                    alloc_opts: next.alloc_opts.clone(),
+                };
+
+                return self.create_locate_block(path, extend_block, &locs);
+            }
+
+            let choose_workers = self.choose_worker_for_file(file, client_addr, exclude_workers)?;
+            let has_spdk = {
+                let wm = self.worker_manager.read();
+                wm.workers_have_spdk(&choose_workers)
+            };
+            let (entry, block) = fs_dir.prepare_add_block_command(
+                path,
+                inode,
+                commit_blocks,
+                &choose_workers,
+                file_len,
+            )?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit =
+                writer.enqueue_metadata_commands(vec![MetadataCommand::AddBlock(entry)])?;
+            (commit, writer, block, choose_workers, has_spdk)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+        Ok(LocatedBlock {
+            block,
+            locs,
+            has_spdk,
+        })
+    }
+
     pub fn complete_file<T: AsRef<str>>(
         &self,
         path: T,
@@ -982,6 +1070,20 @@ impl MasterFilesystem {
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
+        let client_name = client_name.as_ref();
+        if self.master_monitor.is_active() {
+            let _metadata_write = self.metadata_admission_lock.write();
+            return self.complete_file_committed(
+                path,
+                inode_id,
+                len,
+                commit_blocks,
+                client_name,
+                only_flush,
+                set_attr_opts,
+            );
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
@@ -1003,6 +1105,52 @@ impl MasterFilesystem {
         }
 
         Ok(None)
+    }
+
+    fn complete_file_committed(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: &str,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<Option<FileBlocks>> {
+        let (commit, writer, committed_inode_id) = {
+            let fs_dir = self.fs_dir.write();
+            let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
+            let entry = fs_dir.prepare_complete_file_command(
+                path,
+                inode,
+                len,
+                commit_blocks,
+                client_name,
+                only_flush,
+                set_attr_opts,
+            )?;
+            let committed_inode_id = entry.file.id;
+            let writer = fs_dir.journal_writer.clone();
+            let commit =
+                writer.enqueue_metadata_commands(vec![MetadataCommand::CompleteFile(entry)])?;
+            (commit, writer, committed_inode_id)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+        if only_flush {
+            let blocks = self.get_block_locations(path)?;
+            if blocks.status.id != committed_inode_id {
+                return err_box!(
+                    "Path {} resolved to different inode after complete_file, expected {}, got {}",
+                    path,
+                    committed_inode_id,
+                    blocks.status.id
+                );
+            }
+            Ok(Some(blocks))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn get_file_blocks(
@@ -1974,6 +2122,11 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            let _metadata_write = self.metadata_admission_lock.write();
+            return self.resize_committed(path, opts);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         // This snapshot only rejects individually impossible requests; it is not a
         // reservation, so concurrent fallocates may observe the same capacity.
@@ -2011,6 +2164,44 @@ impl MasterFilesystem {
         Ok(blocks)
     }
 
+    fn resize_committed(&self, path: &str, opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        let available = if opts.truncate {
+            i64::MAX
+        } else {
+            self.worker_manager.read().available_bytes()
+        };
+        let (commit, writer, inode_id) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+            let file = inode.as_file_ref()?;
+            Self::validate_alloc_capacity(file.len, file.replicas, &opts, available)?;
+            let inode_id = inode.id();
+            let command = fs_dir.prepare_resize_command(&inp, opts)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = if let Some(entry) = command {
+                writer.enqueue_metadata_commands(vec![MetadataCommand::CompleteFile(entry)])?
+            } else {
+                writer.enqueue_metadata_commands(vec![])?
+            };
+            (commit, writer, inode_id)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+
+        let blocks = self.get_block_locations(path)?;
+        if blocks.status.id != inode_id {
+            return err_box!(
+                "Path {} resolved to different inode after resize, expected {}, got {}",
+                path,
+                inode_id,
+                blocks.status.id
+            );
+        }
+
+        Ok(blocks)
+    }
+
     pub fn assign_worker<T: AsRef<str>>(
         &self,
         path: T,
@@ -2019,6 +2210,11 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
+        if self.master_monitor.is_active() {
+            let _metadata_write = self.metadata_admission_lock.write();
+            return self.assign_worker_committed(path, block, client_addr, exclude_workers);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
@@ -2033,6 +2229,41 @@ impl MasterFilesystem {
         Ok(LocatedBlock {
             block,
             locs: choose_workers,
+            has_spdk,
+        })
+    }
+
+    fn assign_worker_committed(
+        &self,
+        path: &str,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<LocatedBlock> {
+        let (commit, writer, block, locs, has_spdk) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+
+            let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+            let has_spdk = {
+                let wm = self.worker_manager.read();
+                wm.workers_have_spdk(&choose_workers)
+            };
+            let (entry, block) =
+                fs_dir.prepare_assign_worker_command(&inp, block.id, &choose_workers)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = if let Some(entry) = entry {
+                writer.enqueue_metadata_commands(vec![MetadataCommand::AddBlock(entry)])?
+            } else {
+                writer.enqueue_metadata_commands(vec![])?
+            };
+            (commit, writer, block, choose_workers, has_spdk)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+        Ok(LocatedBlock {
+            block,
+            locs,
             has_spdk,
         })
     }

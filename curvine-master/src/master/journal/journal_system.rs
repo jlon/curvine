@@ -279,6 +279,7 @@ impl JournalSystem {
             JournalLoader::new(
                 rt.clone(),
                 parts.fs_dir.clone(),
+                parts.worker_manager.clone(),
                 parts.mount_manager.clone(),
                 &conf.journal,
                 parts.job_manager.clone(),

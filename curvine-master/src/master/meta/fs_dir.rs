@@ -14,8 +14,9 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{
-    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, LinkEntry, MetadataCommand,
-    MkdirEntry, RenameEntry, ReopenFileEntry, SetAttrEntry, SetLocksEntry, SymlinkEntry,
+    CompleteFileEntry, CreateFileEntry, DeleteEntry, FreeEntry, JournalEntry, JournalWriter,
+    LinkEntry, MetadataCommand, MkdirEntry, OverWriteFileEntry, RenameEntry, ReopenFileEntry,
+    SetAttrEntry, SetLocksEntry, SymlinkEntry,
 };
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -311,11 +312,12 @@ impl FsDir {
         Ok(del_res)
     }
 
-    pub(crate) fn prepare_empty_dir_delete_command(
+    pub(crate) fn prepare_delete_command(
         &self,
         inp: &InodePath,
+        recursive: bool,
         mtime: i64,
-    ) -> FsResult<Option<DeleteEntry>> {
+    ) -> FsResult<DeleteEntry> {
         if inp.is_root() {
             return err_box!("The root is not allowed to be deleted");
         }
@@ -324,16 +326,16 @@ impl FsDir {
             return err_ext!(FsError::file_not_found(inp.path()));
         }
 
-        if !inp.is_empty_dir() {
-            return Ok(None);
+        if !inp.is_empty_dir() && !recursive {
+            return err_ext!(FsError::dir_not_empty(inp.path()));
         }
 
-        Ok(Some(DeleteEntry {
+        Ok(DeleteEntry {
             op_id: self.next_op_id(),
             rpc_id: 0,
             path: inp.path().to_string(),
             mtime,
-        }))
+        })
     }
 
     pub(crate) fn unprotected_delete(
@@ -411,6 +413,72 @@ impl FsDir {
         self.journal_writer
             .log_free(self, inp.path(), op_ms, recursive)?;
 
+        Ok(free_res)
+    }
+
+    pub(crate) fn prepare_free_command(
+        &self,
+        inp: &InodePath,
+        recursive: bool,
+        mtime: i64,
+    ) -> FsResult<(FreeEntry, FreeResult)> {
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be free");
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let free_res = self.collect_free_result(inode, mtime, recursive)?;
+        Ok((
+            FreeEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: inp.path().to_string(),
+                mtime,
+                recursive,
+            },
+            free_res,
+        ))
+    }
+
+    fn collect_free_result(
+        &self,
+        inode: InodePtr,
+        mtime: i64,
+        recursive: bool,
+    ) -> FsResult<FreeResult> {
+        let mut free_res = FreeResult::default();
+        let mut stack = LinkedList::new();
+        stack.push_back(inode);
+        while let Some(inode) = stack.pop_front() {
+            match inode.as_ref() {
+                FileEntry(e) => {
+                    if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
+                        stack.push_back(InodePtr::from_owned(store_inode));
+                    }
+                }
+
+                Dir(d) => {
+                    if recursive {
+                        for child in d.children_iter() {
+                            stack.push_back(InodePtr::from_ref(child));
+                        }
+                    }
+                }
+
+                File(f) => {
+                    let locs = f.get_locs(&self.store)?;
+                    let bytes = f.get_locs_bytes(&locs);
+                    let mut file = f.clone();
+                    if file.free(mtime) {
+                        free_res.add(bytes, locs);
+                    }
+                }
+            }
+        }
         Ok(free_res)
     }
 
@@ -499,17 +567,28 @@ impl FsDir {
         if src_inp.get_last_inode().is_none() {
             return err_ext!(FsError::file_not_found(src_inp.path()));
         }
-        if dst_inp.get_last_inode().is_some() {
-            return err_box!(
-                "committed rename currently requires an absent destination: {}",
-                dst_inp.path()
-            );
-        }
         if flags.exchange_mode() {
             return err_box!("Rename failed, because exchange mode is not supported");
         }
         if dst_inp.get_inode(-2).is_none() {
             return err_box!("Parent {} does not exist", dst_inp.get_parent_path());
+        }
+        if let Some(dst_inode) = dst_inp.get_last_inode() {
+            let src_inode = src_inp.get_last_inode().expect("checked above");
+            let src_is_file = src_inode.is_file();
+            let dst_is_file = dst_inode.is_file();
+            if flags.no_replace() {
+                return err_ext!(FsError::file_exists(dst_inp.path()));
+            }
+            if src_is_file && !dst_is_file {
+                return err_ext!(FsError::is_a_directory(dst_inp.path()));
+            }
+            if !src_is_file && dst_is_file {
+                return err_ext!(FsError::not_a_directory(dst_inp.path()));
+            }
+            if !src_is_file && !dst_is_file && !dst_inp.is_empty_dir() {
+                return err_ext!(FsError::dir_not_empty(dst_inp.path()));
+            }
         }
 
         Ok(RenameEntry {
@@ -880,6 +959,41 @@ impl FsDir {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_add_block_command(
+        &self,
+        path: impl AsRef<str>,
+        inode: InodePtr,
+        commit_blocks: Vec<CommitBlock>,
+        choose_workers: &[WorkerAddress],
+        file_len: i64,
+    ) -> FsResult<(CompleteFileEntry, ExtendedBlock)> {
+        let mut file = inode.as_file_ref()?.clone();
+        let new_block_id = file.next_block_id()?;
+
+        file.complete(file_len, &commit_blocks, "", true)?;
+        file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+
+        let block = ExtendedBlock {
+            id: new_block_id,
+            len: 0,
+            storage_type: file.storage_policy.storage_type,
+            file_type: file.file_type,
+            alloc_opts: None,
+        };
+
+        Ok((
+            CompleteFileEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: path.as_ref().to_string(),
+                file,
+                commit_blocks,
+            },
+            block,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_file(
         &mut self,
         path: impl AsRef<str>,
@@ -910,6 +1024,36 @@ impl FsDir {
             .log_complete_file(self, path, inode.as_file_ref()?, commit_block)?;
 
         Ok(true)
+    }
+
+    pub(crate) fn prepare_complete_file_command(
+        &self,
+        path: impl AsRef<str>,
+        inode: InodePtr,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: impl AsRef<str>,
+        only_flush: bool,
+        set_attr_opts: Option<SetAttrOpts>,
+    ) -> FsResult<CompleteFileEntry> {
+        let mut inode = inode.as_ref().clone();
+        inode
+            .as_file_mut()?
+            .complete(len, &commit_blocks, client_name, only_flush)?;
+        if !only_flush {
+            if let Some(opts) = set_attr_opts {
+                inode.set_attr(opts)?;
+            }
+        }
+        let file = inode.as_file_ref()?.clone();
+
+        Ok(CompleteFileEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: path.as_ref().to_string(),
+            file,
+            commit_blocks,
+        })
     }
 
     pub fn get_file_locations(
@@ -991,6 +1135,31 @@ impl FsDir {
             rpc_id: 0,
             path: inp.path().to_string(),
             file: file.clone(),
+        })
+    }
+
+    pub(crate) fn prepare_overwrite_file_command(
+        &self,
+        inp: &InodePath,
+        opts: CreateFileOpts,
+        mtime: i64,
+    ) -> FsResult<OverWriteFileEntry> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+        if !inode.is_file() {
+            return err_box!("Path is not a file: {}", inp.path());
+        }
+
+        let mut file = inode.as_file_ref()?.clone();
+        file.overwrite(opts, mtime);
+
+        Ok(OverWriteFileEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            file,
         })
     }
 
@@ -1623,6 +1792,33 @@ impl FsDir {
         Ok(del_res)
     }
 
+    pub(crate) fn prepare_resize_command(
+        &self,
+        inp: &InodePath,
+        opts: FileAllocOpts,
+    ) -> FsResult<Option<CompleteFileEntry>> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let mut file = inode.as_file_ref()?.clone();
+        if file.len == opts.len {
+            return Ok(None);
+        }
+
+        file.resize(opts)?;
+        file.complete(file.len, &[], "", true)?;
+
+        Ok(Some(CompleteFileEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            file,
+            commit_blocks: vec![],
+        }))
+    }
+
     pub fn assign_worker(
         &mut self,
         inp: InodePath,
@@ -1649,6 +1845,40 @@ impl FsDir {
         }
 
         Ok(block)
+    }
+
+    pub(crate) fn prepare_assign_worker_command(
+        &self,
+        inp: &InodePath,
+        block_id: i64,
+        workers: &[WorkerAddress],
+    ) -> FsResult<(Option<CompleteFileEntry>, ExtendedBlock)> {
+        let inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
+        let mut file = inode.as_file_ref()?.clone();
+
+        let block = file.search_block_mut_check(block_id)?;
+        let changed = block.assign_worker(workers);
+        let block = ExtendedBlock {
+            id: block.id,
+            len: block.len as i64,
+            alloc_opts: block.alloc_opts.clone(),
+            storage_type: file.storage_policy.storage_type,
+            file_type: file.file_type,
+        };
+
+        let entry = if changed {
+            Some(CompleteFileEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                path: inp.path().to_string(),
+                file,
+                commit_blocks: vec![],
+            })
+        } else {
+            None
+        };
+
+        Ok((entry, block))
     }
 
     pub fn get_locations(&self, meta: &BlockMeta) -> CommonResult<Vec<BlockLocation>> {

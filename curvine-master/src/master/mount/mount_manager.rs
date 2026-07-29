@@ -14,6 +14,7 @@
 
 #![allow(unused)]
 use crate::master::fs::MasterFilesystem;
+use crate::master::journal::MetadataCommand;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
 use curvine_core_error::err_box;
@@ -111,6 +112,24 @@ impl MountManager {
             .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
     }
 
+    fn add_mount_committed(
+        &self,
+        mnt_id: Option<u32>,
+        mount_path: &str,
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<()> {
+        let assign_id = match mnt_id {
+            Some(id) => id,
+            None => self.mount_table.assign_mount_id()?,
+        };
+        let entry = self
+            .mount_table
+            .prepare_add_mount_command(assign_id, mount_path, ufs_path, mnt_opt)?;
+        self.mount_table
+            .commit_metadata_command(MetadataCommand::Mount(entry))
+    }
+
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
         let path = Path::from_str(cv_path)?;
         let Some(existing) = self.get_mount_info(&path)? else {
@@ -120,6 +139,17 @@ impl MountManager {
         Self::normalize_mount_config(&mut merged)?;
 
         self.mount_table.update_mount(merged)
+    }
+
+    fn update_mount_committed(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let path = Path::from_str(cv_path)?;
+        let Some(existing) = self.get_mount_info(&path)? else {
+            return err_box!("mount point {} not found for update", cv_path);
+        };
+        let merged = existing.merge_with(mnt_opt.clone());
+        let entry = self.mount_table.prepare_update_mount_command(merged)?;
+        self.mount_table
+            .commit_metadata_command(MetadataCommand::Mount(entry))
     }
 
     /// same baseuri of ufs can only mount once
@@ -134,7 +164,17 @@ impl MountManager {
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
         if mnt_opt.update {
+            let (active, _metadata_write) = self.master_fs.active_metadata_write_guard();
+            if active {
+                return self.update_mount_committed(cv_path, mnt_opt);
+            }
             return self.update_mount(cv_path, mnt_opt);
+        }
+
+        let _ = self.create_mount_point(cv_path)?;
+        let (active, _metadata_write) = self.master_fs.active_metadata_write_guard();
+        if active {
+            return self.add_mount_committed(mnt_id, cv_path, ufs_path, mnt_opt);
         }
 
         self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
@@ -145,7 +185,17 @@ impl MountManager {
     }
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
+        let (active, _metadata_write) = self.master_fs.active_metadata_write_guard();
+        if active {
+            return self.umount_committed(cv_path);
+        }
         self.mount_table.umount(cv_path)
+    }
+
+    fn umount_committed(&self, cv_path: &str) -> FsResult<()> {
+        let entry = self.mount_table.prepare_unmount_command(cv_path)?;
+        self.mount_table
+            .commit_metadata_command(MetadataCommand::UnMount(entry))
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {

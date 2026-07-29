@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::journal::{MetadataCommand, MountEntry, UnMountEntry};
 use crate::master::SyncFsDir;
 use curvine_config::{UfsConf, UfsConfBuilder};
 use curvine_core_error::err_box;
@@ -197,6 +198,31 @@ impl MountTable {
         Ok(())
     }
 
+    pub fn prepare_add_mount_command(
+        &self,
+        mount_id: u32,
+        cv_path: &str,
+        ufs_path: &str,
+        mnt_opt: &MountOptions,
+    ) -> FsResult<MountEntry> {
+        if self.exists(ufs_path)? {
+            return err_box!("{} already exists in mount table", ufs_path);
+        }
+
+        if self.mount_point_inuse(cv_path)? {
+            return err_box!("{} already exists in mount table", cv_path);
+        }
+
+        self.check_conflict(cv_path, ufs_path)?;
+        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+        let fs_dir = self.fs_dir.read();
+        Ok(MountEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            info,
+        })
+    }
+
     pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
         let old = self.get_mount_info_by_id(info.mount_id)?;
         if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
@@ -208,6 +234,28 @@ impl MountTable {
         let mut fs_dir = self.fs_dir.write();
         fs_dir.store_mount(info, true)?;
         Ok(())
+    }
+
+    pub fn prepare_update_mount_command(&self, info: MountInfo) -> FsResult<MountEntry> {
+        let old = self.get_mount_info_by_id(info.mount_id)?;
+        if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
+            return err_box!("cannot change mount path");
+        }
+
+        let fs_dir = self.fs_dir.read();
+        Ok(MountEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            info,
+        })
+    }
+
+    pub fn commit_metadata_command(&self, command: MetadataCommand) -> FsResult<()> {
+        let writer = {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.journal_writer.clone()
+        };
+        writer.commit_metadata_commands(vec![command])
     }
 
     pub fn assign_mount_id(&self) -> FsResult<u32> {
@@ -243,6 +291,26 @@ impl MountTable {
         fs_dir.unmount(mount_id)?;
 
         Ok(())
+    }
+
+    pub fn prepare_unmount_command(&self, mount_path: &str) -> FsResult<UnMountEntry> {
+        let inner = self.read_inner()?;
+
+        let mount_id = match inner.mountpath2id.get(mount_path) {
+            Some(&id) => id,
+            None => return err_box!("failed found {} to umount", mount_path),
+        };
+
+        if !inner.mountid2entry.contains_key(&mount_id) {
+            return err_box!("failed found {} matched mountentry to umount", mount_id);
+        }
+
+        let fs_dir = self.fs_dir.read();
+        Ok(UnMountEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            id: mount_id,
+        })
     }
 
     /// use ufs_uri to find ufs config

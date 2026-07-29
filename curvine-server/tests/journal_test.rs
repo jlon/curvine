@@ -16,8 +16,8 @@ use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
-    RenameFlags, SetAttrOptsBuilder, WorkerInfo, WriteType,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, FileLock, LockFlags, LockType,
+    MountOptions, OpenFlags, RenameFlags, SetAttrOptsBuilder, WorkerInfo, WriteType,
 };
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
@@ -223,6 +223,56 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
 
     active.mkdir("/committed-dir", false)?;
     active.mkdir("/deleted-dir", false)?;
+    active.create("/reopen-file", false)?;
+    active.open_file(
+        "/reopen-file",
+        CreateFileOpts::with_create(false),
+        OpenFlags::new_write_only(),
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::ReopenFile(_))),
+        "active reopen_file must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.symlink("/target", "/committed-symlink", false, 0o777)?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Symlink(_))),
+        "active symlink must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/hardlink-source", false)?;
+    active.link("/hardlink-source", "/hardlink-dst")?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::Link(_))),
+        "active link must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
+    active.create("/lockfile", false)?;
+    active.set_lock(
+        "/lockfile",
+        FileLock {
+            client_id: "client1".to_string(),
+            owner_id: 1,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            ..Default::default()
+        },
+    )?;
+    let legacy_entries = active.fs_dir.read().take_entries();
+    assert!(
+        !legacy_entries
+            .iter()
+            .any(|entry| matches!(entry, JournalEntry::SetLocks(_))),
+        "active set_lock must not emit legacy local-first journal entries: {legacy_entries:?}"
+    );
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     active.set_attr(
@@ -236,9 +286,13 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             entry,
             JournalEntry::Mkdir(_)
                 | JournalEntry::CreateFile(_)
+                | JournalEntry::ReopenFile(_)
                 | JournalEntry::Rename(_)
                 | JournalEntry::SetAttr(_)
                 | JournalEntry::Delete(_)
+                | JournalEntry::Symlink(_)
+                | JournalEntry::Link(_)
+                | JournalEntry::SetLocks(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -249,6 +303,10 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             && standby.file_status("/committed-file").is_err()
             && standby.file_status("/deleted-dir").is_err()
             && standby.file_status("/exclusive-race").is_ok()
+            && standby.file_status("/reopen-file").is_ok()
+            && standby.file_status("/committed-symlink").is_ok()
+            && standby.file_status("/hardlink-dst").is_ok()
+            && standby.file_status("/lockfile").is_ok()
         {
             if let Ok(status) = standby.file_status("/renamed-file") {
                 if status.owner == "committed-owner" {

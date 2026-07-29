@@ -685,6 +685,7 @@ impl JournalLoader {
                 }
             }
             MetadataCommand::CreateFile(entry) => self.create_file(entry),
+            MetadataCommand::ReopenFile(entry) => self.reopen_file(entry),
             MetadataCommand::Rename(entry) => {
                 self.rename(entry.clone())?;
                 if is_leader {
@@ -706,6 +707,9 @@ impl JournalLoader {
                     Ok(())
                 }
             }
+            MetadataCommand::Symlink(entry) => self.symlink(entry),
+            MetadataCommand::Link(entry) => self.link(entry),
+            MetadataCommand::SetLocks(entry) => self.set_locks(entry),
         }
     }
 

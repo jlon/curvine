@@ -162,6 +162,30 @@ impl MasterFilesystem {
         Ok(())
     }
 
+    fn validate_create_options(&self, path: &str, opts: &CreateFileOpts) -> FsResult<()> {
+        self.check_path_length(path)?;
+
+        if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
+            return err_box!(
+                "The replica number {} needs to be between {} and {}",
+                opts.replicas,
+                self.conf.min_replication,
+                self.conf.max_replication
+            );
+        }
+
+        if opts.block_size < self.conf.min_block_size || opts.block_size >= self.conf.max_block_size
+        {
+            return err_box!(
+                "Block size needs to be between {} and {}",
+                self.conf.min_block_size,
+                self.conf.max_block_size
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn new(
         conf: &ClusterConf,
         fs_dir: SyncFsDir,
@@ -503,26 +527,7 @@ impl MasterFilesystem {
         }
         let path = path.as_ref();
 
-        // Check the path length
-        self.check_path_length(path)?;
-
-        if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
-            return err_box!(
-                "The replica number {} needs to be between {} and {}",
-                opts.replicas,
-                self.conf.min_replication,
-                self.conf.max_replication
-            );
-        }
-
-        if opts.block_size < self.conf.min_block_size || opts.block_size >= self.conf.max_block_size
-        {
-            return err_box!(
-                "Block size needs to be between {} and {}",
-                self.conf.min_block_size,
-                self.conf.max_block_size
-            );
-        }
+        self.validate_create_options(path, &opts)?;
 
         let (active, _metadata_write) = self.active_metadata_write_guard();
         if active {
@@ -625,6 +630,11 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
+        if self.master_monitor.is_active() {
+            let _metadata_write = self.metadata_admission_lock.write();
+            return self.open_file_committed(path, opts, flags);
+        }
+
         let metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
@@ -663,6 +673,51 @@ impl MasterFilesystem {
             vec![]
         };
         Ok(FileBlocks::new(status, blocks))
+    }
+
+    fn open_file_committed(
+        &self,
+        path: &str,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileBlocks> {
+        if flags.create() {
+            self.validate_create_options(path, &opts)?;
+        }
+
+        let (commit, writer) = {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+
+            let Some(inode) = inp.get_last_inode() else {
+                return if flags.create() {
+                    drop(fs_dir);
+                    let status = self.create_with_opts_committed(path, opts, flags)?;
+                    Ok(FileBlocks::new(status, vec![]))
+                } else {
+                    err_ext!(FsError::file_not_found(inp.path()))
+                };
+            };
+
+            if inode.is_dir() {
+                return err_box!("{} is a directory", inp.path());
+            }
+
+            if flags.truncate() {
+                self.truncate(&mut fs_dir, &inp, opts)?;
+                let status = fs_dir.file_status(&inp)?;
+                return Ok(FileBlocks::new(status, vec![]));
+            }
+
+            let entry = fs_dir.prepare_reopen_file_command(&inp, opts.client_name)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit =
+                writer.enqueue_metadata_commands(vec![MetadataCommand::ReopenFile(entry)])?;
+            (commit, writer)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+        self.get_block_locations(path)
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
@@ -1848,6 +1903,11 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
+            return self.symlink_committed(target, link, force, mode, owner, group);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
@@ -1855,12 +1915,59 @@ impl MasterFilesystem {
         fs_dir.symlink(target, link, force, mode, owner, group)
     }
 
+    fn symlink_committed<T: AsRef<str>>(
+        &self,
+        target: T,
+        link: T,
+        force: bool,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<()> {
+        let (commit, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let link = Self::resolve_path(&fs_dir, link.as_ref())?;
+            let entry = fs_dir.prepare_symlink_command(
+                target.as_ref().to_string(),
+                &link,
+                force,
+                mode,
+                owner,
+                group,
+            )?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::Symlink(entry)])?;
+            (commit, writer)
+        };
+
+        writer.wait_metadata_commit(commit)
+    }
+
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
+            return self.link_committed(src_path, dst_path);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
         fs_dir.link(src_path, dst_path)
+    }
+
+    fn link_committed<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
+        let (commit, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
+            let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
+            let commands = fs_dir.prepare_link_commands(&src_path, dst_path)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(commands)?;
+            (commit, writer)
+        };
+
+        writer.wait_metadata_commit(commit)
     }
 
     pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
@@ -1943,11 +2050,36 @@ impl MasterFilesystem {
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
+            return self.set_lock_committed(path, lock);
+        }
+
         let _metadata_read = self.active_metadata_read_guard();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+    }
+
+    fn set_lock_committed(&self, path: &str, lock: FileLock) -> FsResult<Option<FileLock>> {
+        let (conflict, commit, writer) = {
+            let fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let (conflict, entry) =
+                fs_dir.prepare_set_locks_command(&inp, lock, self.conf.lock_expire_time_ms())?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = match entry {
+                Some(entry) => {
+                    writer.enqueue_metadata_commands(vec![MetadataCommand::SetLocks(entry)])?
+                }
+                None => crate::master::journal::JournalCommit::Completed,
+            };
+            (conflict, commit, writer)
+        };
+
+        writer.wait_metadata_commit(commit)?;
+        Ok(conflict)
     }
 }
 

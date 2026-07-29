@@ -632,9 +632,13 @@ impl JournalCommand {
 pub enum MetadataCommand {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
     Rename(RenameEntry),
     SetAttr(SetAttrEntry),
     Delete(DeleteEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(SetLocksEntry),
 }
 
 impl MetadataCommand {
@@ -642,9 +646,13 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => entry.op_id,
             MetadataCommand::CreateFile(entry) => entry.op_id,
+            MetadataCommand::ReopenFile(entry) => entry.op_id,
             MetadataCommand::Rename(entry) => entry.op_id,
             MetadataCommand::SetAttr(entry) => entry.op_id,
             MetadataCommand::Delete(entry) => entry.op_id,
+            MetadataCommand::Symlink(entry) => entry.op_id,
+            MetadataCommand::Link(entry) => entry.op_id,
+            MetadataCommand::SetLocks(entry) => entry.op_id,
         }
     }
 
@@ -652,9 +660,13 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => entry.rpc_id,
             MetadataCommand::CreateFile(entry) => entry.rpc_id,
+            MetadataCommand::ReopenFile(entry) => entry.rpc_id,
             MetadataCommand::Rename(entry) => entry.rpc_id,
             MetadataCommand::SetAttr(entry) => entry.rpc_id,
             MetadataCommand::Delete(entry) => entry.rpc_id,
+            MetadataCommand::Symlink(entry) => entry.rpc_id,
+            MetadataCommand::Link(entry) => entry.rpc_id,
+            MetadataCommand::SetLocks(entry) => entry.rpc_id,
         }
     }
 
@@ -662,13 +674,22 @@ impl MetadataCommand {
         match self {
             MetadataCommand::Mkdir(entry) => Some(entry.dir.id),
             MetadataCommand::CreateFile(entry) => Some(entry.file.id),
+            MetadataCommand::ReopenFile(entry) => Some(entry.file.id),
             MetadataCommand::Rename(_) => None,
             MetadataCommand::SetAttr(_) => None,
             MetadataCommand::Delete(_) => None,
+            MetadataCommand::Symlink(entry) => Some(entry.new_inode.id),
+            MetadataCommand::Link(_) => None,
+            MetadataCommand::SetLocks(entry) => Some(entry.ino),
         }
     }
 
     pub fn allocated_inode_id(&self) -> Option<i64> {
-        self.inode_id()
+        match self {
+            MetadataCommand::Mkdir(entry) => Some(entry.dir.id),
+            MetadataCommand::CreateFile(entry) => Some(entry.file.id),
+            MetadataCommand::Symlink(entry) => Some(entry.new_inode.id),
+            _ => None,
+        }
     }
 }

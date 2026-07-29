@@ -14,8 +14,8 @@
 
 use crate::master::fs::{BlockInodeState, DeleteResult};
 use crate::master::journal::{
-    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, MetadataCommand, MkdirEntry,
-    RenameEntry, SetAttrEntry,
+    CreateFileEntry, DeleteEntry, JournalEntry, JournalWriter, LinkEntry, MetadataCommand,
+    MkdirEntry, RenameEntry, ReopenFileEntry, SetAttrEntry, SetLocksEntry, SymlinkEntry,
 };
 use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
@@ -962,6 +962,38 @@ impl FsDir {
         Ok(status)
     }
 
+    pub(crate) fn prepare_reopen_file_command(
+        &self,
+        inp: &InodePath,
+        client_name: impl AsRef<str>,
+    ) -> FsResult<ReopenFileEntry> {
+        let inode_ptr = match inp.get_last_inode() {
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+            Some(v) => v,
+        };
+
+        let mut inode = match inode_ptr.as_ref() {
+            File(..) => inode_ptr.as_ref().clone(),
+            Dir(..) => {
+                let err_msg = format!("Cannot append to already exists {} directory", inp.path());
+                return err_ext!(FsError::file_exists(err_msg));
+            }
+            FileEntry(..) => {
+                return err_box!("FileEntry is not supported");
+            }
+        };
+
+        let file = inode.as_file_mut()?;
+        let _ = file.reopen(client_name);
+
+        Ok(ReopenFileEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            path: inp.path().to_string(),
+            file: file.clone(),
+        })
+    }
+
     pub(crate) fn block_inode_state(&self, block_id: i64) -> FsResult<BlockInodeState> {
         let file_id = InodeId::get_id(block_id);
         let inode = self.store.get_inode(file_id, None)?;
@@ -1340,6 +1372,44 @@ impl FsDir {
         Ok(())
     }
 
+    pub(crate) fn prepare_symlink_command(
+        &self,
+        target: String,
+        link: &InodePath,
+        force: bool,
+        mode: u32,
+        owner: Option<String>,
+        group: Option<String>,
+    ) -> FsResult<SymlinkEntry> {
+        if link.get_inode(-2).is_none() {
+            return err_box!("Directory does not exist");
+        }
+
+        if let Some(inode) = link.get_last_inode() {
+            if !inode.is_link() || !force {
+                return err_ext!(FsError::file_exists(link.path()));
+            }
+        }
+
+        let op_ms = LocalTime::mills();
+        let new_inode = InodeFile::with_link(
+            self.next_inode_id()?,
+            op_ms as i64,
+            target,
+            mode,
+            owner,
+            group,
+        );
+
+        Ok(SymlinkEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            link: link.path().to_string(),
+            new_inode,
+            force,
+        })
+    }
+
     pub fn unprotected_symlink(
         &mut self,
         mut link: InodePath,
@@ -1421,6 +1491,49 @@ impl FsDir {
             .log_link(self, src_path.path(), &dst_path_str, op_ms as i64)?;
 
         Ok(())
+    }
+
+    pub(crate) fn prepare_link_commands(
+        &self,
+        src_path: &InodePath,
+        mut dst_path: InodePath,
+    ) -> FsResult<Vec<MetadataCommand>> {
+        match src_path.get_last_inode() {
+            Some(inode) => match inode.as_ref() {
+                File(file) => {
+                    if file.file_type != curvine_common::state::FileType::File {
+                        return err_ext!(FsError::common("Cannot create link to non-regular file"));
+                    }
+                }
+                FileEntry(_) => (),
+                Dir(_) => return err_ext!(FsError::common("Cannot create link to directory")),
+            },
+            None => return err_ext!(FsError::file_not_found(src_path.path())),
+        }
+
+        let dst_path_str = dst_path.path().to_string();
+        let op_ms = LocalTime::mills() as i64;
+        let mut commands = vec![];
+        let dir_opts = MkdirOpts::with_create(true);
+        while dst_path.existing_len() + 1 < dst_path.len() {
+            commands.push(MetadataCommand::Mkdir(
+                self.prepare_mkdir_command(&mut dst_path, dir_opts.clone())?,
+            ));
+        }
+
+        if dst_path.get_last_inode().is_some() {
+            return err_ext!(FsError::file_exists(dst_path.path()));
+        }
+
+        commands.push(MetadataCommand::Link(LinkEntry {
+            op_id: self.next_op_id(),
+            rpc_id: 0,
+            mtime: op_ms,
+            src_path: src_path.path().to_string(),
+            dst_path: dst_path_str,
+        }));
+
+        Ok(commands)
     }
 
     pub fn unprotected_link(
@@ -1585,5 +1698,33 @@ impl FsDir {
         self.journal_writer.log_set_locks(self, inode.id(), locks)?;
 
         Ok(conflict)
+    }
+
+    pub(crate) fn prepare_set_locks_command(
+        &self,
+        inp: &InodePath,
+        lock: FileLock,
+        expire_ms: u64,
+    ) -> FsResult<(Option<FileLock>, Option<SetLocksEntry>)> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let mut meta = self.store.get_locks(inode.id())?;
+        let (conflict, changed) = meta.set_lock_with_change(lock, expire_ms);
+        if !changed {
+            return Ok((conflict, None));
+        }
+
+        Ok((
+            conflict,
+            Some(SetLocksEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                ino: inode.id(),
+                locks: meta.to_vec(),
+            }),
+        ))
     }
 }

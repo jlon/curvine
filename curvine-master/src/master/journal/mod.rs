@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod journal_writer;
+pub(crate) use self::journal_writer::JournalCommit;
 pub use self::journal_writer::JournalWriter;
 
 mod journal_loader;

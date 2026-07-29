@@ -193,12 +193,14 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     };
 
     active.mkdir("/committed-dir", false)?;
+    active.mkdir("/deleted-dir", false)?;
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
     active.set_attr(
         "/renamed-file",
         SetAttrOptsBuilder::new().owner("committed-owner").build(),
     )?;
+    active.delete("/deleted-dir", false)?;
     let legacy_entries = active.fs_dir.read().take_entries();
     assert!(
         !legacy_entries.iter().any(|entry| matches!(
@@ -207,6 +209,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
                 | JournalEntry::CreateFile(_)
                 | JournalEntry::Rename(_)
                 | JournalEntry::SetAttr(_)
+                | JournalEntry::Delete(_)
         )),
         "active namespace changes must not emit legacy local-first namespace journal entries: {legacy_entries:?}"
     );
@@ -215,6 +218,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     loop {
         if standby.file_status("/committed-dir").is_ok()
             && standby.file_status("/committed-file").is_err()
+            && standby.file_status("/deleted-dir").is_err()
         {
             if let Ok(status) = standby.file_status("/renamed-file") {
                 if status.owner == "committed-owner" {

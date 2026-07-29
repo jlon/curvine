@@ -634,6 +634,7 @@ pub enum MetadataCommand {
     CreateFile(CreateFileEntry),
     Rename(RenameEntry),
     SetAttr(SetAttrEntry),
+    Delete(DeleteEntry),
 }
 
 impl MetadataCommand {
@@ -643,6 +644,7 @@ impl MetadataCommand {
             MetadataCommand::CreateFile(entry) => entry.op_id,
             MetadataCommand::Rename(entry) => entry.op_id,
             MetadataCommand::SetAttr(entry) => entry.op_id,
+            MetadataCommand::Delete(entry) => entry.op_id,
         }
     }
 
@@ -652,6 +654,7 @@ impl MetadataCommand {
             MetadataCommand::CreateFile(entry) => entry.rpc_id,
             MetadataCommand::Rename(entry) => entry.rpc_id,
             MetadataCommand::SetAttr(entry) => entry.rpc_id,
+            MetadataCommand::Delete(entry) => entry.rpc_id,
         }
     }
 
@@ -661,6 +664,7 @@ impl MetadataCommand {
             MetadataCommand::CreateFile(entry) => Some(entry.file.id),
             MetadataCommand::Rename(_) => None,
             MetadataCommand::SetAttr(_) => None,
+            MetadataCommand::Delete(_) => None,
         }
     }
 

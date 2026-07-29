@@ -31,7 +31,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -71,6 +71,9 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
+    // Active-master admission gate: commit-first namespace changes take the
+    // write side while waiting for apply; legacy local-first writes take read.
+    metadata_admission_lock: Arc<RwLock<()>>,
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
@@ -170,6 +173,7 @@ impl MasterFilesystem {
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
+            metadata_admission_lock: Default::default(),
             full_block_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
@@ -181,11 +185,13 @@ impl MasterFilesystem {
     }
 
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+        let fs = js.fs();
         Self {
-            fs_dir: js.fs().fs_dir.clone(),
+            fs_dir: fs.fs_dir.clone(),
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
+            metadata_admission_lock: fs.metadata_admission_lock.clone(),
             full_block_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
@@ -193,6 +199,24 @@ impl MasterFilesystem {
                 FULL_BLOCK_RECONCILE_THREADS,
                 FULL_BLOCK_RECONCILE_QUEUE_SIZE,
             )),
+        }
+    }
+
+    fn active_metadata_write_guard(&self) -> (bool, Option<RwLockWriteGuard<'_, ()>>) {
+        let active = self.master_monitor.is_active();
+        let guard = if active {
+            Some(self.metadata_admission_lock.write())
+        } else {
+            None
+        };
+        (active, guard)
+    }
+
+    fn active_metadata_read_guard(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        if self.master_monitor.is_active() {
+            Some(self.metadata_admission_lock.read())
+        } else {
+            None
         }
     }
 
@@ -223,7 +247,8 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
             return self.mkdir_with_opts_committed(path, opts);
         }
 
@@ -263,7 +288,7 @@ impl MasterFilesystem {
     }
 
     fn mkdir_with_opts_committed(&self, path: &str, opts: MkdirOpts) -> FsResult<FileStatus> {
-        let (commands, writer) = {
+        let (commit, writer) = {
             let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -287,13 +312,13 @@ impl MasterFilesystem {
                 Self::check_parent(&inp)?;
             }
 
-            (
-                fs_dir.prepare_mkdir_commands(inp, opts)?,
-                fs_dir.journal_writer.clone(),
-            )
+            let commands = fs_dir.prepare_mkdir_commands(inp, opts)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(commands)?;
+            (commit, writer)
         };
 
-        writer.commit_metadata_commands(commands)?;
+        writer.wait_metadata_commit(commit)?;
         self.file_status(path)
     }
 
@@ -304,7 +329,8 @@ impl MasterFilesystem {
 
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
             if let Some(result) = self.delete_committed(path)? {
                 return Ok(result);
             }
@@ -322,7 +348,7 @@ impl MasterFilesystem {
     }
 
     fn delete_committed(&self, path: &str) -> FsResult<Option<bool>> {
-        let (command, writer) = {
+        let (commit, writer) = {
             let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
             let Some(entry) =
@@ -330,17 +356,17 @@ impl MasterFilesystem {
             else {
                 return Ok(None);
             };
-            (
-                MetadataCommand::Delete(entry),
-                fs_dir.journal_writer.clone(),
-            )
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::Delete(entry)])?;
+            (commit, writer)
         };
 
-        writer.commit_metadata_commands(vec![command])?;
+        writer.wait_metadata_commit(commit)?;
         Ok(Some(true))
     }
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
@@ -360,7 +386,8 @@ impl MasterFilesystem {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
-        if self.master_monitor.is_active() {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
             if let Some(result) = self.rename_committed(src, dst, flags)? {
                 return Ok(result);
             }
@@ -409,7 +436,7 @@ impl MasterFilesystem {
     }
 
     fn rename_committed(&self, src: &str, dst: &str, flags: RenameFlags) -> FsResult<Option<bool>> {
-        let (command, writer) = {
+        let (commit, writer) = {
             let fs_dir = self.fs_dir.write();
             let src_inp = Self::resolve_path(&fs_dir, src)?;
             let dst_inp = Self::resolve_path(&fs_dir, dst)?;
@@ -442,13 +469,12 @@ impl MasterFilesystem {
                 LocalTime::mills() as i64,
                 flags,
             )?;
-            (
-                MetadataCommand::Rename(entry),
-                fs_dir.journal_writer.clone(),
-            )
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::Rename(entry)])?;
+            (commit, writer)
         };
 
-        writer.commit_metadata_commands(vec![command])?;
+        writer.wait_metadata_commit(commit)?;
         Ok(Some(true))
     }
 
@@ -498,7 +524,8 @@ impl MasterFilesystem {
             );
         }
 
-        if self.master_monitor.is_active() {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
             return self.create_with_opts_committed(path, opts, flags);
         }
 
@@ -542,7 +569,7 @@ impl MasterFilesystem {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
-        let (commands, writer) = {
+        let (commit, writer) = {
             let mut fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -570,13 +597,13 @@ impl MasterFilesystem {
                 return fs_dir.file_status(&inp);
             }
 
-            (
-                fs_dir.prepare_create_file_commands(inp, opts)?,
-                fs_dir.journal_writer.clone(),
-            )
+            let commands = fs_dir.prepare_create_file_commands(inp, opts)?;
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(commands)?;
+            (commit, writer)
         };
 
-        writer.commit_metadata_commands(commands)?;
+        writer.wait_metadata_commit(commit)?;
         self.file_status(path)
     }
 
@@ -598,6 +625,7 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
+        let metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -605,6 +633,7 @@ impl MasterFilesystem {
             None => {
                 return if flags.create() {
                     drop(fs_dir);
+                    drop(metadata_read);
                     let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
                 } else {
@@ -802,6 +831,7 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
@@ -897,6 +927,7 @@ impl MasterFilesystem {
         options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         fs_dir.complete_file(
@@ -1730,6 +1761,7 @@ impl MasterFilesystem {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
+        let _metadata_read = self.active_metadata_read_guard();
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
@@ -1773,7 +1805,8 @@ impl MasterFilesystem {
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
+        let (active, _metadata_write) = self.active_metadata_write_guard();
+        if active {
             return self.set_attr_committed(path, opts);
         }
 
@@ -1783,17 +1816,16 @@ impl MasterFilesystem {
     }
 
     fn set_attr_committed(&self, path: &str, opts: SetAttrOpts) -> FsResult<FileStatus> {
-        let (command, writer) = {
+        let (commit, writer) = {
             let fs_dir = self.fs_dir.write();
             let inp = Self::resolve_path(&fs_dir, path)?;
             let entry = fs_dir.prepare_set_attr_command(&inp, opts)?;
-            (
-                MetadataCommand::SetAttr(entry),
-                fs_dir.journal_writer.clone(),
-            )
+            let writer = fs_dir.journal_writer.clone();
+            let commit = writer.enqueue_metadata_commands(vec![MetadataCommand::SetAttr(entry)])?;
+            (commit, writer)
         };
 
-        writer.commit_metadata_commands(vec![command])?;
+        writer.wait_metadata_commit(commit)?;
         self.file_status(path)
     }
 
@@ -1816,6 +1848,7 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
@@ -1823,6 +1856,7 @@ impl MasterFilesystem {
     }
 
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
@@ -1833,6 +1867,7 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
+        let _metadata_read = self.active_metadata_read_guard();
         // This snapshot only rejects individually impossible requests; it is not a
         // reservation, so concurrent fallocates may observe the same capacity.
         // Worker-side block allocation remains the hard enforcement point.
@@ -1877,6 +1912,7 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
+        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -1907,6 +1943,7 @@ impl MasterFilesystem {
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
+        let _metadata_read = self.active_metadata_read_guard();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 

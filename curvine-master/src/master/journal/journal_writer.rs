@@ -36,6 +36,11 @@ pub(crate) enum JournalWriteRequest {
     Metadata(Vec<MetadataCommand>, mpsc::SyncSender<FsResult<()>>),
 }
 
+pub(crate) enum JournalCommit {
+    Completed,
+    Pending(mpsc::Receiver<FsResult<()>>),
+}
+
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
@@ -92,36 +97,50 @@ impl JournalWriter {
         Ok(())
     }
 
-    pub fn commit_metadata_commands(&self, commands: Vec<MetadataCommand>) -> FsResult<()> {
+    pub(crate) fn enqueue_metadata_commands(
+        &self,
+        commands: Vec<MetadataCommand>,
+    ) -> FsResult<JournalCommit> {
         if !self.enable {
-            return Ok(());
+            return Ok(JournalCommit::Completed);
         }
         if commands.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(receiver) = self.receiver.as_ref() {
-            return self.commit_metadata_commands_for_test(receiver, commands);
+            return Ok(JournalCommit::Completed);
         }
 
         let (tx, rx) = mpsc::sync_channel(1);
         self.sender
             .send(JournalWriteRequest::Metadata(commands, tx))?;
         self.metrics.journal_queue_len.inc();
-        match rx.recv() {
-            Ok(res) => res,
-            Err(e) => err_box!("metadata journal sender dropped response: {}", e),
+        Ok(JournalCommit::Pending(rx))
+    }
+
+    pub(crate) fn wait_metadata_commit(&self, commit: JournalCommit) -> FsResult<()> {
+        match commit {
+            JournalCommit::Completed => Ok(()),
+            JournalCommit::Pending(rx) => {
+                if let Some(receiver) = self.receiver.as_ref() {
+                    self.flush_test_journal(receiver)?;
+                }
+                match rx.recv() {
+                    Ok(res) => res,
+                    Err(e) => err_box!("metadata journal sender dropped response: {}", e),
+                }
+            }
         }
     }
 
-    fn commit_metadata_commands_for_test(
+    pub fn commit_metadata_commands(&self, commands: Vec<MetadataCommand>) -> FsResult<()> {
+        let commit = self.enqueue_metadata_commands(commands)?;
+        self.wait_metadata_commit(commit)
+    }
+
+    fn flush_test_journal(
         &self,
         receiver: &Mutex<BlockingReceiver<JournalWriteRequest>>,
-        commands: Vec<MetadataCommand>,
     ) -> FsResult<()> {
         let spend = TimeSpent::new();
-        let seq_id = commands[0].op_id();
-        let mut batch = JournalCommandBatch::new(seq_id);
+        let mut batch = JournalCommandBatch::new(0);
         let receiver = match receiver.lock() {
             Ok(receiver) => receiver,
             Err(e) => return err_box!("failed to lock journal test receiver: {}", e),
@@ -133,24 +152,36 @@ impl JournalWriter {
                     self.metrics.journal_queue_len.dec();
                     batch.push_legacy(entry);
                     if force {
-                        self.propose_command_batch(batch)?;
-                        self.metrics.journal_flush_count.inc();
-                        self.metrics
-                            .journal_flush_time
-                            .inc_by(spend.used_us() as i64);
-                        batch = JournalCommandBatch::new(seq_id);
+                        self.flush_test_batch(&mut batch, &spend)?;
                     }
                 }
-                JournalWriteRequest::Metadata(_, _) => {
-                    return err_box!("unexpected queued metadata command in test journal writer");
+                JournalWriteRequest::Metadata(commands, ack) => {
+                    for command in commands {
+                        batch.push_metadata(command);
+                    }
+                    self.metrics.journal_queue_len.dec();
+                    let res = self.flush_test_batch(&mut batch, &spend);
+                    let err = res.as_ref().err().map(ToString::to_string);
+                    if ack.send(res).is_err() {
+                        log::warn!("metadata journal receiver dropped response");
+                    }
+                    if let Some(err) = err {
+                        return err_box!("{}", err);
+                    }
                 }
             }
         }
-        for command in commands {
-            batch.push_metadata(command);
-        }
-        self.propose_command_batch(batch)?;
 
+        self.flush_test_batch(&mut batch, &spend)
+    }
+
+    fn flush_test_batch(&self, batch: &mut JournalCommandBatch, spend: &TimeSpent) -> FsResult<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let pending = std::mem::replace(batch, JournalCommandBatch::new(0));
+        self.propose_command_batch(pending)?;
         self.metrics.journal_flush_count.inc();
         self.metrics
             .journal_flush_time

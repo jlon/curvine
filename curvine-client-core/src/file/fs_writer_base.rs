@@ -274,13 +274,11 @@ impl FsWriterBase {
             let committed_len = self.committed_len();
             let result = self
                 .fs_client
-                .complete_file_by_id(
+                .flush_file_by_id(
                     &self.path,
                     self.file_blocks.status.id,
                     committed_len,
                     commit_blocks.clone(),
-                    true,
-                    None,
                 )
                 .await;
             if let Err(e) = result {

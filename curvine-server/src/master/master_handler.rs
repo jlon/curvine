@@ -323,25 +323,45 @@ impl MasterHandler {
         };
         ctx.set_audit(Some(audit_path), None);
 
-        let commit_blocks = req
-            .commit_blocks
-            .into_iter()
-            .map(ProtoUtils::commit_block_from_pb)
-            .collect();
-        let file_blocks = self.fs.complete_file(
-            req.path,
-            req.inode_id,
-            req.len,
-            commit_blocks,
-            req.client_name,
-            req.only_flush,
-            req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
-        )?;
+        let return_file_blocks = req.return_file_blocks.unwrap_or(true);
+        let file_blocks = self.complete_file0(req, return_file_blocks)?;
         let rep_header = CompleteFileResponse {
             result: true,
             file_blocks: file_blocks.map(ProtoUtils::file_blocks_to_pb),
         };
         ctx.response(rep_header)
+    }
+
+    fn complete_file0(
+        &self,
+        req: CompleteFileRequest,
+        return_file_blocks: bool,
+    ) -> FsResult<Option<FileBlocks>> {
+        let commit_blocks = req
+            .commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_from_pb)
+            .collect();
+        if req.only_flush && !return_file_blocks {
+            self.fs.flush_file(
+                req.path,
+                req.inode_id,
+                req.len,
+                commit_blocks,
+                req.client_name,
+            )?;
+            Ok(None)
+        } else {
+            self.fs.complete_file(
+                req.path,
+                req.inode_id,
+                req.len,
+                commit_blocks,
+                req.client_name,
+                req.only_flush,
+                req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
+            )
+        }
     }
 
     pub fn create_files_batch(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -399,25 +419,9 @@ impl MasterHandler {
     pub fn complete_files_batch(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteFilesBatchRequest = ctx.parse_header()?;
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(header.requests.len());
         for req in header.requests {
-            let commit_blocks = req
-                .commit_blocks
-                .into_iter()
-                .map(ProtoUtils::commit_block_from_pb)
-                .collect();
-            let result = self
-                .fs
-                .complete_file(
-                    req.path,
-                    req.inode_id,
-                    req.len,
-                    commit_blocks,
-                    req.client_name,
-                    req.only_flush,
-                    req.set_attr_opts.map(ProtoUtils::set_attr_opts_from_pb),
-                )
-                .is_ok();
+            let result = self.complete_file0(req, false).is_ok();
             results.push(result);
         }
 

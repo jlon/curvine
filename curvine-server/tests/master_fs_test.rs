@@ -17,18 +17,18 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CreateFileRequest, DeleteRequest, GetMasterInfoRequest, MkdirOptsProto, MkdirRequest,
-    RenameRequest,
+    CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
+    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, MkdirOptsBuilder, StorageType, TtlAction,
-    WorkerAddress, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, LocatedBlock, MkdirOptsBuilder,
+    StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
-use curvine_common::utils::SerdeUtils;
+use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
@@ -43,6 +43,7 @@ use orpc::message::Builder;
 use orpc::message::ResponseStatus;
 use orpc::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
 use orpc::CommonResult;
+use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -157,6 +158,51 @@ fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
 
 fn new_handler() -> MasterHandler {
     new_handler_for_test("retry")
+}
+
+fn full_commit(block: &LocatedBlock, len: i64) -> CommitBlock {
+    CommitBlock {
+        block_id: block.id,
+        block_len: len,
+        locations: block
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, block.storage_type))
+            .collect(),
+    }
+}
+
+fn prepare_flush_file(
+    fs: &MasterFilesystem,
+    path: &str,
+    client: &ClientAddress,
+    blocks: usize,
+) -> CommonResult<(i64, CommitBlock)> {
+    let status = fs.create(path, true)?;
+    let mut last: Option<LocatedBlock> = None;
+
+    for index in 0..blocks {
+        let commits = last
+            .as_ref()
+            .map(|block| vec![full_commit(block, status.block_size)])
+            .unwrap_or_default();
+        let last_block = last.as_ref().map(|block| block.block.clone());
+        last = Some(fs.add_block(
+            path,
+            None,
+            client.clone(),
+            commits,
+            vec![],
+            index as i64 * status.block_size,
+            last_block,
+        )?);
+    }
+
+    let last = last.expect("benchmark requires at least one block");
+    Ok((
+        blocks as i64 * status.block_size,
+        full_commit(&last, status.block_size),
+    ))
 }
 
 fn new_handler_for_test(test_name: &str) -> MasterHandler {
@@ -1832,6 +1878,135 @@ fn resize_rejects_extreme_file_size() {
 
     let status = fs.file_status("/extreme.log").unwrap();
     assert_eq!(status.len, 0);
+}
+
+#[test]
+fn only_flush_persists_block_without_returning_file_snapshot() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "only-flush-no-snapshot");
+    let path = "/only-flush-no-snapshot.log";
+    let client = ClientAddress::default();
+    let status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    let commit = full_commit(&block, status.block_size);
+
+    fs.flush_file(
+        path,
+        None,
+        status.block_size,
+        vec![commit],
+        client.client_name.as_str(),
+    )?;
+
+    let file_blocks = fs.get_block_locations(path)?;
+    assert_eq!(file_blocks.block_locs.len(), 1);
+    assert_eq!(file_blocks.block_locs[0].block.len, status.block_size);
+
+    let legacy_response = fs.complete_file(
+        path,
+        None,
+        status.block_size,
+        vec![],
+        client.client_name.as_str(),
+        true,
+        None,
+    )?;
+    assert_eq!(legacy_response.unwrap().block_locs.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn handler_only_flush_without_snapshot_persists_block() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let handler = new_handler_for_test("handler-only-flush-no-snapshot");
+    let fs = handler.clone_fs();
+    let path = "/handler-only-flush-no-snapshot.log";
+    let client = ClientAddress::default();
+    let status = fs.create(path, false)?;
+    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
+    let req = CompleteFileRequest {
+        path: path.to_string(),
+        len: status.block_size,
+        client_name: client.client_name.clone(),
+        commit_blocks: vec![ProtoUtils::commit_block_to_pb(full_commit(
+            &block,
+            status.block_size,
+        ))],
+        only_flush: true,
+        inode_id: None,
+        set_attr_opts: None,
+        return_file_blocks: Some(false),
+    };
+    let msg = Builder::new_rpc(RpcCode::CompleteFile)
+        .proto_header(req)
+        .build();
+    let mut ctx = RpcContext::new(&msg);
+
+    let response = handler.complete_file(&mut ctx)?;
+    let header: CompleteFileResponse = response.parse_header()?;
+    assert!(header.result);
+    assert!(header.file_blocks.is_none());
+
+    let file_blocks = fs.get_block_locations(path)?;
+    assert_eq!(file_blocks.block_locs.len(), 1);
+    assert_eq!(file_blocks.block_locs[0].block.len, status.block_size);
+    Ok(())
+}
+
+#[test]
+#[ignore = "manual benchmark: run with --ignored --nocapture"]
+fn measure_only_flush_file_blocks_snapshot() -> CommonResult<()> {
+    const BLOCKS: usize = 4096;
+
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "only-flush-snapshot-bench");
+    let client = ClientAddress::default();
+
+    let (legacy_len, legacy_commit) =
+        prepare_flush_file(&fs, "/flush-bench/legacy", &client, BLOCKS)?;
+    let legacy_started = std::time::Instant::now();
+    let legacy_response = fs.complete_file(
+        "/flush-bench/legacy",
+        None,
+        legacy_len,
+        vec![legacy_commit],
+        client.client_name.as_str(),
+        true,
+        None,
+    )?;
+    let legacy_elapsed = legacy_started.elapsed();
+    let legacy_blocks = legacy_response
+        .as_ref()
+        .map(|blocks| blocks.block_locs.len())
+        .unwrap_or_default();
+    let legacy_bytes = legacy_response
+        .as_ref()
+        .map(|blocks| ProtoUtils::file_blocks_to_pb(blocks.clone()).encoded_len())
+        .unwrap_or_default();
+
+    let (opt_in_len, opt_in_commit) =
+        prepare_flush_file(&fs, "/flush-bench/opt-in", &client, BLOCKS)?;
+    let opt_in_started = std::time::Instant::now();
+    let opt_in_result = fs.flush_file(
+        "/flush-bench/opt-in",
+        None,
+        opt_in_len,
+        vec![opt_in_commit],
+        client.client_name.as_str(),
+    );
+    let opt_in_elapsed = opt_in_started.elapsed();
+    opt_in_result?;
+    let opt_in_blocks = 0;
+    let opt_in_bytes = 0;
+
+    assert_eq!(legacy_blocks, BLOCKS);
+    assert_eq!(opt_in_blocks, 0);
+    eprintln!(
+        "ONLY_FLUSH_FILE_BLOCKS_BENCH blocks={BLOCKS} legacy_us={} legacy_bytes={legacy_bytes} opt_in_us={} opt_in_bytes={opt_in_bytes}",
+        legacy_elapsed.as_micros(),
+        opt_in_elapsed.as_micros(),
+    );
+    Ok(())
 }
 
 #[test]

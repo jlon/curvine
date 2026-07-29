@@ -59,6 +59,12 @@ pub struct CvMetadataDeltaPage {
     pub full_snapshot_required: bool,
 }
 
+struct CompleteFileOptions {
+    only_flush: bool,
+    return_file_blocks: bool,
+    set_attr_opts: Option<SetAttrOpts>,
+}
+
 #[derive(Clone)]
 pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
@@ -659,6 +665,53 @@ impl MasterFilesystem {
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
+        self.complete_file0(
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            client_name,
+            CompleteFileOptions {
+                only_flush,
+                return_file_blocks: true,
+                set_attr_opts,
+            },
+        )
+    }
+
+    /// Flushes file metadata without building the full block-location snapshot.
+    pub fn flush_file<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+    ) -> FsResult<()> {
+        self.complete_file0(
+            path,
+            inode_id,
+            len,
+            commit_blocks,
+            client_name,
+            CompleteFileOptions {
+                only_flush: true,
+                return_file_blocks: false,
+                set_attr_opts: None,
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn complete_file0<T: AsRef<str>>(
+        &self,
+        path: T,
+        inode_id: Option<i64>,
+        len: i64,
+        commit_blocks: Vec<CommitBlock>,
+        client_name: T,
+        options: CompleteFileOptions,
+    ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
@@ -668,18 +721,18 @@ impl MasterFilesystem {
             len,
             commit_blocks,
             client_name,
-            only_flush,
-            set_attr_opts,
+            options.only_flush,
+            options.set_attr_opts,
         )?;
 
-        if only_flush {
+        if options.only_flush && options.return_file_blocks {
             let file = inode.as_file_ref()?;
             let locs = self.get_block_locs(path, &fs_dir, file)?;
             let status = inode.to_file_status(path)?;
-            Ok(Some(FileBlocks::new(status, locs)))
-        } else {
-            Ok(None)
+            return Ok(Some(FileBlocks::new(status, locs)));
         }
+
+        Ok(None)
     }
 
     pub fn get_file_blocks(

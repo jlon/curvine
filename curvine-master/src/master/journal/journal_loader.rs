@@ -685,6 +685,16 @@ impl JournalLoader {
                 }
             }
             MetadataCommand::CreateFile(entry) => self.create_file(entry),
+            MetadataCommand::Rename(entry) => {
+                self.rename(entry.clone())?;
+                if is_leader {
+                    self.ufs_loader
+                        .apply_entry(&JournalEntry::Rename(entry))
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 

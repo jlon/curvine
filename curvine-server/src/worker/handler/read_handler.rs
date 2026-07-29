@@ -93,17 +93,19 @@ impl ReadHandler {
         }
 
         let sc_path = if context.short_circuit {
-            self.store.short_circuit(&meta)?
+            self.store.short_circuit_by_id(context.block_id)?
         } else {
             None
         };
 
-        let (is_short_circuit, path, file) = if let Some(path) = sc_path {
-            (true, path, None)
+        let (meta, is_short_circuit, path, file) = if let Some((meta, path)) = sc_path {
+            (meta, true, path, None)
         } else {
-            let file = self.store.open_reader(&meta, context.off)?;
+            let (meta, file) = self
+                .store
+                .open_reader_by_id(context.block_id, context.off)?;
             let path = file.path().to_string();
-            (false, path, Some(file))
+            (meta, false, path, Some(file))
         };
         let label = if is_short_circuit { "local" } else { "remote" };
 

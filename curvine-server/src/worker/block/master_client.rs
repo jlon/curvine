@@ -104,8 +104,10 @@ impl MasterClient {
         for block in blocks {
             let status = match block.state {
                 BlockState::Finalized => BlockReportStatusProto::Finalized,
-                BlockState::Writing => BlockReportStatusProto::Writing,
-                BlockState::Recovering => BlockReportStatusProto::Writing,
+                BlockState::Writing
+                | BlockState::Recovering
+                | BlockState::Allocating
+                | BlockState::Finalizing => BlockReportStatusProto::Writing,
             };
             let info = BlockReportInfoProto {
                 id: block.id,

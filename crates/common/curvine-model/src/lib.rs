@@ -92,6 +92,9 @@ pub use self::opts::*;
 mod job;
 pub use self::job::*;
 
+mod transfer;
+pub use self::transfer::*;
+
 mod metrics;
 pub use self::metrics::*;
 

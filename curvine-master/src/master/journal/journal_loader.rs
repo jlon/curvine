@@ -230,66 +230,81 @@ impl JournalLoader {
             return Ok(());
         }
 
-        let batch = JournalBatch::deserialize_compat(&entry.data)?;
+        let batch = JournalEnvelope::decode(&entry.data)?;
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
         let mut has_ufs_affecting = false;
 
-        for (seq, op_entry) in batch.batch.into_iter().enumerate() {
-            applied.op_id = op_entry.op_id();
-            applied.rpc_id = op_entry.rpc_id();
+        for (seq, command) in batch.into_commands().into_iter().enumerate() {
+            applied.op_id = command.op_id();
+            applied.rpc_id = command.rpc_id();
 
-            match op_entry {
-                JournalEntry::Snapshot(e) if is_leader && e.node_id == self.node_id => {
+            if matches!(&command, JournalCommand::Metadata(_)) {
+                return err_box!("unsupported committed metadata command: {:?}", command);
+            }
+
+            match &command {
+                JournalCommand::Legacy(JournalEntry::Snapshot(e))
+                    if is_leader && e.node_id == self.node_id =>
+                {
                     if seq + 1 != batch_len {
                         return err_box!("snapshot should be the last entry");
                     }
-                    snapshot.replace(e);
+                    snapshot.replace(e.clone());
                     continue;
                 }
 
-                JournalEntry::CacheInvalidation(_) | JournalEntry::UfsApplied(_) => (),
+                JournalCommand::Legacy(JournalEntry::CacheInvalidation(_))
+                | JournalCommand::Legacy(JournalEntry::UfsApplied(_)) => (),
 
                 _ => has_ufs_affecting = true,
             }
 
             if !is_leader {
                 let fs_dir = self.fs_dir.read();
-                if let Some(inode_id) = op_entry.allocated_inode_id() {
+                if let Some(inode_id) = command.allocated_inode_id() {
                     let last_inode_id = fs_dir.last_inode_id();
                     if inode_id <= last_inode_id {
                         return err_box!(
                             "journal reuses allocated inode id {} at raft index {}, path operation {:?}; current high-water mark is {}",
                             inode_id,
                             entry.index,
-                            op_entry,
+                            command,
                             last_inode_id
                         );
                     }
                 }
-                fs_dir.update_op_id(op_entry.op_id());
-                if let Some(inode_id) = op_entry.inode_id() {
+                fs_dir.update_op_id(command.op_id());
+                if let Some(inode_id) = command.inode_id() {
                     fs_dir.update_last_inode_id(inode_id)?;
                 }
             }
 
-            let res = if is_leader {
-                self.ufs_loader.apply_entry(&op_entry).await
-            } else {
-                self.apply_entry(op_entry.clone())
-            };
+            match command {
+                JournalCommand::Legacy(op_entry) => {
+                    let res = if is_leader {
+                        self.ufs_loader.apply_entry(&op_entry).await
+                    } else {
+                        self.apply_entry(op_entry.clone())
+                    };
 
-            if let Err(e) = res {
-                if is_leader && skip_ufs_error {
-                    error!(
-                        "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
-                        entry.index, entry.term, op_entry, e
-                    );
-                    continue;
+                    if let Err(e) = res {
+                        if is_leader && skip_ufs_error {
+                            error!(
+                                "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
+                                entry.index, entry.term, op_entry, e
+                            );
+                            continue;
+                        }
+
+                        return err_box!("failed to apply journal: {:?}: {}", op_entry, e);
+                    }
                 }
 
-                return err_box!("failed to apply journal: {:?}: {}", op_entry, e);
+                JournalCommand::Metadata(command) => {
+                    return err_box!("unsupported committed metadata command: {:?}", command);
+                }
             }
         }
 

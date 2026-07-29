@@ -535,6 +535,48 @@ mod tests {
     }
 
     #[test]
+    fn replay_accepts_versioned_legacy_journal_batch() -> FsResult<()> {
+        Master::init_test_metrics();
+
+        let mut source_conf = ClusterConf {
+            testing: true,
+            ..Default::default()
+        };
+        source_conf.change_test_meta_dir(format!("versioned-source-{}", Utils::rand_str(6)));
+        let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+        source_fs.mkdir("/versioned-legacy", false)?;
+        let entry = source_fs
+            .fs_dir
+            .read()
+            .take_entries()
+            .into_iter()
+            .next()
+            .expect("mkdir must emit a journal entry");
+
+        let mut target_conf = ClusterConf {
+            testing: true,
+            ..Default::default()
+        };
+        target_conf.change_test_meta_dir(format!("versioned-target-{}", Utils::rand_str(6)));
+        let target = JournalSystem::from_conf(&target_conf)?;
+        let target_fs = target.fs();
+        let loader = target.journal_loader();
+
+        let raft_entry = Entry {
+            term: 1,
+            index: 1,
+            data: serialize_test_versioned_legacy_batch(1, entry)?,
+            ..Default::default()
+        };
+
+        AsyncRuntime::single()
+            .block_on(async { loader.apply(true, ApplyMsg::new_entry(raft_entry)).await })?;
+
+        assert!(target_fs.file_status("/versioned-legacy").is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn replay_rejects_duplicate_allocated_inode_id() -> FsResult<()> {
         Master::init_test_metrics();
 

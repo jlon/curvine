@@ -556,7 +556,11 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 unsafe {
                     jindo_writer_free(writer_handle.as_raw());
                 }
-                Self::check_status(start_status, "Failed to start async writer tell")?;
+                Self::check_status_with_err(
+                    start_status,
+                    "Failed to start async writer tell",
+                    None,
+                )?;
             }
         }
 
@@ -626,10 +630,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                     status
                 })
                 .await?;
-            match start_status {
-                JindoStatus::Ok => {}
-                _ => Self::check_status(start_status, "Failed to start async exists")?,
-            }
+            Self::check_status(start_status, "Failed to start async exists")?;
         }
 
         let (status, exists, err) = ctx.wait().await?;

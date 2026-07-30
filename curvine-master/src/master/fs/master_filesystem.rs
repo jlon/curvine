@@ -1079,8 +1079,8 @@ impl MasterFilesystem {
                 len,
                 commit_blocks,
                 client_name,
-                only_flush,
-                set_attr_opts,
+                options.only_flush,
+                options.set_attr_opts,
             );
         }
 

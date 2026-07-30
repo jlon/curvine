@@ -598,6 +598,8 @@ impl FsDir {
             dst: dst_inp.path().to_string(),
             mtime,
             flags: flags.value(),
+            src_inode_id: 0,
+            dst_inode_id: 0,
         })
     }
 

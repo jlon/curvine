@@ -747,6 +747,8 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         HeartbeatStatus::Running,
         worker.address.clone(),
         worker.weight,
+        worker.worker_session_id.clone(),
+        worker.transfer_capabilities.clone(),
         vec![],
     )?;
     assert!(

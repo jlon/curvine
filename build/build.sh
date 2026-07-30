@@ -914,7 +914,8 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   protoc -I"$PROTO_DIR" --python_out="$PROTO_PKG" "$PROTO_DIR"/*.proto
   for f in "$PROTO_PKG"/*_pb2.py; do
     if [ -f "$f" ]; then
-      sed -i -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+      sed -i.bak -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+      rm -f "$f.bak"
     fi
   done
 

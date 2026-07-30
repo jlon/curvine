@@ -35,6 +35,12 @@ pub struct FsClient {
     connector: Arc<ClusterConnector>,
 }
 
+struct CompleteFileOptions {
+    only_flush: bool,
+    set_attr_opts: Option<SetAttrOpts>,
+    return_file_blocks: bool,
+}
+
 impl FsClient {
     pub fn new(context: Arc<FsContext>) -> Self {
         let connector = context.connector.clone();
@@ -359,8 +365,18 @@ impl FsClient {
         only_flush: bool,
         set_attr_opts: Option<SetAttrOpts>,
     ) -> FsResult<Option<FileBlocks>> {
-        self.complete_file0(path, None, len, commit_blocks, only_flush, set_attr_opts)
-            .await
+        self.complete_file0(
+            path,
+            None,
+            len,
+            commit_blocks,
+            CompleteFileOptions {
+                only_flush,
+                set_attr_opts,
+                return_file_blocks: true,
+            },
+        )
+        .await
     }
 
     pub async fn complete_file_by_id(
@@ -377,10 +393,35 @@ impl FsClient {
             Some(inode_id),
             len,
             commit_blocks,
-            only_flush,
-            set_attr_opts,
+            CompleteFileOptions {
+                only_flush,
+                set_attr_opts,
+                return_file_blocks: true,
+            },
         )
         .await
+    }
+
+    pub(crate) async fn flush_file_by_id(
+        &self,
+        path: &Path,
+        inode_id: i64,
+        len: i64,
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+    ) -> FsResult<()> {
+        self.complete_file0(
+            path,
+            Some(inode_id),
+            len,
+            commit_blocks,
+            CompleteFileOptions {
+                only_flush: true,
+                set_attr_opts: None,
+                return_file_blocks: false,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     // File writing is completed.
@@ -390,8 +431,7 @@ impl FsClient {
         inode_id: Option<i64>,
         len: i64,
         commit_blocks: impl IntoIterator<Item = CommitBlock>,
-        only_flush: bool,
-        set_attr_opts: Option<SetAttrOpts>,
+        options: CompleteFileOptions,
     ) -> FsResult<Option<FileBlocks>> {
         let commit_blocks = commit_blocks
             .into_iter()
@@ -403,12 +443,17 @@ impl FsClient {
             len,
             client_name: self.context().clone_client_name(),
             commit_blocks,
-            only_flush,
+            only_flush: options.only_flush,
             inode_id,
-            set_attr_opts: set_attr_opts.map(ProtoUtils::set_attr_opts_to_pb),
+            set_attr_opts: options.set_attr_opts.map(ProtoUtils::set_attr_opts_to_pb),
+            return_file_blocks: Some(options.return_file_blocks),
         };
 
-        let operation = if only_flush { "Flush" } else { "Complete" };
+        let operation = if options.only_flush {
+            "Flush"
+        } else {
+            "Complete"
+        };
         let rep: CompleteFileResponse =
             FsContext::metrics_track(operation, self.rpc(RpcCode::CompleteFile, header)).await?;
 
@@ -434,6 +479,7 @@ impl FsClient {
                     only_flush,
                     inode_id: None,
                     set_attr_opts: None,
+                    return_file_blocks: Some(false),
                 }
             })
             .collect();

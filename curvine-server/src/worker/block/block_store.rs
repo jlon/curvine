@@ -213,20 +213,29 @@ impl BlockStore {
         layout.open_writer(&dir, meta, off).map_err(Into::into)
     }
 
-    pub fn open_reader(&self, meta: &BlockMeta, off: i64) -> CommonResult<BlockReadContext> {
+    pub fn open_reader(
+        &self,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> CommonResult<BlockReadContext> {
         let (layout, dir) = {
             let state = self.read()?;
             state.layout_for(meta)?
         };
-        layout.open_reader(&dir, meta, off).map_err(Into::into)
+        layout
+            .open_reader(&dir, meta, off, logical_len)
+            .map_err(Into::into)
     }
 
     /// Opens the currently readable generation while the dataset read lock is
     /// held, so a finalize publish cannot replace its path before the FD opens.
+    /// `logical_len` may exceed the worker's physical bytes for sparse tails.
     pub fn open_reader_by_id(
         &self,
         id: i64,
         off: i64,
+        logical_len: i64,
     ) -> CommonResult<(BlockMeta, BlockReadContext)> {
         let state = self.read()?;
         let meta = state
@@ -234,7 +243,7 @@ impl BlockStore {
             .ok_or_else(|| orpc::err_msg!(format!("block {} not exists", id)))?
             .clone();
         let (layout, dir) = state.layout_for(&meta)?;
-        let reader = layout.open_reader(&dir, &meta, off)?;
+        let reader = layout.open_reader(&dir, &meta, off, logical_len)?;
         Ok((meta, reader))
     }
 
@@ -503,11 +512,11 @@ mod tests {
             .expect("rewrite finalize must reserve");
         let plan = reservation.prepare(block.len)?;
 
-        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0)?;
+        let (_, mut committed_reader) = store.open_reader_by_id(block.id, 0, 0)?;
         store.write()?.publish_file_finalize(&reservation, plan)?;
         assert_eq!(read_bytes(&mut committed_reader, 4)?, b"old!");
 
-        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0)?;
+        let (_, mut published_reader) = store.open_reader_by_id(block.id, 0, 0)?;
         assert_eq!(read_bytes(&mut published_reader, 4)?, b"new!");
         Ok(())
     }

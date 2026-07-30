@@ -94,6 +94,24 @@ impl FileLayout {
         committed_len: i64,
     ) -> CommonResult<FileFinalizePlan> {
         let staging_path = Self::block_path(dir, meta)?;
+        // Sparse seek-past-EOF resize can raise a committed block's logical
+        // length on the master without rewriting worker bytes. A later partial
+        // rewrite then completes with committed_len larger than the staging
+        // file size. Only materialize that logical length for known rewrites;
+        // first writes must still match the staging file exactly.
+        let mut finalized_probe = meta.clone();
+        finalized_probe.state = BlockState::Finalized;
+        let active_path = Self::block_path(dir, &finalized_probe)?;
+        let is_rewrite = active_path.exists();
+        if is_rewrite && committed_len >= 0 {
+            let current_len = staging_path.metadata()?.len() as i64;
+            if committed_len > current_len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&staging_path)?
+                    .set_len(committed_len as u64)?;
+            }
+        }
         let final_meta = BlockMeta::with_final(meta, &staging_path)?;
         if final_meta.len() != committed_len {
             return err_box!(
@@ -236,13 +254,29 @@ impl BlockLayout for FileLayout {
         BlockWriteContext::new(device, 0, meta.len, off)
     }
 
-    fn open_reader(&self, dir: &VfsDir, meta: &BlockMeta, off: i64) -> IOResult<BlockReadContext> {
-        validate_open_offset(meta, off)?;
-        let read_off = u64::try_from(off)
-            .map_err(|_| IOError::from(format!("Invalid read offset: {}", off)))?;
+    fn open_reader(
+        &self,
+        dir: &VfsDir,
+        meta: &BlockMeta,
+        off: i64,
+        logical_len: i64,
+    ) -> IOResult<BlockReadContext> {
+        let physical_len = meta.len;
+        let logical_len = logical_len.max(physical_len);
+        if off < 0 || off > logical_len {
+            return err_box!(
+                "Invalid block offset: {}, block length: {}",
+                off,
+                logical_len
+            );
+        }
+        // Seek within the physical file; sparse logical tail is synthesized.
+        let device_off = off.min(physical_len);
+        let read_off = u64::try_from(device_off)
+            .map_err(|_| IOError::from(format!("Invalid read offset: {}", device_off)))?;
         let file = Self::block_file(dir, meta)?;
         let device = LocalFile::with_read(file, read_off)?;
-        BlockReadContext::new(device, 0, meta.len, off)
+        BlockReadContext::with_physical(device, 0, logical_len, physical_len, off)
     }
 
     fn short_circuit(&self, dir: &VfsDir, meta: &BlockMeta) -> CommonResult<Option<String>> {

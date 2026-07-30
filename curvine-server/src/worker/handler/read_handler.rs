@@ -58,24 +58,41 @@ impl ReadHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = ReadContext::from_req(msg)?;
+        let conf = Worker::get_conf()?;
+        let max_block_size = conf.master.max_block_size;
         let meta = self.store.get_block(context.block_id).map_err(|e| {
             FsError::block_not_found(context.block_id)
                 .ctx(format!("worker block store lookup failed: {}", e))
         })?;
 
+        // Master sparse ResizeFile may raise logical block len above the
+        // worker's physical file size. Only synthesize a sparse tail when the
+        // client advertises a validated logical length above physical bytes.
+        let physical_len = meta.len;
+        let logical_len = if context.len > physical_len {
+            if context.len > max_block_size {
+                return err_box!(
+                    "Advertised block length {} exceeds max_block_size {}",
+                    context.len,
+                    max_block_size
+                );
+            }
+            context.len
+        } else {
+            physical_len
+        };
         if context.off < 0 {
             return err_box!(
                 "Invalid read offset: {}, block length: {}",
                 context.off,
-                meta.len
+                logical_len
             );
         }
-        if context.off > meta.len {
+        if context.off > logical_len {
             return err_box!(
-                "The length of the requested data exceeds the maximum length of the block file, \
-            request off {}, file len {}",
+                "The length of the requested data exceeds the maximum length of the block file,             request off {}, file len {}",
                 context.off,
-                meta.len
+                logical_len
             );
         }
 
@@ -83,16 +100,25 @@ impl ReadHandler {
             return err_box!("chunk_size must be greater than 0");
         }
 
+        if context.chunk_size as i64 > Self::MAX_READ_AHEAD {
+            return err_box!(
+                "chunk_size {} exceeds maximum allowed value {}",
+                context.chunk_size,
+                Self::MAX_READ_AHEAD
+            );
+        }
+
         if context.enable_read_ahead && context.read_ahead_len > Self::MAX_READ_AHEAD {
             return err_box!(
-                "The pre-read size exceeds the maximum value allowed by the system.\
-                 The current value is {}. The maximum allowed value is: {}",
+                "The pre-read size exceeds the maximum value allowed by the system.                 The current value is {}. The maximum allowed value is: {}",
                 context.read_ahead_len,
                 Self::MAX_READ_AHEAD
             );
         }
 
-        let sc_path = if context.short_circuit {
+        // Short-circuit local reads cannot synthesize sparse tails; force the
+        // remote path when logical length exceeds physical worker bytes.
+        let sc_path = if context.short_circuit && logical_len <= meta.len {
             self.store.short_circuit_by_id(context.block_id)?
         } else {
             None
@@ -101,9 +127,9 @@ impl ReadHandler {
         let (meta, is_short_circuit, path, file) = if let Some((meta, path)) = sc_path {
             (meta, true, path, None)
         } else {
-            let (meta, file) = self
-                .store
-                .open_reader_by_id(context.block_id, context.off)?;
+            let (meta, file) =
+                self.store
+                    .open_reader_by_id(context.block_id, context.off, logical_len)?;
             let path = file.path().to_string();
             (meta, false, path, Some(file))
         };
@@ -129,7 +155,7 @@ impl ReadHandler {
 
         let response = BlockReadResponse {
             id: context.block_id,
-            len: meta.len,
+            len: logical_len,
             path: ternary!(is_short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
         };

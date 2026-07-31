@@ -2037,7 +2037,7 @@ dependencies = [
  "curvine-job-client",
  "curvine-model",
  "curvine-proto",
- "curvine-ufs",
+ "curvine-ufs-api",
  "curvine-unified-fs",
  "mimalloc",
  "orpc",
@@ -2428,7 +2428,7 @@ dependencies = [
  "curvine-fault",
  "curvine-rocksdb",
  "curvine-storage-spdk",
- "curvine-ufs",
+ "curvine-ufs-api",
  "curvine-web",
  "dashmap 5.5.3",
  "futures",
@@ -2509,7 +2509,7 @@ dependencies = [
  "curvine-fuse",
  "curvine-lancedb",
  "curvine-server",
- "curvine-ufs",
+ "curvine-ufs-api",
  "futures",
  "lance-io",
  "log",
@@ -2526,6 +2526,13 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs"
+version = "0.2.0"
+dependencies = [
+ "curvine-ufs-api",
+]
+
+[[package]]
+name = "curvine-ufs-api"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -2549,7 +2556,7 @@ dependencies = [
  "curvine-fs-api",
  "curvine-hdfs-jni",
  "curvine-model",
- "curvine-ufs",
+ "curvine-ufs-api",
  "futures",
  "log",
  "opendal",
@@ -2567,7 +2574,7 @@ dependencies = [
  "curvine-error",
  "curvine-fs-api",
  "curvine-model",
- "curvine-ufs",
+ "curvine-ufs-api",
  "futures",
  "log",
  "orpc",
@@ -2586,7 +2593,6 @@ dependencies = [
  "curvine-job-client",
  "curvine-model",
  "curvine-proto",
- "curvine-ufs",
  "curvine-ufs-opendal",
  "curvine-ufs-oss-hdfs",
  "dashmap 5.5.3",

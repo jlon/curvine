@@ -574,6 +574,8 @@ impl MasterHandler {
                 attempt_safe_output: header.transfer_attempt_safe_output.unwrap_or(false),
                 source_read_plan: header.transfer_source_read_plan.unwrap_or(false),
             },
+            header.software_version,
+            u64::try_from(header.fs_ctime).unwrap_or_default(),
             ProtoUtils::storage_info_list_from_pb(header.storages),
         )?;
         Ok(cmds)
@@ -989,5 +991,54 @@ impl MessageHandler for MasterHandler {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::journal::JournalSystem;
+    use curvine_common::state::WorkerAddress;
+    use orpc::common::Utils;
+
+    #[test]
+    fn process_worker_heartbeat_stores_worker_report_fields() {
+        Master::init_test_metrics();
+        let test_name = Utils::rand_str(6);
+        let mut conf = ClusterConf::format();
+        conf.testing = true;
+        conf.journal.enable = false;
+        conf.master.meta_dir =
+            Utils::test_sub_dir(format!("master-handler-test/meta-{}", test_name));
+        conf.journal.journal_dir =
+            Utils::test_sub_dir(format!("master-handler-test/journal-{}", test_name));
+
+        let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+        let address = WorkerAddress {
+            worker_id: 7,
+            hostname: "worker-host".to_string(),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 1234,
+            web_port: 5678,
+        };
+        let header = WorkerHeartbeatRequest {
+            status: HeartbeatStatus::Running.into(),
+            cluster_id: conf.cluster_id.clone(),
+            address: ProtoUtils::worker_address_to_pb(&address),
+            software_version: "0.1.0-test".to_string(),
+            fs_ctime: 123_456,
+            ..Default::default()
+        };
+
+        MasterHandler::process_worker_heartbeat(fs.clone(), header).unwrap();
+
+        let info = fs.master_info().unwrap();
+        let worker = info
+            .live_workers
+            .iter()
+            .find(|worker| worker.address.worker_id == address.worker_id)
+            .unwrap();
+        assert_eq!(worker.software_version, "0.1.0-test");
+        assert_eq!(worker.startup_time_ms, 123_456);
     }
 }

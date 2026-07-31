@@ -14,7 +14,7 @@
 
 use crate::util::*;
 use clap::{Parser, Subcommand};
-use curvine_model::MasterInfo;
+use curvine_model::{MasterInfo, WorkerInfo};
 use curvine_unified_fs::UnifiedFileSystem;
 use orpc::CommonResult;
 use serde::Serialize;
@@ -182,12 +182,13 @@ impl CurvineReport {
         for i in 0..self.info.live_workers.len() {
             if let Some(worker) = self.info.get_live_worker(i) {
                 let str = format!(
-                    "{}:{},{}/{} ({:.2}%)",
+                    "{}:{},{}/{} ({:.2}%){}",
                     worker.address.hostname,
                     worker.address.rpc_port,
                     bytes_to_string(worker.available),
                     bytes_to_string(worker.capacity),
-                    Self::get_percent(worker.available, worker.capacity)
+                    Self::get_percent(worker.available, worker.capacity),
+                    Self::worker_detail_suffix(worker),
                 );
                 if i == 0 {
                     builder.push_str(&format!("{}\n", str));
@@ -205,7 +206,12 @@ impl CurvineReport {
         builder.push_str(&format!("{:>20}: ", "lost_worker_list"));
         for i in 0..self.info.lost_workers.len() {
             if let Some(worker) = self.info.get_lost_worker(i) {
-                let str = format!("{}:{}", worker.address.hostname, worker.address.rpc_port,);
+                let str = format!(
+                    "{}:{}{}",
+                    worker.address.hostname,
+                    worker.address.rpc_port,
+                    Self::worker_detail_suffix(worker),
+                );
 
                 if i == 0 {
                     builder.push_str(&format!("{}\n", str));
@@ -382,6 +388,39 @@ impl CurvineReport {
         }
         (numerator as f64 / denominator as f64) * 100.0
     }
+
+    fn worker_detail_suffix(worker: &WorkerInfo) -> String {
+        let mut details = vec![];
+        if !worker.software_version.is_empty() {
+            details.push(format!("version={}", worker.software_version));
+        }
+        if worker.startup_time_ms > 0 {
+            details.push(format!(
+                "startup_time={}",
+                Self::format_epoch_ms(worker.startup_time_ms)
+            ));
+        }
+
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", details.join(", "))
+        }
+    }
+
+    fn format_epoch_ms(timestamp_ms: u64) -> String {
+        let Ok(timestamp_ms) = i64::try_from(timestamp_ms) else {
+            return "-".to_string();
+        };
+        let Some(datetime) = chrono::DateTime::from_timestamp_millis(timestamp_ms) else {
+            return "-".to_string();
+        };
+
+        datetime
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
 }
 
 fn fluid_bytes_to_string(size: i64) -> String {
@@ -407,4 +446,44 @@ fn fluid_bytes_to_string(size: i64) -> String {
     };
 
     format!("{value:.2}{unit}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_model::WorkerAddress;
+
+    #[test]
+    fn simple_report_renders_worker_report_fields() {
+        let startup_time_ms = 123_456;
+        let worker = WorkerInfo {
+            address: WorkerAddress {
+                worker_id: 7,
+                hostname: "worker-host".to_string(),
+                ip_addr: "127.0.0.1".to_string(),
+                rpc_port: 1234,
+                web_port: 5678,
+            },
+            software_version: "0.1.0-test".to_string(),
+            startup_time_ms,
+            capacity: 1024,
+            available: 512,
+            ..Default::default()
+        };
+        let report = CurvineReport {
+            info: MasterInfo {
+                live_workers: vec![worker],
+                ..Default::default()
+            },
+        };
+
+        let output = report.simple(true);
+
+        assert!(output.contains("worker-host:1234"));
+        assert!(output.contains("version=0.1.0-test"));
+        assert!(output.contains(&format!(
+            "startup_time={}",
+            CurvineReport::format_epoch_ms(startup_time_ms)
+        )));
+    }
 }

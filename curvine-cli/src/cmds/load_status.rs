@@ -146,7 +146,7 @@ async fn print_transfer_status(
     );
     if let Some(summary) = status.task_summary {
         println!(
-            "Tasks: {} completed, {} failed, {} running, {} pending; {} cached",
+            "Files: {} completed, {} failed, {} running, {} pending; {} transferred",
             summary.completed,
             summary.failed,
             summary.running,

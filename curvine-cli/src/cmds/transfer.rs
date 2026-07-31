@@ -47,7 +47,7 @@ enum TransferSubCommand {
     /// Cancel one transfer job
     Cancel(TransferCancelCommand),
 
-    /// Retry a failed, canceled, or partially successful transfer as a new job
+    /// Rerun a completed, failed, canceled, or partially successful transfer as a new job
     Retry(TransferRetryCommand),
 
     /// Summarize transfer jobs by tenant
@@ -593,7 +593,7 @@ fn print_status_summary(
         progress_text(job.progress.loaded_size, job.progress.total_size),
     ]);
     if let Some(summary) = task_summary {
-        table.add_row(["Tasks".to_string(), task_summary_text(summary)]);
+        table.add_row(["Files".to_string(), task_summary_text(summary)]);
     }
     if !job.progress.message.is_empty() {
         table.add_row(["Message".to_string(), job.progress.message.clone()]);
@@ -716,7 +716,7 @@ fn task_summary_text(summary: &TransferTaskSummaryProto) -> String {
         parts.push(format!("{} stale", summary.stale));
     }
     parts.push(format!(
-        "{} cached",
+        "{} transferred",
         bytes_to_string(summary.completed_size.max(0))
     ));
     parts.join(", ")

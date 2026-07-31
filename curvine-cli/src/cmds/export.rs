@@ -97,10 +97,11 @@ impl ExportCommand {
             kind: TransferKind::Export,
             source_path: source.clone_uri(),
             target_path: target.clone_uri(),
-            client_request_id: TransferCommand::default_client_request_id(
+            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
                 TransferKind::Export,
                 source.clone_uri(),
                 target.clone_uri(),
+                self.overwrite,
             ),
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),

@@ -46,29 +46,12 @@ pub struct TransferMetrics {
     store_unavailable_since: Mutex<HashMap<String, Instant>>,
     metadata_operation_duration_us: HistogramVec,
     metadata_operation_total: CounterVec,
-    metadata_replica_version: Gauge,
-    metadata_replica_entries: Gauge,
-    metadata_replica_page_size: Gauge,
-    metadata_replica_pages: Gauge,
-    metadata_replica_last_refresh_time_ms: Gauge,
-    metadata_replica_refresh_total: CounterVec,
-    metadata_replica_refresh_duration_us: HistogramVec,
     cluster_snapshot_version: Gauge,
     cluster_snapshot_staleness_ms: Gauge,
     cluster_snapshot_live_workers: Gauge,
     cluster_snapshot_capable_workers: Gauge,
     cluster_snapshot_refresh_total: CounterVec,
     cluster_snapshot_refresh_duration_us: HistogramVec,
-}
-
-pub struct MetadataReplicaRefreshObservation<'a> {
-    pub result: &'a str,
-    pub elapsed_us: u128,
-    pub version: Option<u64>,
-    pub entries: Option<usize>,
-    pub page_size: Option<usize>,
-    pub pages: Option<usize>,
-    pub refresh_time_ms: Option<i64>,
 }
 
 impl TransferMetrics {
@@ -221,54 +204,6 @@ impl TransferMetrics {
                 "transfer_metadata_operation_total",
                 "Transfer planning metadata operations by source, operation, and result",
                 &["source", "operation", "result"],
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_version: m::new_gauge(
-                "transfer_metadata_replica_version",
-                "Current Transfer metadata replica snapshot version",
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_entries: m::new_gauge(
-                "transfer_metadata_replica_entries",
-                "Current Transfer metadata replica entry count",
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_page_size: m::new_gauge(
-                "transfer_metadata_replica_page_size",
-                "Configured Transfer metadata replica snapshot page size",
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_pages: m::new_gauge(
-                "transfer_metadata_replica_pages",
-                "Pages read by the last Transfer metadata replica refresh",
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_last_refresh_time_ms: m::new_gauge(
-                "transfer_metadata_replica_last_refresh_time_ms",
-                "Last successful Transfer metadata replica refresh timestamp in milliseconds",
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_refresh_total: m::new_counter_vec(
-                "transfer_metadata_replica_refresh_total",
-                "Transfer metadata replica refresh attempts by result",
-                &["result"],
-            )
-            .map_err(|err| FsError::common(err.to_string()))?,
-            metadata_replica_refresh_duration_us: m::new_histogram_vec_with_buckets(
-                "transfer_metadata_replica_refresh_duration_us",
-                "Transfer metadata replica refresh latency in microseconds",
-                &["result"],
-                &[
-                    1_000.0,
-                    10_000.0,
-                    50_000.0,
-                    100_000.0,
-                    500_000.0,
-                    1_000_000.0,
-                    5_000_000.0,
-                    30_000_000.0,
-                    120_000_000.0,
-                ],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             cluster_snapshot_version: m::new_gauge(
@@ -454,31 +389,6 @@ impl TransferMetrics {
         self.metadata_operation_total
             .with_label_values(labels)
             .inc();
-    }
-
-    pub fn observe_metadata_replica_refresh(&self, obs: MetadataReplicaRefreshObservation<'_>) {
-        self.metadata_replica_refresh_total
-            .with_label_values(&[obs.result])
-            .inc();
-        self.metadata_replica_refresh_duration_us
-            .with_label_values(&[obs.result])
-            .observe(obs.elapsed_us as f64);
-        if let Some(version) = obs.version {
-            self.metadata_replica_version.set(version as i64);
-        }
-        if let Some(entries) = obs.entries {
-            self.metadata_replica_entries.set(entries as i64);
-        }
-        if let Some(page_size) = obs.page_size {
-            self.metadata_replica_page_size.set(page_size as i64);
-        }
-        if let Some(pages) = obs.pages {
-            self.metadata_replica_pages.set(pages as i64);
-        }
-        if let Some(refresh_time_ms) = obs.refresh_time_ms {
-            self.metadata_replica_last_refresh_time_ms
-                .set(refresh_time_ms);
-        }
     }
 
     pub fn observe_cluster_snapshot_refresh(

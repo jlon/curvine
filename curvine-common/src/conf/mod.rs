@@ -14,7 +14,7 @@
 
 pub use curvine_config::{
     CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, TransferConf,
-    TransferCvMetadataReaderType, TransferStoreType, UfsConf, UfsConfBuilder,
+    TransferStoreType, UfsConf, UfsConfBuilder,
 };
 
 pub use curvine_fault::FaultHttpConfig;

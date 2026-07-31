@@ -242,6 +242,7 @@ fn main() -> CommonResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn export_subcommand_is_available() {
@@ -253,6 +254,7 @@ mod tests {
 
     #[test]
     fn mount_accepts_config_without_conf_short_option_collision() {
+        CurvineArgs::command().debug_assert();
         let args = CurvineArgs::try_parse_from([
             "curvine",
             "--conf",

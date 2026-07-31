@@ -27,15 +27,6 @@ pub enum TransferStoreType {
     Mysql,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum TransferCvMetadataReaderType {
-    Auto,
-    Disabled,
-    Master,
-    Replica,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConf {
@@ -58,9 +49,6 @@ pub struct TransferConf {
     pub sqlite_path: String,
     #[serde(skip_serializing)]
     pub mysql_url: String,
-    pub cv_metadata_reader: TransferCvMetadataReaderType,
-    #[serde(skip, default = "TransferConf::default_metadata_replica_max_entries")]
-    pub metadata_replica_max_entries: usize,
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
@@ -101,22 +89,6 @@ pub struct TransferConf {
     pub terminal_retention: Duration,
     #[serde(alias = "terminal_retention")]
     pub terminal_retention_str: String,
-
-    #[serde(skip)]
-    pub metadata_replica_refresh_interval: Duration,
-    #[serde(
-        skip,
-        default = "TransferConf::default_metadata_replica_refresh_interval_str"
-    )]
-    pub metadata_replica_refresh_interval_str: String,
-
-    #[serde(skip)]
-    pub metadata_replica_max_staleness: Duration,
-    #[serde(
-        skip,
-        default = "TransferConf::default_metadata_replica_max_staleness_str"
-    )]
-    pub metadata_replica_max_staleness_str: String,
 }
 
 impl TransferConf {
@@ -125,11 +97,6 @@ impl TransferConf {
     pub const DEFAULT_LEASE_TIMEOUT: &'static str = "120s";
     pub const DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS: &'static str = "60s";
     pub const DEFAULT_TERMINAL_RETENTION: &'static str = "168h";
-    pub const DEFAULT_METADATA_REPLICA_REFRESH_INTERVAL: &'static str = "30s";
-    pub const DEFAULT_METADATA_REPLICA_MAX_STALENESS: &'static str = "120s";
-    pub const DEFAULT_METADATA_REPLICA_MAX_ENTRIES: usize = 1_000_000;
-    pub const DEFAULT_METADATA_REPLICA_PAGE_SIZE: usize = 1000;
-    pub const DEFAULT_METADATA_REPLICA_HISTORY_SIZE: usize = 2;
     pub const DEFAULT_MAX_PLANNING_TRANSFERS: usize = 8;
     pub const DEFAULT_PLANNING_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_WORKER_DISPATCH_CONCURRENCY: usize = 256;
@@ -158,10 +125,6 @@ impl TransferConf {
             DurationUnit::from_str(&self.cluster_snapshot_max_staleness_str)?.as_duration();
         self.terminal_retention =
             DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
-        self.metadata_replica_refresh_interval =
-            DurationUnit::from_str(&self.metadata_replica_refresh_interval_str)?.as_duration();
-        self.metadata_replica_max_staleness =
-            DurationUnit::from_str(&self.metadata_replica_max_staleness_str)?.as_duration();
         if !self.store_url.is_empty() && self.effective_store_type() == TransferStoreType::Auto {
             return Err(FsError::common(
                 "transfer.store_url must use memory://, sqlite://, or mysql://",
@@ -193,24 +156,9 @@ impl TransferConf {
                 "transfer.ufs_max_concurrency_per_endpoint must be greater than 0",
             ));
         }
-        if self.metadata_replica_max_entries == 0 {
-            return Err(FsError::common(
-                "transfer.metadata_replica_max_entries must be greater than 0",
-            ));
-        }
         if self.cluster_snapshot_max_staleness.is_zero() {
             return Err(FsError::common(
                 "transfer.cluster_snapshot_max_staleness must be greater than 0",
-            ));
-        }
-        if self.metadata_replica_refresh_interval.is_zero() {
-            return Err(FsError::common(
-                "transfer.metadata_replica_refresh_interval must be greater than 0",
-            ));
-        }
-        if self.metadata_replica_max_staleness.is_zero() {
-            return Err(FsError::common(
-                "transfer.metadata_replica_max_staleness must be greater than 0",
             ));
         }
         if self.lease_timeout.is_zero() {
@@ -258,13 +206,6 @@ impl TransferConf {
         }
     }
 
-    pub fn effective_cv_metadata_reader(&self) -> TransferCvMetadataReaderType {
-        match self.cv_metadata_reader {
-            TransferCvMetadataReaderType::Auto => TransferCvMetadataReaderType::Replica,
-            reader => reader,
-        }
-    }
-
     pub fn sqlite_store_path(&self) -> &str {
         self.store_url
             .strip_prefix("sqlite://")
@@ -280,11 +221,6 @@ impl TransferConf {
     }
 
     fn validate_mysql_store(&self) -> FsResult<()> {
-        if self.effective_cv_metadata_reader() != TransferCvMetadataReaderType::Replica {
-            return Err(FsError::common(
-                "production transfer requires transfer.cv_metadata_reader=replica",
-            ));
-        }
         if self.allow_submit_with_stale_snapshot {
             return Err(FsError::common(
                 "production transfer forbids transfer.allow_submit_with_stale_snapshot=true",
@@ -325,28 +261,8 @@ impl TransferConf {
         Self::DEFAULT_TASK_STALE_TIMEOUT.to_string()
     }
 
-    fn default_metadata_replica_max_entries() -> usize {
-        Self::DEFAULT_METADATA_REPLICA_MAX_ENTRIES
-    }
-
     fn default_cluster_snapshot_max_staleness_str() -> String {
         Self::DEFAULT_CLUSTER_SNAPSHOT_MAX_STALENESS.to_string()
-    }
-
-    fn default_metadata_replica_refresh_interval_str() -> String {
-        Self::DEFAULT_METADATA_REPLICA_REFRESH_INTERVAL.to_string()
-    }
-
-    fn default_metadata_replica_max_staleness_str() -> String {
-        Self::DEFAULT_METADATA_REPLICA_MAX_STALENESS.to_string()
-    }
-
-    pub fn metadata_replica_page_size(&self) -> usize {
-        Self::DEFAULT_METADATA_REPLICA_PAGE_SIZE
-    }
-
-    pub fn metadata_replica_history_size(&self) -> usize {
-        Self::DEFAULT_METADATA_REPLICA_HISTORY_SIZE
     }
 
     pub fn scheduler_workers(&self) -> usize {
@@ -415,8 +331,6 @@ impl Default for TransferConf {
             endpoints: vec![],
             sqlite_path: "data/transfer/transfer.db".to_string(),
             mysql_url: String::new(),
-            cv_metadata_reader: TransferCvMetadataReaderType::Auto,
-            metadata_replica_max_entries: Self::DEFAULT_METADATA_REPLICA_MAX_ENTRIES,
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
@@ -433,19 +347,13 @@ impl Default for TransferConf {
                 .to_string(),
             terminal_retention: Duration::default(),
             terminal_retention_str: Self::DEFAULT_TERMINAL_RETENTION.to_string(),
-            metadata_replica_refresh_interval: Duration::default(),
-            metadata_replica_refresh_interval_str: Self::DEFAULT_METADATA_REPLICA_REFRESH_INTERVAL
-                .to_string(),
-            metadata_replica_max_staleness: Duration::default(),
-            metadata_replica_max_staleness_str: Self::DEFAULT_METADATA_REPLICA_MAX_STALENESS
-                .to_string(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferConf, TransferCvMetadataReaderType, TransferStoreType};
+    use super::{TransferConf, TransferStoreType};
 
     #[test]
     fn defaults_to_local_sqlite_with_a_local_endpoint() {
@@ -458,10 +366,6 @@ mod tests {
 
         assert_eq!(conf.effective_store_type(), TransferStoreType::Sqlite);
         assert_eq!(conf.store_url, "sqlite://data/transfer/transfer.db");
-        assert_eq!(
-            conf.effective_cv_metadata_reader(),
-            TransferCvMetadataReaderType::Replica
-        );
         assert_eq!(conf.endpoints, vec!["localhost:9010"]);
     }
 
@@ -482,24 +386,6 @@ mod tests {
             conf.store_url,
             "mysql://root:curvine@127.0.0.1:3306/curvine_transfer"
         );
-        assert_eq!(
-            conf.effective_cv_metadata_reader(),
-            TransferCvMetadataReaderType::Replica
-        );
-    }
-
-    #[test]
-    fn auto_mysql_rejects_development_metadata_reader() {
-        let mut conf = TransferConf {
-            enabled: true,
-            store_url: "mysql://root:curvine@127.0.0.1:3306/curvine_transfer".to_string(),
-            cv_metadata_reader: TransferCvMetadataReaderType::Master,
-            ..Default::default()
-        };
-
-        let err = conf.init().unwrap_err().to_string();
-
-        assert!(err.contains("requires transfer.cv_metadata_reader=replica"));
     }
 
     #[test]

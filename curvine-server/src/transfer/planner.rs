@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::common::UfsFactory;
-use crate::transfer::{
-    job_mount_snapshot, ClusterMetadataCache, CvMetadataReader, TransferMetrics,
-};
+use crate::transfer::{job_mount_snapshot, ClusterMetadataCache, TransferMetrics};
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
+use curvine_common::state::ListOptions;
 use curvine_common::state::{
     FileStatus, LoadJobInfo, MountInfo, TransferCommand, TransferJobRecord, TransferKind,
     TransferTaskRecord, TransferTaskState,
@@ -32,18 +32,20 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-const MAX_EXPORT_EPOCH_PLAN_RETRIES: usize = 3;
+const CV_LIST_PAGE_SIZE: usize = 1_000;
 
 pub struct PlannedTransfer {
     pub job_info: LoadJobInfo,
     pub tasks: Vec<TransferTaskRecord>,
     pub total_size: i64,
+    pub skipped_files: usize,
+    pub skipped_size: i64,
     pub cv_metadata_epoch: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct TransferPlanner {
-    cv_metadata: Arc<dyn CvMetadataReader>,
+    master_fs: CurvineFileSystem,
     factory: Arc<UfsFactory>,
     cache: ClusterMetadataCache,
     client_conf: ClientConf,
@@ -53,7 +55,7 @@ pub struct TransferPlanner {
 
 impl TransferPlanner {
     pub fn new(
-        cv_metadata: Arc<dyn CvMetadataReader>,
+        master_fs: CurvineFileSystem,
         factory: Arc<UfsFactory>,
         cache: ClusterMetadataCache,
         client_conf: ClientConf,
@@ -61,7 +63,7 @@ impl TransferPlanner {
         ufs_max_concurrency_per_endpoint: usize,
     ) -> Self {
         Self {
-            cv_metadata,
+            master_fs,
             factory,
             cache,
             client_conf,
@@ -71,64 +73,77 @@ impl TransferPlanner {
     }
 
     pub async fn plan(&self, job: &TransferJobRecord) -> FsResult<PlannedTransfer> {
-        for attempt in 0..MAX_EXPORT_EPOCH_PLAN_RETRIES {
-            let cv_metadata_epoch = self.export_epoch_before_plan(job)?;
-            let planned = self.plan_once(job, cv_metadata_epoch).await?;
-            if !self.export_epoch_changed(job, cv_metadata_epoch)? {
-                return Ok(planned);
-            }
-            log::warn!(
-                "CV metadata replica epoch changed while planning export {}, retry {}/{}",
-                job.job_id,
-                attempt + 1,
-                MAX_EXPORT_EPOCH_PLAN_RETRIES
-            );
-        }
-        Err(FsError::common(format!(
-            "CV metadata replica epoch changed during export planning {} after {} retries",
-            job.job_id, MAX_EXPORT_EPOCH_PLAN_RETRIES
-        )))
+        let mount = job_mount_snapshot(job, &self.cache)?;
+        self.plan_once(job, mount).await
     }
 
     async fn plan_once(
         &self,
         job: &TransferJobRecord,
-        cv_metadata_epoch: Option<u64>,
+        mount: MountInfo,
     ) -> FsResult<PlannedTransfer> {
         let source = Path::from_str(&job.source_path)?;
         let target = Path::from_str(&job.target_path)?;
-        let mount = job_mount_snapshot(job, &self.cache)?;
         let job_info = self.load_job_info(job, &mount);
-        let source_status = self
-            .get_status(job, &source, &mount, cv_metadata_epoch)
-            .await?;
-        if source_status.is_dir {
-            self.validate_directory_target(job, &target, &mount, cv_metadata_epoch)
-                .await?;
+        let source_status = self.get_status(&source, &mount).await?;
+        let incremental_load = job.kind == TransferKind::Load && !source.is_cv() && target.is_cv();
+        let target_status = if incremental_load {
+            self.get_optional_status(&target, &mount).await?
+        } else {
+            None
+        };
+        validate_transfer_target(&source_status, target_status.as_ref(), &target)?;
+        if source_status.is_dir && !incremental_load {
+            self.validate_directory_target(job, &target, &mount).await?;
         }
 
         let mut tasks = Vec::new();
         let mut total_size = 0;
+        let mut skipped_files = 0;
+        let mut skipped_size = 0;
         let mut stack = VecDeque::new();
-        stack.push_back(source_status);
+        stack.push_back((source_status, target_status));
 
-        while let Some(status) = stack.pop_front() {
+        while let Some((status, target_status)) = stack.pop_front() {
             let path = Path::from_str(&status.path)?;
             if status.is_dir {
-                for child in self
-                    .list_status(job, &path, &mount, cv_metadata_epoch)
-                    .await?
-                {
-                    stack.push_back(child);
+                let target_children = if incremental_load && target_status.is_some() {
+                    let target_path = append_relative_path(&source, &target, &path)?;
+                    self.list_status(&target_path, &mount)
+                        .await?
+                        .into_iter()
+                        .map(|status| (status.name.clone(), status))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+                for child in self.list_status(&path, &mount).await? {
+                    let target_status = target_children.get(&child.name).cloned();
+                    stack.push_back((child, target_status));
                 }
                 continue;
             }
 
             let task_target = append_relative_path(&source, &target, &path)?;
+            validate_transfer_target(&status, target_status.as_ref(), &task_target)?;
+            let unchanged =
+                if incremental_load && unchanged_load_target(&status, target_status.as_ref()) {
+                    true
+                } else if incremental_load
+                    && needs_source_status_refresh(&status, target_status.as_ref())
+                {
+                    let current_source_status = self.get_status(&path, &mount).await?;
+                    unchanged_load_target(&current_source_status, target_status.as_ref())
+                } else {
+                    false
+                };
+            if unchanged {
+                skipped_files += 1;
+                skipped_size += status.len;
+                continue;
+            }
             let task_id = format!("{}_task_{}", job.job_id, tasks.len());
-            let source_read_plan_json = self
-                .source_read_plan_json(job, &path, cv_metadata_epoch)
-                .await?;
+            let source_read_plan_json = self.source_read_plan_json(&path).await?;
             total_size += status.len;
             tasks.push(TransferTaskRecord {
                 job_id: job.job_id.clone(),
@@ -163,7 +178,9 @@ impl TransferPlanner {
             job_info,
             tasks,
             total_size,
-            cv_metadata_epoch,
+            skipped_files,
+            skipped_size,
+            cv_metadata_epoch: None,
         })
     }
 
@@ -172,9 +189,16 @@ impl TransferPlanner {
         job: &TransferJobRecord,
         target: &Path,
         mount: &MountInfo,
-        cv_metadata_epoch: Option<u64>,
     ) -> FsResult<()> {
-        match self.get_status(job, target, mount, cv_metadata_epoch).await {
+        let target_status = if job.kind == TransferKind::Load && target.is_cv() {
+            let start = Instant::now();
+            let result = self.master_fs.get_status(target).await;
+            record_metadata_operation("cv", "get_status", result.is_ok(), start);
+            result
+        } else {
+            self.get_status(target, mount).await
+        };
+        match target_status {
             Ok(status) if status.is_dir => Ok(()),
             Ok(_) => err_box!(
                 "Transfer target {} is a file; refusing to transfer directory into file",
@@ -185,55 +209,16 @@ impl TransferPlanner {
         }
     }
 
-    fn export_epoch_before_plan(&self, job: &TransferJobRecord) -> FsResult<Option<u64>> {
-        if job.kind != TransferKind::Export {
-            return Ok(None);
-        }
-        let Some(epoch) = self.cv_metadata.current_epoch()? else {
-            return Ok(None);
-        };
-        Ok(Some(job.cv_metadata_epoch.unwrap_or(epoch)))
-    }
-
-    fn export_epoch_changed(
-        &self,
-        job: &TransferJobRecord,
-        epoch_before: Option<u64>,
-    ) -> FsResult<bool> {
-        if job.kind != TransferKind::Export {
-            return Ok(false);
-        }
-        if job.cv_metadata_epoch.is_some() {
-            return Ok(false);
-        }
-        let Some(epoch_before) = epoch_before else {
-            return Ok(false);
-        };
-        let Some(epoch_after) = self.cv_metadata.current_epoch()? else {
-            return Ok(false);
-        };
-        Ok(epoch_before != epoch_after)
-    }
-
     pub(crate) fn load_job_info(&self, job: &TransferJobRecord, mount: &MountInfo) -> LoadJobInfo {
         load_job_info(job, mount, &self.client_conf)
     }
 
-    async fn get_status(
-        &self,
-        job: &TransferJobRecord,
-        path: &Path,
-        mount: &MountInfo,
-        cv_metadata_epoch: Option<u64>,
-    ) -> FsResult<FileStatus> {
+    async fn get_status(&self, path: &Path, mount: &MountInfo) -> FsResult<FileStatus> {
         let start = Instant::now();
         if path.is_cv() {
-            let result = self
-                .cv_metadata
-                .get_status_at_epoch(path, cv_metadata_epoch)
-                .await;
+            let result = self.master_fs.get_status(path).await;
             record_metadata_operation("cv", "get_status", result.is_ok(), start);
-            result.map_err(|err| self.map_export_cv_not_found(job, path, err))
+            result
         } else {
             let _permit = self.ufs_limiter.acquire(mount).await?;
             let result = match self.factory.get_ufs(mount) {
@@ -245,42 +230,24 @@ impl TransferPlanner {
         }
     }
 
-    fn map_export_cv_not_found(
+    async fn get_optional_status(
         &self,
-        job: &TransferJobRecord,
         path: &Path,
-        err: FsError,
-    ) -> FsError {
-        if job.kind != TransferKind::Export || !matches!(err, FsError::FileNotFound(_)) {
-            return err;
-        }
-        match self.cv_metadata.covers_time_ms(job.created_at) {
-            Ok(false) => FsError::in_progress_msg(format!(
-                "CV metadata replica has not caught up for export {}: path={}, job_created_at={}",
-                job.job_id,
-                path.full_path(),
-                job.created_at
-            )),
-            Ok(true) => err,
-            Err(refresh_err) => refresh_err,
+        mount: &MountInfo,
+    ) -> FsResult<Option<FileStatus>> {
+        match self.get_status(path, mount).await {
+            Ok(status) => Ok(Some(status)),
+            Err(FsError::FileNotFound(_)) => Ok(None),
+            Err(err) => Err(err),
         }
     }
 
-    async fn list_status(
-        &self,
-        job: &TransferJobRecord,
-        path: &Path,
-        mount: &MountInfo,
-        cv_metadata_epoch: Option<u64>,
-    ) -> FsResult<Vec<FileStatus>> {
+    async fn list_status(&self, path: &Path, mount: &MountInfo) -> FsResult<Vec<FileStatus>> {
         let start = Instant::now();
         if path.is_cv() {
-            let result = self
-                .cv_metadata
-                .list_status_at_epoch(path, cv_metadata_epoch)
-                .await;
+            let result = self.list_cv_status(path).await;
             record_metadata_operation("cv", "list_status", result.is_ok(), start);
-            result.map_err(|err| self.map_export_cv_not_found(job, path, err))
+            result
         } else {
             let _permit = self.ufs_limiter.acquire(mount).await?;
             let result = match self.factory.get_ufs(mount) {
@@ -292,22 +259,37 @@ impl TransferPlanner {
         }
     }
 
-    async fn source_read_plan_json(
-        &self,
-        job: &TransferJobRecord,
-        path: &Path,
-        cv_metadata_epoch: Option<u64>,
-    ) -> FsResult<String> {
+    async fn list_cv_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
+        let mut statuses = Vec::new();
+        let mut start_after = None;
+        loop {
+            let page = self
+                .master_fs
+                .list_options(
+                    path,
+                    ListOptions {
+                        limit: Some(CV_LIST_PAGE_SIZE),
+                        start_after: start_after.take(),
+                    },
+                )
+                .await?;
+            let count = page.len();
+            start_after = page.last().map(|status| status.name.clone());
+            statuses.extend(page);
+            if count < CV_LIST_PAGE_SIZE {
+                return Ok(statuses);
+            }
+        }
+    }
+
+    async fn source_read_plan_json(&self, path: &Path) -> FsResult<String> {
         if !path.is_cv() {
             return Ok(String::new());
         }
         let start = Instant::now();
-        let blocks = self
-            .cv_metadata
-            .get_block_locations_at_epoch(path, cv_metadata_epoch)
-            .await;
+        let blocks = self.master_fs.get_block_locations(path).await;
         record_metadata_operation("cv", "get_block_locations", blocks.is_ok(), start);
-        let blocks = blocks.map_err(|err| self.map_export_cv_not_found(job, path, err))?;
+        let blocks = blocks?;
         serde_json::to_string(&blocks).map_err(|_| {
             FsError::common(format!(
                 "Unable to prepare the CV read plan for {}",
@@ -315,6 +297,50 @@ impl TransferPlanner {
             ))
         })
     }
+}
+
+pub(crate) fn unchanged_load_target(source: &FileStatus, target: Option<&FileStatus>) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    !target.is_dir && target.is_complete() && target.cv_valid(Some(source))
+}
+
+pub(crate) fn needs_source_status_refresh(
+    source: &FileStatus,
+    target: Option<&FileStatus>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    !target.is_dir
+        && target.is_complete()
+        && target.cv_valid(None)
+        && target.len == source.len
+        && target.storage_policy.ufs_mtime != source.mtime
+}
+
+fn validate_transfer_target(
+    source: &FileStatus,
+    target: Option<&FileStatus>,
+    target_path: &Path,
+) -> FsResult<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    if source.is_dir && !target.is_dir {
+        return err_box!(
+            "Transfer target {} is a file; refusing to transfer directory into file",
+            target_path.full_path()
+        );
+    }
+    if !source.is_dir && target.is_dir {
+        return err_box!(
+            "Transfer target {} is a directory; refusing to overwrite directory with file",
+            target_path.full_path()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn load_job_info(

@@ -60,8 +60,7 @@ impl TaskStore {
     pub fn cancel(&self, job_id: impl AsRef<str>) -> Vec<Arc<TaskContext>> {
         let all_tasks = self.get_all_tasks(job_id);
         for context in all_tasks.iter() {
-            context.set_canceled("canceled by master");
-            let _ = self.tasks.remove(&context.info.task_id);
+            context.request_cancel("cancellation requested by Transfer");
         }
 
         all_tasks

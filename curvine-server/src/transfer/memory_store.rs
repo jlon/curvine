@@ -62,11 +62,19 @@ impl TransferStore for MemoryTransferStore {
         let mut inner = self.inner.lock();
         let request_key = (job.submitter.clone(), job.client_request_id.clone());
         if let Some(job_id) = inner.request_index.get(&request_key) {
-            return inner
+            let existing = inner
                 .jobs
                 .get(job_id)
                 .cloned()
                 .ok_or_else(|| FsError::job_not_found(job_id));
+            let existing = existing?;
+            if existing.command_json != job.command_json {
+                return Err(FsError::common(format!(
+                    "Transfer request ID {} submitted by {} is already bound to job {} with a different command",
+                    job.client_request_id, job.submitter, existing.job_id
+                )));
+            }
+            return Ok(existing);
         }
 
         if let Some(existing) = inner

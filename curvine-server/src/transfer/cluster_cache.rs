@@ -179,16 +179,18 @@ impl ClusterMetadataCache {
         target: &Path,
     ) -> FsResult<MountSnapshot> {
         let snapshot = self.snapshot();
-        self.check_snapshot_fresh(&snapshot)?;
-        if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
-            return Ok(snapshot);
+        if self.check_snapshot_fresh(&snapshot).is_ok() {
+            if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
+                return Ok(snapshot);
+            }
         }
 
         let _guard = self.refresh_lock.lock();
         let snapshot = self.snapshot();
-        self.check_snapshot_fresh(&snapshot)?;
-        if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
-            return Ok(snapshot);
+        if self.check_snapshot_fresh(&snapshot).is_ok() {
+            if let Some(snapshot) = self.matching_mount_snapshot(kind, source, target, &snapshot) {
+                return Ok(snapshot);
+            }
         }
 
         // SubmitTransfer is synchronous and may run within a Tokio task.

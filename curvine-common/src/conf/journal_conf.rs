@@ -57,7 +57,7 @@ pub struct JournalConf {
     // How many entries are created after creating snapshots.
     pub snapshot_entries: u64,
 
-    // Internal ring buffer for Transfer metadata replica delta sync.
+    // Internal ring buffer for metadata snapshot delta RPCs.
     #[serde(
         skip_serializing,
         skip_deserializing,

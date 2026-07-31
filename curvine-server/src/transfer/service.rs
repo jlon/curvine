@@ -277,10 +277,13 @@ where
         let job = self.get_transfer(job_id)?;
         if !matches!(
             job.state,
-            TransferState::Failed | TransferState::Canceled | TransferState::PartialSuccess
+            TransferState::Completed
+                | TransferState::Failed
+                | TransferState::Canceled
+                | TransferState::PartialSuccess
         ) {
             return Err(FsError::common(format!(
-                "Only failed, canceled, or partially successful transfers can be retried; job {} is currently {}",
+                "Only completed, failed, canceled, or partially successful transfers can be rerun; job {} is currently {}",
                 job_id,
                 transfer_state_name(job.state)
             )));
@@ -386,7 +389,23 @@ where
     pub fn request_cancel(&self, job_id: &str, run_id: Option<u64>) -> FsResult<TransferState> {
         let job = self.get_transfer(job_id)?;
         let target_run_id = run_id.unwrap_or(job.run_id);
-        let _ = self.store.request_cancel(job_id, target_run_id, now_ms())?;
+        if target_run_id == job.run_id
+            && (job.state == TransferState::Canceling || job.state.is_terminal())
+        {
+            return Ok(job.state);
+        }
+        if !self.store.request_cancel(job_id, target_run_id, now_ms())? {
+            let current = self.get_transfer(job_id)?;
+            if target_run_id == current.run_id
+                && (current.state == TransferState::Canceling || current.state.is_terminal())
+            {
+                return Ok(current.state);
+            }
+            return Err(FsError::common(format!(
+                "Transfer {} run {} cannot be canceled because it is not active",
+                job_id, target_run_id
+            )));
+        }
         Ok(self.get_transfer(job_id)?.state)
     }
 

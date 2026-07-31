@@ -282,23 +282,32 @@ where
         }
 
         if planned.tasks.is_empty() {
+            let message = format!(
+                "incremental transfer complete: skipped_files={} skipped_size={}",
+                planned.skipped_files, planned.skipped_size
+            );
             self.transition(
                 &job,
                 &lease,
                 &[TransferState::Planning],
                 TransferState::Completed,
-                "transfer has no file tasks",
+                &message,
             )?;
             record_metric(|metrics| {
                 metrics.inc_planning(transfer_kind_label(job.kind), "empty");
                 metrics.inc_terminal("completed", "empty");
             });
-            info!("transfer {} completed with no file tasks", job.job_id);
+            info!(
+                "transfer {} completed with no file tasks: skipped_files={} skipped_size={}",
+                job.job_id, planned.skipped_files, planned.skipped_size
+            );
             return Ok(());
         }
 
         let task_count = planned.tasks.len();
         let total_size = planned.total_size;
+        let skipped_files = planned.skipped_files;
+        let skipped_size = planned.skipped_size;
         let job_info = planned.job_info;
         let persisted = self.store.persist_planned_tasks(TransferPlannedTasks {
             job_id: job.job_id.clone(),
@@ -306,7 +315,9 @@ where
             owner: lease.owner.clone(),
             lease_epoch: lease.lease_epoch,
             tasks: planned.tasks,
-            message: format!("planned total_size={total_size}"),
+            message: format!(
+                "planned total_size={total_size} skipped_files={skipped_files} skipped_size={skipped_size}"
+            ),
             now_ms: now_ms(),
         })?;
         if !persisted {
@@ -589,18 +600,37 @@ where
             now,
             self.conf.task_probe_concurrency(),
         )?;
-        let workers = self.cache.live_workers().unwrap_or_default();
+        let workers = self.cache.live_workers();
         for task in tasks {
-            let Some(worker) = workers.iter().find(|worker| {
-                worker.worker_id() == task.worker_id
-                    && worker.worker_session_id == task.worker_session_id
-            }) else {
+            let worker = match &workers {
+                Ok(workers) => workers
+                    .iter()
+                    .find(|worker| {
+                        worker.worker_id() == task.worker_id
+                            && worker.worker_session_id == task.worker_session_id
+                    })
+                    .cloned(),
+                Err(err) => {
+                    self.defer_stale_task_retry(
+                        &task,
+                        now,
+                        "cluster worker snapshot unavailable",
+                        err,
+                    )?;
+                    continue;
+                }
+            };
+            let Some(worker) = worker else {
                 continue;
             };
-            let Ok(client) = self.factory.get_worker_client(&worker.address).await else {
-                continue;
+            let client = match self.factory.get_worker_client(&worker.address).await {
+                Ok(client) => client,
+                Err(err) => {
+                    self.defer_stale_task_retry(&task, now, "cannot connect to worker", &err)?;
+                    continue;
+                }
             };
-            let Ok(response) = client
+            let response = match client
                 .query_transfer_task(
                     &task.job_id,
                     task.run_id,
@@ -609,8 +639,17 @@ where
                     &task.worker_session_id,
                 )
                 .await
-            else {
-                continue;
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    self.defer_stale_task_retry(
+                        &task,
+                        now,
+                        "worker did not answer task probe",
+                        &err,
+                    )?;
+                    continue;
+                }
             };
             if !response.found {
                 continue;
@@ -637,6 +676,46 @@ where
         Ok(())
     }
 
+    fn defer_stale_task_retry(
+        &self,
+        task: &TransferTaskRecord,
+        now: i64,
+        reason: &str,
+        err: &impl std::fmt::Display,
+    ) -> FsResult<()> {
+        let mut progress = task.progress.clone();
+        progress.message =
+            "worker status is temporarily unavailable; preserving the current attempt before retry"
+                .to_string();
+        progress.update_time = now;
+        let deferred = self.store.update_task_report(TransferTaskReport {
+            job_id: task.job_id.clone(),
+            run_id: task.run_id,
+            task_id: task.task_id.clone(),
+            attempt_id: task.attempt_id,
+            worker_id: task.worker_id,
+            worker_session_id: task.worker_session_id.clone(),
+            state: TransferTaskState::Running,
+            progress,
+            now_ms: now,
+            stale_deadline_at: now.saturating_add(duration_ms(self.conf.task_stale_timeout)),
+        })?;
+        if deferred {
+            debug!(
+                "defer stale transfer task retry because {}: job={} run={} task={} attempt={} worker_id={} worker_session={} err={}",
+                reason,
+                task.job_id,
+                task.run_id,
+                task.task_id,
+                task.attempt_id,
+                task.worker_id,
+                task.worker_session_id,
+                err,
+            );
+        }
+        Ok(())
+    }
+
     async fn cancel_transfer(
         &self,
         job: &TransferJobRecord,
@@ -644,15 +723,31 @@ where
     ) -> FsResult<()> {
         self.stop_recoverable_tasks(job, lease, "transfer canceled")
             .await?;
+        if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
+            let renewed = self.store.renew_lease(
+                &lease.job_id,
+                lease.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                duration_ms(self.conf.lease_timeout),
+                now_ms(),
+            )?;
+            record_metric(|metrics| {
+                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
+            });
+            return Ok(());
+        }
 
-        let _ = self.transition(
+        let transitioned = self.transition(
             job,
             lease,
             &[TransferState::Canceling],
             TransferState::Canceled,
             "transfer canceled",
         )?;
-        record_metric(|metrics| metrics.inc_terminal("canceled", "cancel_requested"));
+        if transitioned {
+            record_metric(|metrics| metrics.inc_terminal("canceled", "cancel_requested"));
+        }
         Ok(())
     }
 
@@ -663,6 +758,20 @@ where
     ) -> FsResult<()> {
         self.stop_recoverable_tasks(job, lease, "transfer stopped after a task failed")
             .await?;
+        if self.store.has_recoverable_tasks(&job.job_id, job.run_id)? {
+            let renewed = self.store.renew_lease(
+                &lease.job_id,
+                lease.run_id,
+                &lease.owner,
+                lease.lease_epoch,
+                duration_ms(self.conf.lease_timeout),
+                now_ms(),
+            )?;
+            record_metric(|metrics| {
+                metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
+            });
+            return Ok(());
+        }
         let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
         let summary = summarize_transfer_tasks(&tasks, now_ms());
         let state = if summary.counts.completed > 0 {
@@ -678,17 +787,18 @@ where
         } else {
             summary.progress.message
         };
-        let _ = self.transition(job, lease, &[TransferState::Running], state, message)?;
-        record_metric(|metrics| {
-            metrics.inc_terminal(
-                if state == TransferState::PartialSuccess {
-                    "partial_success"
-                } else {
-                    "failed"
-                },
-                "task_failed",
-            )
-        });
+        if self.transition(job, lease, &[TransferState::Running], state, message)? {
+            record_metric(|metrics| {
+                metrics.inc_terminal(
+                    if state == TransferState::PartialSuccess {
+                        "partial_success"
+                    } else {
+                        "failed"
+                    },
+                    "task_failed",
+                )
+            });
+        }
         Ok(())
     }
 
@@ -700,6 +810,7 @@ where
     ) -> FsResult<()> {
         let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
+        let now = now_ms();
         for task in tasks {
             if !matches!(
                 task.state,
@@ -707,21 +818,23 @@ where
             ) {
                 continue;
             }
-            if task.worker_id != 0 {
-                workers.insert(task.worker_id);
-            }
-            if !self.store.update_task_state(TransferTaskStateUpdate {
-                job_id: task.job_id.clone(),
-                run_id: task.run_id,
-                owner: lease.owner.clone(),
-                lease_epoch: lease.lease_epoch,
-                task_id: task.task_id,
-                from_states: vec![task.state],
-                state: TransferTaskState::Canceled,
-                message: message.to_string(),
-                now_ms: now_ms(),
-            })? {
-                continue;
+            if task.state == TransferTaskState::Pending
+                || task.state == TransferTaskState::Stale
+                || (task.state == TransferTaskState::Running && task.stale_deadline_at <= now)
+            {
+                let _ = self.store.update_task_state(TransferTaskStateUpdate {
+                    job_id: task.job_id.clone(),
+                    run_id: task.run_id,
+                    owner: lease.owner.clone(),
+                    lease_epoch: lease.lease_epoch,
+                    task_id: task.task_id,
+                    from_states: vec![task.state],
+                    state: TransferTaskState::Canceled,
+                    message: message.to_string(),
+                    now_ms: now,
+                })?;
+            } else if task.worker_id != 0 {
+                workers.insert((task.worker_id, task.worker_session_id));
             }
         }
 
@@ -736,7 +849,7 @@ where
             }
         };
         for worker in live_workers {
-            if workers.contains(&worker.worker_id()) {
+            if workers.contains(&(worker.worker_id(), worker.worker_session_id.clone())) {
                 match self.factory.get_worker_client(&worker.address).await {
                     Ok(client) => {
                         if let Err(err) = client.cancel_job(&job.job_id).await {
@@ -845,8 +958,16 @@ where
         Ok(client) => client,
         Err(err) => {
             warn!(
-                "connect worker {} for transfer task {} failed before submit; retry in next scheduler tick: {}",
-                worker, task.task_id, err
+                "connect worker for transfer task failed before submit; retry in next scheduler tick: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} err={}",
+                task.job_id,
+                task.run_id,
+                task.task_id,
+                attempt_id,
+                worker.worker_id(),
+                worker.worker_session_id,
+                task.source_path,
+                task.target_path,
+                err
             );
             return Ok(false);
         }
@@ -892,8 +1013,16 @@ where
         Ok(response) => {
             let reason = response.reject_reason.unwrap_or_default();
             warn!(
-                "worker {} rejected transfer task {} attempt {} before accepting it: {}",
-                worker, task.task_id, attempt_id, reason
+                "worker rejected transfer task before accepting it: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} reason={}",
+                task.job_id,
+                task.run_id,
+                task.task_id,
+                attempt_id,
+                worker.worker_id(),
+                worker.worker_session_id,
+                task.source_path,
+                task.target_path,
+                reason
             );
             if !store.update_task_state(TransferTaskStateUpdate {
                 job_id: task.job_id.clone(),
@@ -919,8 +1048,16 @@ where
         }
         Err(err) => {
             warn!(
-                "submit transfer task {} attempt {} to worker {} returned error after attempt start; keep running and let query/stale recovery decide final state: {}",
-                task.task_id, attempt_id, worker, err
+                "submit transfer task returned an error after attempt start; keep running and let query/stale recovery decide final state: job={} run={} task={} attempt={} worker_id={} worker_session={} source={} target={} err={}",
+                task.job_id,
+                task.run_id,
+                task.task_id,
+                attempt_id,
+                worker.worker_id(),
+                worker.worker_session_id,
+                task.source_path,
+                task.target_path,
+                err
             );
             Ok(true)
         }

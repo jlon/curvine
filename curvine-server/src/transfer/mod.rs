@@ -11,7 +11,7 @@ mod mysql_store;
 pub use self::mysql_store::MysqlTransferStore;
 
 mod metrics;
-pub use self::metrics::{MetadataReplicaRefreshObservation, TransferMetrics};
+pub use self::metrics::TransferMetrics;
 
 mod backend;
 pub(crate) use self::backend::is_store_unavailable_error;
@@ -20,16 +20,15 @@ pub use self::backend::TransferStoreBackend;
 mod cluster_cache;
 pub use self::cluster_cache::ClusterMetadataCache;
 
-mod cv_metadata_reader;
-pub use self::cv_metadata_reader::{
-    CvMetadataReader, DisabledCvMetadataReader, MasterCvMetadataReader, MetadataReplicaReader,
-};
-
 mod job_snapshot;
 pub use self::job_snapshot::job_mount_snapshot;
 
 mod planner;
 pub use self::planner::{PlannedTransfer, TransferPlanner};
+
+#[cfg(test)]
+#[path = "tests/planner_test.rs"]
+mod planner_test;
 
 mod service;
 pub use self::service::{progress_to_proto, task_summary_to_proto, TransferService};
@@ -101,8 +100,6 @@ pub(crate) fn transfer_failure_message(
             "Transfer metadata store is unavailable; retry after it recovers".to_string()
         }
         ErrorKind::TransferOverloaded => "Transfer service is busy; retry later".to_string(),
-        _ => format!(
-            "Transfer from {source_path} to {target_path} failed; check the Transfer service logs"
-        ),
+        _ => format!("Transfer from {source_path} to {target_path} failed: {err}"),
     }
 }

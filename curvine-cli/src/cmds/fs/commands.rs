@@ -182,7 +182,10 @@ pub enum FsSubCommand {
         mode: String,
         #[clap(help = "Path of the file/directory to modify")]
         path: String,
-        #[clap(help = "Recursively apply permissions to all files and directories")]
+        #[clap(
+            long,
+            help = "Recursively apply permissions to all files and directories"
+        )]
         recursive: bool,
     },
 
@@ -192,7 +195,10 @@ pub enum FsSubCommand {
         owner_group: String,
         #[clap(help = "Path of the file/directory to modify")]
         path: String,
-        #[clap(help = "Recursively apply ownership to all files and directories")]
+        #[clap(
+            long,
+            help = "Recursively apply ownership to all files and directories"
+        )]
         recursive: bool,
     },
 

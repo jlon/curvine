@@ -138,10 +138,7 @@ impl TransferTaskState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TransferTaskState::Completed
-                | TransferTaskState::Failed
-                | TransferTaskState::Canceled
-                | TransferTaskState::Stale
+            TransferTaskState::Completed | TransferTaskState::Failed | TransferTaskState::Canceled
         )
     }
 }
@@ -176,6 +173,24 @@ impl TransferCommand {
                 kind,
                 source_path.as_ref(),
                 target_path.as_ref()
+            ))
+        )
+    }
+
+    pub fn default_client_request_id_with_overwrite(
+        kind: TransferKind,
+        source_path: impl AsRef<str>,
+        target_path: impl AsRef<str>,
+        overwrite: bool,
+    ) -> String {
+        format!(
+            "job_{}",
+            Utils::md5(format!(
+                "{:?}:{}:{}:overwrite={}",
+                kind,
+                source_path.as_ref(),
+                target_path.as_ref(),
+                overwrite
             ))
         )
     }
@@ -415,6 +430,29 @@ pub struct TransferTenantSummary {
 impl TransferTenantSummary {
     pub fn active(&self) -> u64 {
         self.pending.saturating_add(self.executing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TransferCommand, TransferKind};
+
+    #[test]
+    fn overwrite_changes_default_client_request_id() {
+        let overwrite = TransferCommand::default_client_request_id_with_overwrite(
+            TransferKind::Export,
+            "/source",
+            "s3://bucket/target",
+            true,
+        );
+        let no_overwrite = TransferCommand::default_client_request_id_with_overwrite(
+            TransferKind::Export,
+            "/source",
+            "s3://bucket/target",
+            false,
+        );
+
+        assert_ne!(overwrite, no_overwrite);
     }
 }
 

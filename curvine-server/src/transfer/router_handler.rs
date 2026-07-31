@@ -22,16 +22,13 @@ use curvine_web::router::RouterHandler;
 use log::warn;
 use orpc::common::Metrics;
 
-use crate::transfer::{
-    ClusterMetadataCache, CvMetadataReader, TransferService, TransferStoreBackend,
-};
+use crate::transfer::{ClusterMetadataCache, TransferService, TransferStoreBackend};
 
 pub struct TransferRouterHandler {
     ready: Arc<AtomicBool>,
     store_backend: &'static str,
     service: TransferService<TransferStoreBackend>,
     cluster_cache: ClusterMetadataCache,
-    cv_metadata: Option<Arc<dyn CvMetadataReader>>,
 }
 
 impl TransferRouterHandler {
@@ -40,14 +37,12 @@ impl TransferRouterHandler {
         store_backend: &'static str,
         service: TransferService<TransferStoreBackend>,
         cluster_cache: ClusterMetadataCache,
-        cv_metadata: Option<Arc<dyn CvMetadataReader>>,
     ) -> Self {
         Self {
             ready,
             store_backend,
             service,
             cluster_cache,
-            cv_metadata,
         }
     }
 }
@@ -68,7 +63,6 @@ async fn readyz(
     store_backend: &'static str,
     service: TransferService<TransferStoreBackend>,
     cluster_cache: ClusterMetadataCache,
-    cv_metadata: Option<Arc<dyn CvMetadataReader>>,
 ) -> (StatusCode, String) {
     if !ready.load(Ordering::Relaxed) {
         return (
@@ -99,16 +93,6 @@ async fn readyz(
         );
     }
 
-    if let Some(reader) = cv_metadata {
-        if let Err(err) = reader.current_epoch() {
-            warn!("transfer readiness check failed for CV metadata: {}", err);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "not ready: Curvine metadata is unavailable\n".to_string(),
-            );
-        }
-    }
-
     (StatusCode::OK, "ok\n".to_string())
 }
 
@@ -118,7 +102,6 @@ impl RouterHandler for TransferRouterHandler {
         let store_backend = self.store_backend;
         let service = self.service.clone();
         let cluster_cache = self.cluster_cache.clone();
-        let cv_metadata = self.cv_metadata.clone();
         Router::new()
             .route("/healthz", get(healthz))
             .route(
@@ -129,7 +112,6 @@ impl RouterHandler for TransferRouterHandler {
                         store_backend,
                         service.clone(),
                         cluster_cache.clone(),
-                        cv_metadata.clone(),
                     )
                 }),
             )

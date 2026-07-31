@@ -313,16 +313,18 @@ impl MountCommand {
             mnt_opts.add_properties.clone(),
             mnt_opts.provider,
         )
-        .map_err(|_| {
+        .map_err(|err| {
             FsError::common(format!(
-                "Unable to initialize UFS {}. Verify the URI, mount configuration, and credentials.",
-                ufs_path.full_path()
+                "Unable to initialize UFS {}: {}. Verify the URI, mount configuration, and credentials.",
+                ufs_path.full_path(),
+                err
             ))
         })?;
-        ufs.list_status(&ufs_path).await.map_err(|_| {
+        ufs.list_status(&ufs_path).await.map_err(|err| {
             FsError::common(format!(
-                "Unable to access UFS {}. Verify the endpoint, credentials, and network connectivity.",
-                ufs_path.full_path()
+                "Unable to access UFS {}: {}. Verify the endpoint, credentials, and network connectivity.",
+                ufs_path.full_path(),
+                err
             ))
         })?;
 

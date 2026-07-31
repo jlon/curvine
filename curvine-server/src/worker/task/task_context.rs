@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use curvine_common::state::{JobTaskProgress, JobTaskState, LoadTaskInfo};
@@ -21,6 +22,7 @@ use orpc::sync::StateCtl;
 pub struct TaskContext {
     pub info: LoadTaskInfo,
     state: StateCtl,
+    cancel_requested: AtomicBool,
     progress: Mutex<JobTaskProgress>,
 }
 
@@ -29,6 +31,7 @@ impl TaskContext {
         Self {
             info,
             state: StateCtl::new(JobTaskState::Pending.into()),
+            cancel_requested: AtomicBool::new(false),
             progress: Mutex::new(JobTaskProgress::default()),
         }
     }
@@ -75,6 +78,7 @@ impl TaskContext {
 
     pub fn set_canceled(&self, message: impl Into<String>) -> JobTaskProgress {
         let mut lock = self.progress_lock();
+        self.cancel_requested.store(true, Ordering::Release);
         self.state.set_state(JobTaskState::Canceled);
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
@@ -88,19 +92,27 @@ impl TaskContext {
         }
     }
 
+    pub fn request_cancel(&self, message: impl Into<String>) {
+        let mut lock = self.progress_lock();
+        if self.get_state() == JobTaskState::Canceled {
+            return;
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        lock.message = message.into();
+        lock.update_time = LocalTime::mills() as i64;
+    }
+
     pub fn is_submit(&self) -> bool {
         self.get_state() <= JobTaskState::Loading
     }
 
     pub fn is_cancel(&self) -> bool {
-        self.get_state() == JobTaskState::Canceled
+        self.cancel_requested.load(Ordering::Acquire) || self.get_state() == JobTaskState::Canceled
     }
 
     pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
         let mut lock = self.progress_lock();
-        if self.state.state::<JobTaskState>() == JobTaskState::Canceled
-            && state != JobTaskState::Canceled
-        {
+        if self.is_cancel() && state != JobTaskState::Canceled {
             return;
         }
         self.state.set_state(state);
@@ -115,9 +127,9 @@ impl TaskContext {
         is_last: bool,
     ) -> JobTaskProgress {
         let mut lock = self.progress_lock();
-        if self.state.state::<JobTaskState>() == JobTaskState::Canceled {
+        if self.is_cancel() {
             return JobTaskProgress {
-                state: JobTaskState::Canceled,
+                state: self.get_state(),
                 total_size: lock.total_size,
                 loaded_size: lock.loaded_size,
                 update_time: lock.update_time,

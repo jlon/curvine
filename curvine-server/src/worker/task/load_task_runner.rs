@@ -26,7 +26,7 @@ use curvine_common::state::{
     SetAttrOptsBuilder, TRANSFER_TEMP_PATH_MARKER,
 };
 use curvine_common::FsResult;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::err_box;
 use std::sync::Arc;
@@ -90,8 +90,15 @@ impl LoadTaskRunner {
                     Ok(client) => Some(client),
                     Err(err) => {
                         warn!(
-                            "transfer task {} has invalid report endpoints {:?}: {}",
-                            task.info.task_id, report_endpoints, err
+                            "transfer task has invalid report endpoints {:?}: job={} run={} task={} attempt={} source={} target={} err={}",
+                            report_endpoints,
+                            task.info.job.job_id,
+                            report.run_id,
+                            task.info.task_id,
+                            report.attempt_id,
+                            task.info.source_path,
+                            task.info.target_path,
+                            err,
                         );
                         None
                     }
@@ -114,12 +121,46 @@ impl LoadTaskRunner {
         self.factory.get_ufs(&self.task.info.job.mount_info)
     }
 
+    fn log_context(&self) -> String {
+        let (run_id, attempt_id) = self
+            .task
+            .info
+            .transfer_report
+            .as_ref()
+            .map(|report| (report.run_id, report.attempt_id))
+            .unwrap_or_default();
+        format!(
+            "job={} run={} task={} attempt={} source={} target={}",
+            self.task.info.job.job_id,
+            run_id,
+            self.task.info.task_id,
+            attempt_id,
+            self.task.info.source_path,
+            self.task.info.target_path,
+        )
+    }
+
     pub async fn run(&self) -> bool {
         match self.run0().await {
             Ok(remove_task) => remove_task,
             Err(e) => {
+                if self.task.is_cancel() {
+                    info!(
+                        "transfer task stopped after cancellation request: {} err={}",
+                        self.log_context(),
+                        e
+                    );
+                    return self.finish_canceled().await.unwrap_or_else(|err| {
+                        error!(
+                            "transfer task cancellation finalization failed: {} err={}",
+                            self.log_context(),
+                            err
+                        );
+                        true
+                    });
+                }
                 // The data replication process fails, set the status and report to the master
-                error!("task {} execute failed: {}", self.task.info.task_id, e);
+                error!("transfer task failed: {} err={}", self.log_context(), e);
                 let progress = self.task.set_failed(transfer_failure_message(
                     match Path::from_str(&self.task.info.source_path) {
                         Ok(source) if source.is_cv() => curvine_common::state::TransferKind::Export,
@@ -132,7 +173,11 @@ impl LoadTaskRunner {
                 let res = self.report_progress(progress).await;
 
                 if let Err(e) = res {
-                    warn!("report task {}", e);
+                    warn!(
+                        "transfer task failure report failed: {} err={}",
+                        self.log_context(),
+                        e
+                    );
                     return self.task.info.transfer_report.is_none();
                 }
                 true
@@ -143,10 +188,10 @@ impl LoadTaskRunner {
     async fn run0(&self) -> FsResult<bool> {
         if self.task.is_cancel() {
             info!(
-                "task {} was cancelled before starting",
-                self.task.info.task_id
+                "transfer task canceled before starting: {}",
+                self.log_context()
             );
-            return Ok(true);
+            return self.finish_canceled().await;
         }
 
         self.task
@@ -154,7 +199,7 @@ impl LoadTaskRunner {
 
         let mut stream = self.create_stream().await?;
         if self.task.is_cancel() {
-            info!("task {} was cancelled", self.task.info.task_id);
+            info!("transfer task canceled: {}", self.log_context());
             return self.cancel_stream(&mut stream).await;
         }
         let Some((copied_bytes, reader_len, read_cost_ms, total_cost_ms)) =
@@ -210,8 +255,9 @@ impl LoadTaskRunner {
         if let Err(err) = self.update_progress0(copied_bytes, reader_len, true).await {
             if self.task.info.transfer_report.is_some() {
                 warn!(
-                    "final transfer task report failed, keep task for scheduler probe: job={}, task={}, err={}",
-                    self.task.info.job.job_id, self.task.info.task_id, err
+                    "final transfer task report failed, keep task for scheduler probe: {} err={}",
+                    self.log_context(),
+                    err
                 );
                 return Ok(false);
             }
@@ -219,10 +265,8 @@ impl LoadTaskRunner {
         }
 
         info!(
-            "task {} completed, source_path {}, target_path {}, ufs_mtime:{}, copy bytes {}, read cost {} ms, task cost {} ms",
-            self.task.info.task_id,
-            self.task.info.source_path,
-            self.task.info.target_path,
+            "transfer task completed: {} ufs_mtime={} copied_bytes={} read_cost_ms={} task_cost_ms={}",
+            self.log_context(),
             ufs_mtime,
             copied_bytes,
             read_cost_ms,
@@ -242,7 +286,10 @@ impl LoadTaskRunner {
 
         loop {
             if self.task.is_cancel() {
-                info!("task {} was cancelled", self.task.info.task_id);
+                info!(
+                    "transfer task canceled while copying: {}",
+                    self.log_context()
+                );
                 self.cancel_stream(stream).await?;
                 return Ok(None);
             }
@@ -275,6 +322,14 @@ impl LoadTaskRunner {
 
         stream.writer.complete().await?;
         stream.reader.complete().await?;
+        if self.task.is_cancel() {
+            info!(
+                "transfer task canceled before committing output: {}",
+                self.log_context()
+            );
+            self.cancel_stream(stream).await?;
+            return Ok(None);
+        }
         let copied_bytes = stream.writer.pos();
         let reader_len = stream.reader.len();
         self.commit_output(stream).await?;
@@ -292,9 +347,9 @@ impl LoadTaskRunner {
         };
         if let Err(err) = self.delete_temp_output(temp_path).await {
             warn!(
-                "delete failed transfer temp output {} failed for task {}: {}",
+                "delete failed transfer temp output {} failed: {} err={}",
                 temp_path.full_path(),
-                self.task.info.task_id,
+                self.log_context(),
                 err
             );
         }
@@ -303,27 +358,33 @@ impl LoadTaskRunner {
     async fn cancel_stream(&self, stream: &mut CopyStream) -> FsResult<bool> {
         if let Err(err) = stream.writer.cancel().await {
             warn!(
-                "cancel transfer writer failed for task {} temp {:?}: {}",
-                self.task.info.task_id, stream.temp_path, err
+                "cancel transfer writer failed: {} temp={:?} err={}",
+                self.log_context(),
+                stream.temp_path,
+                err
             );
         }
 
         if let Some(temp_path) = &stream.temp_path {
             if let Err(err) = self.delete_temp_output(temp_path).await {
                 warn!(
-                    "delete cancelled transfer temp output {} failed for task {}: {}",
+                    "delete canceled transfer temp output {} failed: {} err={}",
                     temp_path.full_path(),
-                    self.task.info.task_id,
+                    self.log_context(),
                     err
                 );
             }
         }
 
+        self.finish_canceled().await
+    }
+
+    async fn finish_canceled(&self) -> FsResult<bool> {
         let progress = self.task.set_canceled("task canceled");
         if let Err(err) = self.report_progress(progress).await {
             info!(
-                "cancelled task report was not accepted, remove local task anyway: job={}, task={}, err={}",
-                self.task.info.job.job_id, self.task.info.task_id, err
+                "canceled transfer task report was not accepted, remove local task anyway: {} err={}",
+                self.log_context(), err
             );
         }
         Ok(true)
@@ -389,6 +450,7 @@ impl LoadTaskRunner {
                 .await?
             {
                 CommitTarget::RenameTemp => {
+                    self.ensure_not_canceled()?;
                     self.fs.rename(temp_path, &stream.final_path).await?;
                 }
                 CommitTarget::AlreadyCommitted => {
@@ -408,6 +470,7 @@ impl LoadTaskRunner {
                 .await?
             {
                 CommitTarget::RenameTemp => {
+                    self.ensure_not_canceled()?;
                     self.mark_ufs_commit_source(&stream.final_path).await?;
                     rename_ufs_output(&ufs, temp_path, &stream.final_path).await?;
                 }
@@ -421,6 +484,13 @@ impl LoadTaskRunner {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_not_canceled(&self) -> FsResult<()> {
+        if self.task.is_cancel() {
+            return err_box!("Transfer task was canceled before committing output");
         }
         Ok(())
     }
@@ -612,7 +682,10 @@ impl LoadTaskRunner {
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
 
             if !overwrite && ufs.exists(path).await? {
-                warn!("UFS file already exists, skipping: {}", path.full_path());
+                warn!(
+                    "transfer task rejected because target exists and overwrite=false: {}",
+                    self.log_context()
+                );
                 return err_box!("File exists and overwrite=false");
             }
 
@@ -632,7 +705,11 @@ impl LoadTaskRunner {
             .update_progress0(loaded_size, total_size, is_last)
             .await
         {
-            warn!("update progress failed, err: {:?}", e);
+            debug!(
+                "transfer task progress report failed: {} err={}",
+                self.log_context(),
+                e
+            );
         }
     }
 

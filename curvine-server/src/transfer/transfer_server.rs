@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use crate::common::UfsFactory;
 use curvine_client::file::CurvineFileSystem;
-use curvine_common::conf::{ClusterConf, TransferCvMetadataReaderType, TransferStoreType};
+use curvine_common::conf::{ClusterConf, TransferStoreType};
 use curvine_common::error::FsError;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
@@ -30,8 +30,7 @@ use orpc::CommonResult;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::transfer::{
-    ClusterMetadataCache, CvMetadataReader, DisabledCvMetadataReader, MasterCvMetadataReader,
-    MemoryTransferStore, MetadataReplicaReader, MysqlTransferStore, SqliteTransferStore,
+    ClusterMetadataCache, MemoryTransferStore, MysqlTransferStore, SqliteTransferStore,
     TransferHandler, TransferMetrics, TransferPlanner, TransferRouterHandler, TransferScheduler,
     TransferService, TransferStoreBackend,
 };
@@ -42,7 +41,6 @@ pub struct TransferRpcService {
     ready: Arc<AtomicBool>,
     store_backend: &'static str,
     cluster_cache: ClusterMetadataCache,
-    cv_metadata: Option<Arc<dyn CvMetadataReader>>,
 }
 
 impl TransferRpcService {
@@ -51,14 +49,12 @@ impl TransferRpcService {
         ready: Arc<AtomicBool>,
         store_backend: &'static str,
         cluster_cache: ClusterMetadataCache,
-        cv_metadata: Option<Arc<dyn CvMetadataReader>>,
     ) -> Self {
         Self {
             service,
             ready,
             store_backend,
             cluster_cache,
-            cv_metadata,
         }
     }
 }
@@ -80,7 +76,6 @@ impl WebHandlerService for TransferRpcService {
             self.store_backend,
             self.service.clone(),
             self.cluster_cache.clone(),
-            self.cv_metadata.clone(),
         )
     }
 }
@@ -90,7 +85,6 @@ pub struct TransferServer {
     web_server: WebServer<TransferRpcService>,
     cluster_cache: ClusterMetadataCache,
     scheduler: TransferScheduler<TransferStoreBackend>,
-    metadata_replica: Option<(MetadataReplicaReader, std::time::Duration)>,
     ready: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
@@ -128,37 +122,13 @@ impl TransferServer {
             Duration::from_millis(conf.client.mount_update_ttl_ms),
             stop.clone(),
         );
-        let mut metadata_replica = None;
-        let cv_metadata: Arc<dyn CvMetadataReader> =
-            match conf.transfer.effective_cv_metadata_reader() {
-                TransferCvMetadataReaderType::Auto => {
-                    unreachable!("resolved CV metadata reader cannot be auto")
-                }
-                TransferCvMetadataReaderType::Disabled => Arc::new(DisabledCvMetadataReader),
-                TransferCvMetadataReaderType::Master => Arc::new(MasterCvMetadataReader::new(fs)),
-                TransferCvMetadataReaderType::Replica => {
-                    let reader = MetadataReplicaReader::new(
-                        fs.clone(),
-                        conf.transfer.metadata_replica_max_entries,
-                        conf.transfer.metadata_replica_page_size(),
-                        conf.transfer.metadata_replica_history_size(),
-                        conf.transfer.metadata_replica_max_staleness,
-                    );
-                    metadata_replica = Some((
-                        reader.clone(),
-                        conf.transfer.metadata_replica_refresh_interval,
-                    ));
-                    Arc::new(reader)
-                }
-            };
-
         let owner = if conf.transfer.instance_id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
             conf.transfer.instance_id.clone()
         };
         let planner = TransferPlanner::new(
-            cv_metadata.clone(),
+            fs,
             factory.clone(),
             cache.clone(),
             conf.client.clone(),
@@ -173,6 +143,18 @@ impl TransferServer {
         } else {
             conf.transfer.endpoints.clone()
         };
+        info!(
+            "configured curvine-transfer store_backend={} rpc_addr={}:{} web_addr={}:{} report_endpoints={:?} max_running={} max_tasks={} task_stale_timeout_ms={}",
+            store_backend,
+            conf.transfer.hostname,
+            conf.transfer.rpc_port,
+            conf.transfer.hostname,
+            conf.transfer.web_port,
+            report_endpoints,
+            conf.transfer.max_running_transfers,
+            conf.transfer.max_tasks_per_transfer,
+            conf.transfer.task_stale_timeout.as_millis(),
+        );
         let scheduler = TransferScheduler::new(
             store.clone(),
             planner,
@@ -195,7 +177,6 @@ impl TransferServer {
             ready.clone(),
             store_backend,
             cache.clone(),
-            Some(cv_metadata.clone()),
         );
         let rpc_server =
             RpcServer::with_rt(rt.clone(), conf.transfer_server_conf(), service.clone());
@@ -209,7 +190,6 @@ impl TransferServer {
             web_server,
             cluster_cache: cache,
             scheduler,
-            metadata_replica,
             ready,
             stop,
         })
@@ -224,10 +204,6 @@ impl TransferServer {
 
         let result = async {
             self.cluster_cache.refresh().await?;
-            if let Some((reader, refresh_interval)) = &self.metadata_replica {
-                reader.refresh().await?;
-                reader.start_refresh_loop(*refresh_interval, self.stop.clone());
-            }
             self.scheduler
                 .start(self.rpc_server.clone_rt(), self.stop.clone());
             info!("Starting curvine-transfer rpc server");

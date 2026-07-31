@@ -18,7 +18,7 @@ use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::rpc::TransferClient;
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{JobTaskProgress, LoadTaskInfo, TransferTaskReportInfo};
+use curvine_common::state::{JobTaskProgress, JobTaskState, LoadTaskInfo, TransferTaskReportInfo};
 use curvine_common::FsResult;
 use dashmap::mapref::entry::Entry;
 use log::{debug, info, warn};
@@ -190,8 +190,13 @@ impl TaskManager {
                             && old_report.attempt_id == new_report.attempt_id
                         {
                             debug!(
-                                "ignore duplicate transfer task submit {}, attempt {}",
-                                task_id, new_report.attempt_id
+                                "ignore duplicate transfer task submit: job={} run={} task={} attempt={} source={} target={}",
+                                context.info.job.job_id,
+                                new_report.run_id,
+                                task_id,
+                                new_report.attempt_id,
+                                context.info.source_path,
+                                context.info.target_path,
                             );
                             return Ok(TaskSubmitResult::accepted());
                         }
@@ -223,10 +228,26 @@ impl TaskManager {
                 vac.insert(context.clone());
             }
         }
-        info!(
-            "submit task {} {}",
-            context.info.task_id, context.info.source_path
-        );
+        if let Some(report) = &context.info.transfer_report {
+            info!(
+                "accepted transfer task: job={} run={} task={} attempt={} source={} target={}",
+                context.info.job.job_id,
+                report.run_id,
+                context.info.task_id,
+                report.attempt_id,
+                context.info.source_path,
+                context.info.target_path,
+            );
+        } else {
+            info!(
+                "submit task {} {}",
+                context.info.task_id, context.info.source_path
+            );
+        }
+
+        // The scheduler treats an accepted task as running while it waits for
+        // this worker's local concurrency permit.
+        context.update_state(JobTaskState::Loading, "task accepted and queued");
 
         let runner = LoadTaskRunner::new(
             context.clone(),

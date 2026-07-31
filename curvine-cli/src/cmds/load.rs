@@ -17,7 +17,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_fs_api::Path;
 use curvine_job_client::{JobMasterClient, TransferClient};
-use curvine_model::{LoadJobCommand, TransferCommand, TransferKind};
+use curvine_model::{LoadJobCommand, TransferCommand, TransferKind, TransferState};
 use curvine_unified_fs::UnifiedFileSystem;
 use orpc::{err_box, CommonResult};
 
@@ -36,10 +36,17 @@ pub struct LoadCommand {
     /// Do not overwrite an existing target file
     #[arg(long = "no-overwrite", default_value_t = true, action = clap::ArgAction::SetFalse)]
     overwrite: bool,
+
+    /// Start a new incremental load when the matching transfer has already finished
+    #[arg(long)]
+    force: bool,
 }
 
 impl LoadCommand {
     pub async fn execute_legacy(&self, client: JobMasterClient) -> CommonResult<()> {
+        if self.force {
+            return err_box!("load --force requires transfer.enabled=true");
+        }
         if self.source_path.trim().is_empty() {
             eprintln!("Error: Path cannot be empty");
             std::process::exit(1);
@@ -126,17 +133,21 @@ impl LoadCommand {
             kind: TransferKind::Load,
             source_path: source.clone_uri(),
             target_path: target.clone_uri(),
-            client_request_id: TransferCommand::default_client_request_id(
+            client_request_id: TransferCommand::default_client_request_id_with_overwrite(
                 TransferKind::Load,
                 source.clone_uri(),
                 target.clone_uri(),
+                self.overwrite,
             ),
             submitter: "curvine-cli".to_string(),
             tenant: String::new(),
             options: Default::default(),
         };
         command.set_overwrite(self.overwrite);
-        let rep = handle_rpc_result(transfer_client.submit(command)).await;
+        let mut rep = handle_rpc_result(transfer_client.submit(command)).await;
+        if self.force && TransferState::from(rep.state).is_terminal() {
+            rep = handle_rpc_result(transfer_client.retry(&rep.job_id)).await;
+        }
         println!("Job ID: {}", rep.job_id);
         println!("Target path: {}", target.full_path());
         println!("State: {}", rep.state);
@@ -166,5 +177,13 @@ mod tests {
         assert_eq!(cmd.source_path, "s3://flink/user");
         assert_eq!(cmd.target_path.as_deref(), Some("/flink/user"));
         assert!(cmd.watch);
+    }
+
+    #[test]
+    fn parses_force() {
+        let cmd = LoadCommand::try_parse_from(["load", "s3://flink/user", "--force"])
+            .expect("load command should accept --force");
+
+        assert!(cmd.force);
     }
 }

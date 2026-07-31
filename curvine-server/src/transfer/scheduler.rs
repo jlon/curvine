@@ -810,6 +810,7 @@ where
     ) -> FsResult<()> {
         let tasks = self.store.list_transfer_tasks(&job.job_id, job.run_id)?;
         let mut workers = HashSet::new();
+        let now = now_ms();
         for task in tasks {
             if !matches!(
                 task.state,
@@ -817,17 +818,20 @@ where
             ) {
                 continue;
             }
-            if task.state == TransferTaskState::Pending {
+            if task.state == TransferTaskState::Pending
+                || task.state == TransferTaskState::Stale
+                || (task.state == TransferTaskState::Running && task.stale_deadline_at <= now)
+            {
                 let _ = self.store.update_task_state(TransferTaskStateUpdate {
                     job_id: task.job_id.clone(),
                     run_id: task.run_id,
                     owner: lease.owner.clone(),
                     lease_epoch: lease.lease_epoch,
                     task_id: task.task_id,
-                    from_states: vec![TransferTaskState::Pending],
+                    from_states: vec![task.state],
                     state: TransferTaskState::Canceled,
                     message: message.to_string(),
-                    now_ms: now_ms(),
+                    now_ms: now,
                 })?;
             } else if task.worker_id != 0 {
                 workers.insert((task.worker_id, task.worker_session_id));

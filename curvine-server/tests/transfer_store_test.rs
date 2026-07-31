@@ -66,6 +66,26 @@ fn sqlite_target_conflict_treats_wildcards_as_path_characters() {
 }
 
 #[test]
+fn sqlite_target_conflict_does_not_treat_candidate_parent_as_like_pattern() {
+    let db_path = std::env::temp_dir().join(format!(
+        "curvine-transfer-store-wildcard-parent-{}-{}.db",
+        std::process::id(),
+        orpc::common::LocalTime::mills()
+    ));
+    let store = SqliteTransferStore::open(&db_path).unwrap();
+
+    store
+        .create_or_get_by_request_id(transfer_job("child", "/cache/aXbZ/child"))
+        .unwrap();
+    assert!(store
+        .create_or_get_by_request_id(transfer_job("wildcard-parent", "/cache/a_b%"))
+        .is_ok());
+
+    drop(store);
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn sqlite_request_id_cannot_be_reused_for_a_different_command() {
     let db_path = std::env::temp_dir().join(format!(
         "curvine-transfer-store-request-id-{}-{}.db",

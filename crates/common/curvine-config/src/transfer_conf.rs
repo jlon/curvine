@@ -34,7 +34,7 @@ pub struct TransferConf {
     // Deprecated compatibility inputs normalize into store_url during init.
     #[serde(skip_serializing)]
     pub store_type: TransferStoreType,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing)]
     pub store_url: String,
     pub hostname: String,
     pub rpc_port: u16,
@@ -405,5 +405,18 @@ mod tests {
         };
         let err = invalid.init().unwrap_err().to_string();
         assert!(err.contains("transfer.store_url must use"));
+    }
+
+    #[test]
+    fn store_url_is_not_serialized_into_printed_configuration() {
+        let conf = TransferConf {
+            store_url: "mysql://transfer:secret@db.example:3306/curvine_transfer".to_string(),
+            ..Default::default()
+        };
+
+        let text = toml::to_string(&conf).unwrap();
+
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("store_url"));
     }
 }

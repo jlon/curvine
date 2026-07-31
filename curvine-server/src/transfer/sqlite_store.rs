@@ -1252,7 +1252,7 @@ fn select_conflicting_active_transfer(
     submitter: &str,
     client_request_id: &str,
 ) -> FsResult<Option<TransferJobRecord>> {
-    let child_prefix = format!("{}/%", target_path.trim_end_matches('/'));
+    let child_prefix = sqlite_like_prefix(target_path);
     let exact_or_child = conn
         .query_row(
             job_select_sql(
@@ -1260,7 +1260,7 @@ fn select_conflicting_active_transfer(
                and not (submitter = ?2 and client_request_id = ?3)
                and (
                    target_path = ?1
-                   or target_path like ?4
+                   or target_path like ?4 escape '\\'
                )
              limit 1",
             )
@@ -1294,6 +1294,15 @@ fn select_conflicting_active_transfer(
         }
     }
     Ok(None)
+}
+
+fn sqlite_like_prefix(path: &str) -> String {
+    let path = path
+        .trim_end_matches('/')
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{path}/%")
 }
 
 fn job_select_sql(where_sql: &str) -> String {

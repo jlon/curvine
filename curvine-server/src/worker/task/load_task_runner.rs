@@ -322,6 +322,14 @@ impl LoadTaskRunner {
 
         stream.writer.complete().await?;
         stream.reader.complete().await?;
+        if self.task.is_cancel() {
+            info!(
+                "transfer task canceled before committing output: {}",
+                self.log_context()
+            );
+            self.cancel_stream(stream).await?;
+            return Ok(None);
+        }
         let copied_bytes = stream.writer.pos();
         let reader_len = stream.reader.len();
         self.commit_output(stream).await?;
@@ -442,6 +450,7 @@ impl LoadTaskRunner {
                 .await?
             {
                 CommitTarget::RenameTemp => {
+                    self.ensure_not_canceled()?;
                     self.fs.rename(temp_path, &stream.final_path).await?;
                 }
                 CommitTarget::AlreadyCommitted => {
@@ -461,6 +470,7 @@ impl LoadTaskRunner {
                 .await?
             {
                 CommitTarget::RenameTemp => {
+                    self.ensure_not_canceled()?;
                     self.mark_ufs_commit_source(&stream.final_path).await?;
                     rename_ufs_output(&ufs, temp_path, &stream.final_path).await?;
                 }
@@ -474,6 +484,13 @@ impl LoadTaskRunner {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn ensure_not_canceled(&self) -> FsResult<()> {
+        if self.task.is_cancel() {
+            return err_box!("Transfer task was canceled before committing output");
         }
         Ok(())
     }

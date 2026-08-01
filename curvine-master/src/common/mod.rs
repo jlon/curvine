@@ -12,5 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod ufs_factory;
-pub use self::ufs_factory::UfsFactory;
+pub use curvine_data_transfer::common::UfsFactory;

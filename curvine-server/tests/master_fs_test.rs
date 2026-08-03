@@ -1821,6 +1821,45 @@ fn test_reject_s3_mount_without_region_before_persist() -> CommonResult<()> {
 }
 
 #[test]
+fn test_legacy_s3_mount_properties_are_canonicalized_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("canonicalize-legacy-s3-mount");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.access_key", "access-key")
+        .add_property("s3.secret_key", "secret-key")
+        .add_property("s3.region", "cn-test-1")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let properties = &mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must be stored")
+        .properties;
+    assert_eq!(
+        properties.get("s3.region_name").map(String::as_str),
+        Some("cn-test-1")
+    );
+    assert_eq!(
+        properties.get("s3.credentials.access").map(String::as_str),
+        Some("access-key")
+    );
+    assert_eq!(
+        properties.get("s3.credentials.secret").map(String::as_str),
+        Some("secret-key")
+    );
+    assert!(!properties.contains_key("s3.region"));
+    assert!(!properties.contains_key("s3.access_key"));
+    assert!(!properties.contains_key("s3.secret_key"));
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
 fn test_reject_invalid_s3_mount_config_before_persist() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-invalid-s3-mount-config");

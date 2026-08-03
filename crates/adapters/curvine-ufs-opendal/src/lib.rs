@@ -308,6 +308,12 @@ impl OpendalFileSystem {
             .scheme()
             .ok_or_else(|| FsError::invalid_path(path.full_path(), "Missing scheme"))?;
 
+        let conf = if matches!(scheme, "s3" | "s3a") {
+            curvine_ufs_api::S3Conf::canonicalize_properties(conf)?
+        } else {
+            conf
+        };
+
         let bucket_or_container = path
             .authority()
             .ok_or_else(|| {

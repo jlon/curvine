@@ -124,6 +124,9 @@ impl S3Conf {
     pub const ACCESS_KEY: &'static str = "s3.credentials.access";
     pub const SECRET_KEY: &'static str = "s3.credentials.secret";
     pub const REGION_NAME: &'static str = "s3.region_name";
+    pub const LEGACY_ACCESS_KEY: &'static str = "s3.access_key";
+    pub const LEGACY_SECRET_KEY: &'static str = "s3.secret_key";
+    pub const LEGACY_REGION_NAME: &'static str = "s3.region";
     pub const FORCE_PATH_STYLE: &'static str = "s3.force.path.style";
     pub const LIST_OBJECTS_VERSION: &'static str = "s3.list_objects_version";
     pub const RETRY_TIMES: &'static str = "s3.retry_times";
@@ -139,10 +142,38 @@ impl S3Conf {
     }
 
     pub fn validate(properties: &HashMap<String, String>) -> CommonResult<()> {
-        Self::with_map(properties.clone())?;
-        Self::uses_list_objects_v1(properties)?;
-        OpendalConf::from_map(properties)?;
+        let conf = Self::with_map(properties.clone())?;
+        Self::uses_list_objects_v1(&conf.properties)?;
+        OpendalConf::from_map(&conf.properties)?;
         Ok(())
+    }
+
+    /// Convert the S3 property names used by older clients into the mount schema.
+    pub fn canonicalize_properties(
+        mut properties: HashMap<String, String>,
+    ) -> CommonResult<HashMap<String, String>> {
+        for (legacy, canonical) in [
+            (Self::LEGACY_ACCESS_KEY, Self::ACCESS_KEY),
+            (Self::LEGACY_SECRET_KEY, Self::SECRET_KEY),
+            (Self::LEGACY_REGION_NAME, Self::REGION_NAME),
+        ] {
+            let Some(value) = properties.remove(legacy) else {
+                continue;
+            };
+
+            if let Some(canonical_value) = properties.get(canonical) {
+                if canonical_value != &value {
+                    return err_box!(
+                        "conflicting S3 configuration: both {} and {} are set",
+                        legacy,
+                        canonical
+                    );
+                }
+            } else {
+                properties.insert(canonical.to_string(), value);
+            }
+        }
+        Ok(properties)
     }
 
     pub fn uses_list_objects_v1(properties: &HashMap<String, String>) -> CommonResult<bool> {
@@ -172,7 +203,7 @@ impl S3Conf {
     }
 
     pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
-        let map = ConfMap::new(properties);
+        let map = ConfMap::new(Self::canonicalize_properties(properties)?);
 
         Self::required_property(&map.0, Self::ENDPOINT)?;
         let endpoint_url = map.get_string(Self::ENDPOINT)?;
@@ -440,6 +471,52 @@ mod s3_conf_tests {
         properties.insert(S3Conf::SECRET_KEY.to_string(), " ".to_string());
         let err = S3Conf::with_map(properties).expect_err("empty secret key must fail");
         assert!(err.to_string().contains(S3Conf::SECRET_KEY));
+    }
+
+    #[test]
+    fn canonicalizes_legacy_s3_properties() {
+        let properties = HashMap::from([
+            (
+                S3Conf::ENDPOINT.to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            (
+                S3Conf::LEGACY_ACCESS_KEY.to_string(),
+                "access-key".to_string(),
+            ),
+            (
+                S3Conf::LEGACY_SECRET_KEY.to_string(),
+                "secret-key".to_string(),
+            ),
+            (
+                S3Conf::LEGACY_REGION_NAME.to_string(),
+                "cn-test-1".to_string(),
+            ),
+        ]);
+
+        let conf = S3Conf::with_map(properties).expect("legacy S3 configuration must work");
+        assert_eq!(conf.access_key, "access-key");
+        assert_eq!(conf.secret_key, "secret-key");
+        assert_eq!(conf.region_name, "cn-test-1");
+        assert!(!conf.properties.contains_key(S3Conf::LEGACY_ACCESS_KEY));
+        assert!(!conf.properties.contains_key(S3Conf::LEGACY_SECRET_KEY));
+        assert!(!conf.properties.contains_key(S3Conf::LEGACY_REGION_NAME));
+    }
+
+    #[test]
+    fn rejects_conflicting_legacy_and_canonical_property() {
+        let properties = HashMap::from([
+            (
+                S3Conf::LEGACY_REGION_NAME.to_string(),
+                "cn-test-1".to_string(),
+            ),
+            (S3Conf::REGION_NAME.to_string(), "cn-test-2".to_string()),
+        ]);
+
+        let err = S3Conf::canonicalize_properties(properties)
+            .expect_err("conflicting S3 property names must fail");
+        assert!(err.to_string().contains(S3Conf::LEGACY_REGION_NAME));
+        assert!(err.to_string().contains(S3Conf::REGION_NAME));
     }
 
     #[test]

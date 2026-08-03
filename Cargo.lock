@@ -2417,6 +2417,7 @@ dependencies = [
  "curvine-fault",
  "curvine-metrics",
  "curvine-rocksdb",
+ "curvine-ufs-api",
  "curvine-unified-fs",
  "curvine-web",
  "dashmap 5.5.3",
@@ -2683,6 +2684,7 @@ dependencies = [
  "orpc-error",
  "orpc-runtime",
  "tokio",
+ "url",
 ]
 
 [[package]]

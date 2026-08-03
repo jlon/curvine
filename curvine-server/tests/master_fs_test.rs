@@ -14,8 +14,8 @@
 
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
+use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::proto::{
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
     GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
@@ -1794,6 +1794,131 @@ fn test_idempotent_unmount() -> CommonResult<()> {
     mnt_mgr.umount("/mnt/test")?;
     replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    Ok(())
+}
+
+#[test]
+fn test_reject_s3_mount_without_region_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-s3-mount-without-region");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("S3 mount without s3.region_name must be rejected");
+
+    assert!(err.to_string().contains("s3.region_name"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_legacy_s3_mount_properties_are_canonicalized_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("canonicalize-legacy-s3-mount");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.access_key", "access-key")
+        .add_property("s3.secret_key", "secret-key")
+        .add_property("s3.region", "cn-test-1")
+        .build();
+
+    mnt_mgr.mount(None, mount_path, "s3://bucket/path", &opts)?;
+
+    let properties = &mnt_mgr
+        .get_mount_info(&mount)?
+        .expect("mount must be stored")
+        .properties;
+    assert_eq!(
+        properties.get("s3.region_name").map(String::as_str),
+        Some("cn-test-1")
+    );
+    assert_eq!(
+        properties.get("s3.credentials.access").map(String::as_str),
+        Some("access-key")
+    );
+    assert_eq!(
+        properties.get("s3.credentials.secret").map(String::as_str),
+        Some("secret-key")
+    );
+    assert!(!properties.contains_key("s3.region"));
+    assert!(!properties.contains_key("s3.access_key"));
+    assert!(!properties.contains_key("s3.secret_key"));
+    assert!(fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_reject_invalid_s3_mount_config_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, _loader, _js2, _fs2) = setup_pair("reject-invalid-s3-mount-config");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.list_objects_version", "v3")
+        .build();
+
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &opts)
+        .expect_err("invalid S3 provider configuration must be rejected");
+
+    assert!(err.to_string().contains("s3.list_objects_version"));
+    assert!(mnt_mgr.get_mount_info(&mount)?.is_none());
+    assert!(!fs.exists(mount_path)?);
+    Ok(())
+}
+
+#[test]
+fn test_reject_invalid_s3_mount_update_before_persist() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (_fs, js, _loader, _js2, _fs2) = setup_pair("reject-invalid-s3-mount-update");
+    let mnt_mgr = js.mount_manager();
+    let mount_path = "/mnt/s3";
+    let mount = Path::from_str(mount_path)?;
+    let region = "cn-test-1";
+    let opts = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.region_name", region)
+        .build();
+
+    mnt_mgr.unprotected_add_mount(opts.clone().to_info(1, mount_path, "s3://bucket/path"))?;
+
+    let update = MountOptions::builder()
+        .update(true)
+        .add_property("s3.list_objects_version", "v3")
+        .build();
+    let err = mnt_mgr
+        .mount(None, mount_path, "s3://bucket/path", &update)
+        .expect_err("invalid S3 mount update must be rejected");
+
+    assert!(err.to_string().contains("s3.list_objects_version"));
+    assert_eq!(
+        mnt_mgr
+            .get_mount_info(&mount)?
+            .expect("valid S3 mount must remain stored")
+            .properties
+            .get("s3.region_name")
+            .map(String::as_str),
+        Some(region)
+    );
     Ok(())
 }
 

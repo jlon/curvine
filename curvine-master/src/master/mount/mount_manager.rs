@@ -20,9 +20,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
 use curvine_common::FsResult;
+use curvine_ufs_api::S3Conf;
 use log::info;
 use orpc::err_box;
-use std::collections::HashMap;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,
@@ -58,6 +58,27 @@ impl MountManager {
         Ok(true)
     }
 
+    fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
+        let path = Path::from_str(&mount.ufs_path)?;
+        if !matches!(path.scheme(), Some("s3" | "s3a")) {
+            return Ok(());
+        }
+
+        let properties = std::mem::take(&mut mount.properties);
+        mount.properties = S3Conf::canonicalize_properties(properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })?;
+        S3Conf::validate(&mount.properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })
+    }
+
     /// same baseuri of ufs can only mount once
     ///
     /// ufs_uri maybe scheme://authority/xxxx/yyy,
@@ -69,15 +90,18 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        let _ = self.create_mount_point(mount_path)?;
-
         let assign_id = match mnt_id {
             Some(id) => id,
             None => self.mount_table.assign_mount_id()?,
         };
+        let mut mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
+        Self::normalize_mount_config(&mut mount)?;
+        let _ = self.create_mount_point(mount_path)?;
 
+        let mut normalized_options = mnt_opt.clone();
+        normalized_options.add_properties = mount.properties;
         self.mount_table
-            .add_mount(assign_id, mount_path, ufs_path, mnt_opt)
+            .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
     }
 
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
@@ -85,7 +109,8 @@ impl MountManager {
         let Some(existing) = self.get_mount_info(&path)? else {
             return err_box!("mount point {} not found for update", cv_path);
         };
-        let merged = existing.merge_with(mnt_opt.clone());
+        let mut merged = existing.merge_with(mnt_opt.clone());
+        Self::normalize_mount_config(&mut merged)?;
 
         self.mount_table.update_mount(merged)
     }

@@ -38,7 +38,7 @@ pub fn validate_path_and_configs(
     match scheme.as_deref() {
         Some("s3") => {
             validate_s3_path(path)?;
-            S3Conf::with_map(configs.clone())?;
+            S3Conf::validate(configs)?;
             Ok(())
         }
         Some(_) => Ok(()), // No special validation for other schemes

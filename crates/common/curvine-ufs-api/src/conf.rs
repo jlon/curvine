@@ -17,6 +17,7 @@ use orpc_runtime::common::DurationUnit;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::time::Duration;
+use url::Url;
 
 pub struct ConfMap(HashMap<String, String>);
 
@@ -38,7 +39,15 @@ impl ConfMap {
         match value.trim().to_lowercase().as_str() {
             "true" => Ok(true),
             "false" => Ok(false),
-            _ => err_box!("Invalid boolean string"),
+            _ => err_box!("{} must be true or false", key),
+        }
+    }
+
+    pub fn get_bool_or(&self, key: &str, default: bool) -> CommonResult<bool> {
+        if self.0.contains_key(key) {
+            self.get_bool(key)
+        } else {
+            Ok(default)
         }
     }
 
@@ -50,12 +59,28 @@ impl ConfMap {
             .map_err(|_| format!("Invalid u32 value for key '{}': {}", key, value).into())
     }
 
+    pub fn get_u32_or(&self, key: &str, default: u32) -> CommonResult<u32> {
+        if self.0.contains_key(key) {
+            self.get_u32(key)
+        } else {
+            Ok(default)
+        }
+    }
+
     pub fn get_u64(&self, key: &str) -> CommonResult<u64> {
         let value = self.get_string(key)?;
         value
             .trim()
             .parse::<u64>()
             .map_err(|_| format!("Invalid u64 value for key '{}': {}", key, value).into())
+    }
+
+    pub fn get_u64_or(&self, key: &str, default: u64) -> CommonResult<u64> {
+        if self.0.contains_key(key) {
+            self.get_u64(key)
+        } else {
+            Ok(default)
+        }
     }
 }
 
@@ -100,6 +125,7 @@ impl S3Conf {
     pub const SECRET_KEY: &'static str = "s3.credentials.secret";
     pub const REGION_NAME: &'static str = "s3.region_name";
     pub const FORCE_PATH_STYLE: &'static str = "s3.force.path.style";
+    pub const LIST_OBJECTS_VERSION: &'static str = "s3.list_objects_version";
     pub const RETRY_TIMES: &'static str = "s3.retry_times";
     pub const CONNECT_TIMEOUT: &'static str = "s3.connect_timeout";
     pub const READ_TIMEOUT: &'static str = "s3.read_timeout";
@@ -108,29 +134,65 @@ impl S3Conf {
     pub const DEFAULT_CONNECT_TIMEOUT: &'static str = "30s";
     pub const DEFAULT_READ_TIMEOUT: &'static str = "120s";
 
+    pub fn validate_region(properties: &HashMap<String, String>) -> CommonResult<()> {
+        Self::required_property(properties, Self::REGION_NAME)
+    }
+
+    pub fn validate(properties: &HashMap<String, String>) -> CommonResult<()> {
+        Self::with_map(properties.clone())?;
+        Self::uses_list_objects_v1(properties)?;
+        OpendalConf::from_map(properties)?;
+        Ok(())
+    }
+
+    pub fn uses_list_objects_v1(properties: &HashMap<String, String>) -> CommonResult<bool> {
+        match properties
+            .get(Self::LIST_OBJECTS_VERSION)
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("v2") => Ok(false),
+            Some("v1") => Ok(true),
+            Some(value) => err_box!(
+                "s3.list_objects_version must be 'v1' or 'v2', got '{}'",
+                value
+            ),
+        }
+    }
+
+    fn required_property(properties: &HashMap<String, String>, key: &str) -> CommonResult<()> {
+        if properties
+            .get(key)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            Ok(())
+        } else {
+            err_box!("{} is required", key)
+        }
+    }
+
     pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
         let map = ConfMap::new(properties);
 
+        Self::required_property(&map.0, Self::ENDPOINT)?;
         let endpoint_url = map.get_string(Self::ENDPOINT)?;
-        if !endpoint_url.starts_with("http://") && !endpoint_url.starts_with("https://") {
-            return err_box!("s3.endpoint_url must start with http:// or https://");
+        let endpoint = Url::parse(&endpoint_url)
+            .map_err(|_| "s3.endpoint_url must be an absolute http(s) URL with a host")?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return err_box!("s3.endpoint_url must be an absolute http(s) URL with a host");
         }
 
+        Self::required_property(&map.0, Self::ACCESS_KEY)?;
         let access_key = map.get_string(Self::ACCESS_KEY)?;
+        Self::required_property(&map.0, Self::SECRET_KEY)?;
         let secret_key = map.get_string(Self::SECRET_KEY)?;
 
-        let region_name = if endpoint_url.contains("amazonaws.com") {
-            map.get_string(Self::REGION_NAME)?
-        } else {
-            map.get_string(Self::REGION_NAME)
-                .unwrap_or("undefined".to_string())
-        };
+        Self::validate_region(&map.0)?;
+        let region_name = map.get_string(Self::REGION_NAME)?;
 
-        let force_path_style = map.get_bool(Self::FORCE_PATH_STYLE).unwrap_or(false);
+        let force_path_style = map.get_bool_or(Self::FORCE_PATH_STYLE, false)?;
 
-        let retry_times = map
-            .get_u32(Self::RETRY_TIMES)
-            .unwrap_or(Self::DEFAULT_RETRY_TIMES);
+        let retry_times = map.get_u32_or(Self::RETRY_TIMES, Self::DEFAULT_RETRY_TIMES)?;
 
         let connect_timeout = map
             .get_string(Self::CONNECT_TIMEOUT)
@@ -177,9 +239,7 @@ impl OpendalConf {
     pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
         let map = ConfMap::new(properties.clone());
 
-        let retry_times = map
-            .get_u32(Self::RETRY_TIMES)
-            .unwrap_or(Self::DEFAULT_RETRY_TIMES);
+        let retry_times = map.get_u32_or(Self::RETRY_TIMES, Self::DEFAULT_RETRY_TIMES)?;
 
         let connect_timeout_str = map
             .get_string(Self::CONNECT_TIMEOUT)
@@ -191,13 +251,11 @@ impl OpendalConf {
             .unwrap_or(Self::DEFAULT_READ_TIMEOUT.to_string());
         let read_timeout = DurationUnit::from_str(&read_timeout_str)?.as_duration();
 
-        let retry_interval_ms = map
-            .get_u64(Self::RETRY_INTERVAL_MS)
-            .unwrap_or(Self::DEFAULT_RETRY_INTERVAL_MS);
+        let retry_interval_ms =
+            map.get_u64_or(Self::RETRY_INTERVAL_MS, Self::DEFAULT_RETRY_INTERVAL_MS)?;
 
-        let retry_max_delay_ms = map
-            .get_u64(Self::RETRY_MAX_DELAY_MS)
-            .unwrap_or(Self::DEFAULT_RETRY_MAX_DELAY_MS);
+        let retry_max_delay_ms =
+            map.get_u64_or(Self::RETRY_MAX_DELAY_MS, Self::DEFAULT_RETRY_MAX_DELAY_MS)?;
 
         // read_chunk_size and read_concurrent are intentionally NOT user-tunable
         // via mount properties: benchmarking showed the defaults saturate the
@@ -342,5 +400,110 @@ mod opendal_conf_tests {
         let conf = OpendalConf::from_map(&props).unwrap();
         assert_eq!(conf.read_chunk_size, OpendalConf::DEFAULT_READ_CHUNK_SIZE);
         assert_eq!(conf.read_concurrent, OpendalConf::DEFAULT_READ_CONCURRENT);
+    }
+}
+
+#[cfg(test)]
+mod s3_conf_tests {
+    use super::S3Conf;
+    use std::collections::HashMap;
+
+    #[test]
+    fn requires_non_empty_region() {
+        let mut properties = HashMap::new();
+
+        assert!(S3Conf::validate_region(&properties).is_err());
+
+        properties.insert(S3Conf::REGION_NAME.to_string(), "  ".to_string());
+        assert!(S3Conf::validate_region(&properties).is_err());
+
+        properties.insert(S3Conf::REGION_NAME.to_string(), "cn-test-1".to_string());
+        assert!(S3Conf::validate_region(&properties).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_credentials() {
+        let mut properties = HashMap::from([
+            (
+                S3Conf::ENDPOINT.to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            (S3Conf::ACCESS_KEY.to_string(), " ".to_string()),
+            (S3Conf::SECRET_KEY.to_string(), "secret-key".to_string()),
+            (S3Conf::REGION_NAME.to_string(), "cn-test-1".to_string()),
+        ]);
+
+        let err = S3Conf::with_map(properties.clone()).expect_err("empty access key must fail");
+        assert!(err.to_string().contains(S3Conf::ACCESS_KEY));
+
+        properties.insert(S3Conf::ACCESS_KEY.to_string(), "access-key".to_string());
+        properties.insert(S3Conf::SECRET_KEY.to_string(), " ".to_string());
+        let err = S3Conf::with_map(properties).expect_err("empty secret key must fail");
+        assert!(err.to_string().contains(S3Conf::SECRET_KEY));
+    }
+
+    #[test]
+    fn list_objects_v2_is_the_default() {
+        let mut properties = HashMap::new();
+        assert!(!S3Conf::uses_list_objects_v1(&properties).unwrap());
+
+        properties.insert(S3Conf::LIST_OBJECTS_VERSION.to_string(), "  ".to_string());
+        assert!(!S3Conf::uses_list_objects_v1(&properties).unwrap());
+
+        properties.insert(S3Conf::LIST_OBJECTS_VERSION.to_string(), "V2".to_string());
+        assert!(!S3Conf::uses_list_objects_v1(&properties).unwrap());
+    }
+
+    #[test]
+    fn list_objects_v1_is_supported() {
+        let properties =
+            HashMap::from([(S3Conf::LIST_OBJECTS_VERSION.to_string(), " v1 ".to_string())]);
+
+        assert!(S3Conf::uses_list_objects_v1(&properties).unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_list_objects_version() {
+        let properties =
+            HashMap::from([(S3Conf::LIST_OBJECTS_VERSION.to_string(), "v3".to_string())]);
+
+        let err = S3Conf::uses_list_objects_v1(&properties)
+            .expect_err("invalid ListObjects version must fail");
+        assert!(err.to_string().contains(S3Conf::LIST_OBJECTS_VERSION));
+    }
+
+    #[test]
+    fn rejects_invalid_optional_values() {
+        let mut properties = HashMap::from([
+            (
+                S3Conf::ENDPOINT.to_string(),
+                "http://s3.example.com".to_string(),
+            ),
+            (S3Conf::ACCESS_KEY.to_string(), "access-key".to_string()),
+            (S3Conf::SECRET_KEY.to_string(), "secret-key".to_string()),
+            (S3Conf::REGION_NAME.to_string(), "cn-test-1".to_string()),
+            (S3Conf::FORCE_PATH_STYLE.to_string(), "maybe".to_string()),
+        ]);
+
+        let err = S3Conf::validate(&properties).expect_err("invalid bool must fail");
+        assert!(err.to_string().contains(S3Conf::FORCE_PATH_STYLE));
+
+        properties.insert(S3Conf::FORCE_PATH_STYLE.to_string(), "true".to_string());
+        properties.insert("opendal.retry_times".to_string(), "many".to_string());
+        let err = S3Conf::validate(&properties).expect_err("invalid retry count must fail");
+        assert!(err.to_string().contains("opendal.retry_times"));
+    }
+
+    #[test]
+    fn rejects_endpoint_without_host() {
+        let properties = HashMap::from([
+            (S3Conf::ENDPOINT.to_string(), "http://".to_string()),
+            (S3Conf::ACCESS_KEY.to_string(), "access-key".to_string()),
+            (S3Conf::SECRET_KEY.to_string(), "secret-key".to_string()),
+            (S3Conf::REGION_NAME.to_string(), "cn-test-1".to_string()),
+        ]);
+
+        let err = S3Conf::validate(&properties).expect_err("endpoint without host must fail");
+        assert!(err.to_string().contains(S3Conf::ENDPOINT));
     }
 }

@@ -20,9 +20,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
 use curvine_common::FsResult;
+use curvine_ufs_api::S3Conf;
 use log::info;
 use orpc::err_box;
-use std::collections::HashMap;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,
@@ -58,6 +58,20 @@ impl MountManager {
         Ok(true)
     }
 
+    fn validate_mount_config(mount: &MountInfo) -> FsResult<()> {
+        let path = Path::from_str(&mount.ufs_path)?;
+        if path.scheme() != Some("s3") {
+            return Ok(());
+        }
+
+        S3Conf::validate(&mount.properties).map_err(|err| {
+            FsError::common(format!(
+                "Invalid mount configuration for {}: {}",
+                mount.ufs_path, err
+            ))
+        })
+    }
+
     /// same baseuri of ufs can only mount once
     ///
     /// ufs_uri maybe scheme://authority/xxxx/yyy,
@@ -69,12 +83,13 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        let _ = self.create_mount_point(mount_path)?;
-
         let assign_id = match mnt_id {
             Some(id) => id,
             None => self.mount_table.assign_mount_id()?,
         };
+        let mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
+        Self::validate_mount_config(&mount)?;
+        let _ = self.create_mount_point(mount_path)?;
 
         self.mount_table
             .add_mount(assign_id, mount_path, ufs_path, mnt_opt)
@@ -86,6 +101,7 @@ impl MountManager {
             return err_box!("mount point {} not found for update", cv_path);
         };
         let merged = existing.merge_with(mnt_opt.clone());
+        Self::validate_mount_config(&merged)?;
 
         self.mount_table.update_mount(merged)
     }

@@ -64,7 +64,8 @@ impl RaftClient {
     }
 
     // Cluster configuration modification, usually used to join the cluster with new nodes.
-    pub async fn conf_change(&self, req: ConfChange) -> RaftResult<()> {
+    pub async fn conf_change(&self, change: ConfChange) -> RaftResult<()> {
+        let req = ConfChangeRequest { change };
         let _: ConfChangeResponse = self.leader_rpc(RaftCode::ConfChange, req).await?;
         Ok(())
     }

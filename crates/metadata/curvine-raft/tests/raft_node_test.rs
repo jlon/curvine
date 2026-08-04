@@ -18,11 +18,13 @@ use curvine_core_error::CommonResult;
 use curvine_raft::conf::JournalConf;
 use curvine_raft::proto::raft::{FsmState, SnapshotData};
 use curvine_raft::raft::storage::{
-    AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
+    AppStorage, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksLogStorage,
+    RocksStorageCore,
 };
 use curvine_raft::raft::{
     RaftClient, RaftCode, RaftError, RaftJournal, RaftNode, RaftResult, RoleMonitor,
 };
+use curvine_raft::rocksdb::DBEngine;
 use curvine_raft::utils::SerdeUtils;
 use curvine_rpc::client::{ClientConf, RpcClient};
 use curvine_rpc::message::{Builder, ResponseStatus};
@@ -30,7 +32,10 @@ use curvine_runtime::common::{FileUtils, Logger, Utils};
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use prost::bytes::BytesMut;
 use prost::Message;
-use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};
+use raft::eraftpb::{
+    ConfChange, ConfChangeType, ConfState, Entry, HardState, Message as RaftMessage, MessageType,
+    Snapshot,
+};
 use raft::{Config, RawNode};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,13 +217,17 @@ impl AppStorage for TestKvAppStorage {
             snapshot_id: self.get_fsm_state().applied.index,
             node_id: 0,
             create_time: 0,
-            bytes_data: Some(Vec::new()),
+            bytes_data: Some(SerdeUtils::serialize(&*self.map.read().unwrap())?),
             files_data: None,
             fsm_state: self.get_fsm_state(),
         })
     }
 
-    async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        if let Some(bytes) = snapshot.bytes_data.as_ref() {
+            *self.map.write().unwrap() = SerdeUtils::deserialize(bytes)?;
+        }
+        *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
         Ok(())
     }
 
@@ -435,6 +444,245 @@ fn malformed_propose_request_does_not_stop_raft_node() -> CommonResult<()> {
     assert_eq!(store.get("name"), Some("curvine".to_string()));
     FileUtils::delete_path(&conf.journal_dir, true)?;
 
+    Ok(())
+}
+
+#[test]
+fn rejected_conf_change_does_not_stop_raft_node() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/rejected-conf-change-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    let rt = conf.create_runtime();
+    let log_store = RocksLogStorage::from_conf(&conf, true);
+    let store = TestKvAppStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log_store.clone(),
+        store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+
+    let node_id = conf.node_id()?;
+    let client = RaftClient::from_conf(rt.clone(), &conf);
+    assert!(rt
+        .block_on(client.conf_change(ConfChange {
+            change_type: ConfChangeType::RemoveNode.into(),
+            node_id,
+            ..Default::default()
+        }))
+        .is_err());
+    assert_eq!(log_store.initial_state()?.conf_state.voters, vec![node_id]);
+
+    rt.block_on(send_pair(rt.clone(), &conf, "name", "curvine"))?;
+    assert_eq!(store.get("name"), Some("curvine".to_string()));
+
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+    Ok(())
+}
+
+#[test]
+fn persisted_snapshot_restarts_and_accepts_new_proposals() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/persisted-snapshot-restart-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    let rt = conf.create_runtime();
+    let node_id = conf.node_id()?;
+    let snapshot_conf = ConfState {
+        voters: vec![node_id],
+        ..Default::default()
+    };
+    let persisted_conf = ConfState {
+        voters: vec![node_id],
+        learners: vec![node_id.saturating_add(1)],
+        ..Default::default()
+    };
+
+    {
+        let log_store = RocksLogStorage::from_conf(&conf, true);
+        log_store.set_conf_state(&persisted_conf)?;
+    }
+    {
+        let app_store = TestKvAppStorage::default();
+        let log_store = RocksLogStorage::from_conf(&conf, false);
+        rt.block_on(RaftNode::<RocksLogStorage, _>::install_snapshot(
+            &log_store,
+            &app_store,
+            vec![node_id],
+        ))?;
+        assert_eq!(log_store.initial_state()?.conf_state, persisted_conf);
+    }
+
+    let live_app = TestKvAppStorage::default();
+    let live_storage = PeerStorage::new(
+        rt.clone(),
+        MemLogStorage::new(),
+        live_app.clone(),
+        RaftClient::from_conf(rt.clone(), &conf),
+        &conf,
+    );
+    let mut live_snapshot = Snapshot::default();
+    live_snapshot.mut_metadata().index = 1;
+    live_snapshot
+        .mut_metadata()
+        .set_conf_state(snapshot_conf.clone());
+    live_snapshot.set_data(
+        SnapshotData {
+            snapshot_id: 1,
+            node_id,
+            create_time: 0,
+            bytes_data: Some(SerdeUtils::serialize(&std::collections::HashMap::from([
+                ("live".to_string(), "snapshot".to_string()),
+            ]))?),
+            files_data: None,
+            fsm_state: FsmState::default(),
+        }
+        .encode_to_vec(),
+    );
+    rt.block_on(live_storage.apply_snapshot_for_ready(live_snapshot))?;
+    assert_eq!(live_app.get("live"), Some("snapshot".to_string()));
+
+    {
+        let log_store = RocksLogStorage::from_conf(&conf, true);
+        let entries = vec![
+            Entry {
+                term: 1,
+                index: 1,
+                data: SerdeUtils::serialize(&("before".to_string(), "restart".to_string()))?,
+                ..Default::default()
+            },
+            Entry {
+                term: 1,
+                index: 2,
+                data: SerdeUtils::serialize(&("marker".to_string(), "snapshot".to_string()))?,
+                ..Default::default()
+            },
+        ];
+        log_store.append(&entries)?;
+        log_store.set_hard_state(&HardState {
+            term: 1,
+            vote: 0,
+            commit: 2,
+        })?;
+
+        let mut fsm_state = FsmState::default();
+        fsm_state.applied.term = 1;
+        fsm_state.applied.index = 2;
+        let snapshot_data = SnapshotData {
+            snapshot_id: 2,
+            node_id,
+            create_time: 0,
+            bytes_data: Some(SerdeUtils::serialize(&std::collections::HashMap::from([
+                ("before".to_string(), "restart".to_string()),
+                ("marker".to_string(), "snapshot".to_string()),
+            ]))?),
+            files_data: None,
+            fsm_state,
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.mut_metadata().index = 2;
+        snapshot.mut_metadata().term = 1;
+        snapshot
+            .mut_metadata()
+            .set_conf_state(snapshot_conf.clone());
+        snapshot.set_data(snapshot_data.encode_to_vec());
+        log_store.apply_snapshot(snapshot)?;
+        log_store.set_conf_state(&persisted_conf)?;
+        assert!(log_store.latest_snapshot()?.is_some());
+    }
+
+    let store = TestKvAppStorage::default();
+    let log_store = RocksLogStorage::from_conf(&conf, false);
+    assert_eq!(log_store.initial_state()?.conf_state, persisted_conf);
+    log_store.set_conf_state(&snapshot_conf)?;
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log_store,
+        store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+
+    rt.block_on(send_pair(rt.clone(), &conf, "after", "restart"))?;
+    assert_eq!(store.get("before"), Some("restart".to_string()));
+    assert_eq!(store.get("marker"), Some("snapshot".to_string()));
+    assert_eq!(store.get("after"), Some("restart".to_string()));
+
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+    Ok(())
+}
+
+#[test]
+fn inconsistent_persisted_state_fails_before_raw_node_with_raft_id() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/inconsistent-raft-state-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+    let id = conf.node_id()?;
+
+    {
+        let db = DBEngine::new(
+            conf.db_conf()
+                .add_cf(RocksStorageCore::CF_ENTRIES)
+                .add_cf(RocksStorageCore::CF_META),
+            true,
+        )?;
+        db.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::STATE_KEY,
+            HardState {
+                term: 7,
+                vote: id,
+                commit: 42,
+            }
+            .encode_to_vec(),
+        )?;
+    }
+
+    let rt = conf.create_runtime();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        RocksLogStorage::from_conf(&conf, false),
+        TestKvAppStorage::default(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let error = match rt.block_on(raft.run()) {
+        Ok(_) => return Err("inconsistent raft state unexpectedly started".into()),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains(&format!("raft node {} startup recovery failed", id)));
+    assert!(message.contains("hard_state.commit=42 is outside durable range [0, 0]"));
+    assert!(message.contains("Restore a consistent master meta+journal pair"));
+
+    let follower = RaftJournal::new(
+        rt.clone(),
+        RocksLogStorage::from_conf(&conf, false),
+        TestKvAppStorage::default(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let error = match rt.block_on(follower.run_follower()) {
+        Ok(_) => return Err("inconsistent follower storage unexpectedly joined".into()),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains(&format!("raft node {} join startup failed", id)));
+    assert!(message.contains("hard_state.commit=42 is outside durable range [0, 0]"));
+
+    FileUtils::delete_path(&conf.journal_dir, true)?;
     Ok(())
 }
 

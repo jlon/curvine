@@ -31,7 +31,7 @@ use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
 use curvine_runtime::sync::ArcRwLock;
 use log::{error, info, warn};
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -59,6 +59,209 @@ pub struct CvMetadataDeltaPage {
     pub full_snapshot_required: bool,
 }
 
+#[derive(Clone, Debug)]
+enum MetadataAdmissionScope {
+    Exact(String),
+    Subtree(String),
+    Global,
+}
+
+impl MetadataAdmissionScope {
+    fn exact(path: impl AsRef<str>) -> Self {
+        Self::Exact(Self::normalize(path.as_ref()))
+    }
+
+    fn subtree(path: impl AsRef<str>) -> Self {
+        let path = Self::normalize(path.as_ref());
+        if path == "/" {
+            Self::Global
+        } else {
+            Self::Subtree(path)
+        }
+    }
+
+    fn normalize(path: &str) -> String {
+        curvine_common::fs::Path::from_str(path)
+            .map(|path| path.encode())
+            .unwrap_or_else(|_| path.to_string())
+    }
+}
+
+#[derive(Default)]
+struct MetadataAdmissionState {
+    global: usize,
+    scoped: usize,
+    paths: BTreeMap<String, MetadataAdmissionPath>,
+}
+
+#[derive(Default)]
+struct MetadataAdmissionPath {
+    exact: usize,
+    subtree: usize,
+}
+
+impl MetadataAdmissionPath {
+    fn is_empty(&self) -> bool {
+        self.exact == 0 && self.subtree == 0
+    }
+}
+
+#[derive(Default)]
+struct MetadataAdmission {
+    state: Mutex<MetadataAdmissionState>,
+    changed: Condvar,
+}
+
+struct MetadataAdmissionGuard {
+    admission: Arc<MetadataAdmission>,
+    scopes: Vec<MetadataAdmissionScope>,
+}
+
+pub(crate) struct MetadataMutationGuard<'a> {
+    _mode_read_guard: Option<RwLockReadGuard<'a, ()>>,
+    _mode_write_guard: Option<RwLockWriteGuard<'a, ()>>,
+    _admission_guard: Option<MetadataAdmissionGuard>,
+}
+
+impl MetadataAdmission {
+    fn acquire(self: &Arc<Self>, scopes: &[MetadataAdmissionScope]) -> MetadataAdmissionGuard {
+        let mut state = self.state.lock();
+        while !state.can_acquire(scopes) {
+            self.changed.wait(&mut state);
+        }
+
+        state.add(scopes);
+        MetadataAdmissionGuard {
+            admission: self.clone(),
+            scopes: scopes.to_vec(),
+        }
+    }
+}
+
+impl MetadataAdmissionState {
+    fn can_acquire(&self, scopes: &[MetadataAdmissionScope]) -> bool {
+        if self.global > 0 {
+            return false;
+        }
+        if scopes
+            .iter()
+            .any(|scope| matches!(scope, MetadataAdmissionScope::Global))
+        {
+            return self.scoped == 0;
+        }
+
+        scopes.iter().all(|scope| !self.conflicts(scope))
+    }
+
+    fn conflicts(&self, scope: &MetadataAdmissionScope) -> bool {
+        match scope {
+            MetadataAdmissionScope::Global => self.global > 0 || self.scoped > 0,
+            MetadataAdmissionScope::Exact(path) => {
+                self.paths
+                    .get(path)
+                    .map(|entry| entry.exact > 0)
+                    .unwrap_or(false)
+                    || self.has_subtree_ancestor(path)
+            }
+            MetadataAdmissionScope::Subtree(path) => {
+                self.paths
+                    .get(path)
+                    .map(|entry| entry.exact > 0)
+                    .unwrap_or(false)
+                    || self.has_subtree_ancestor(path)
+                    || self.has_scoped_descendant(path)
+            }
+        }
+    }
+
+    fn has_subtree_ancestor(&self, path: &str) -> bool {
+        let mut ancestor = path;
+        loop {
+            if self
+                .paths
+                .get(ancestor)
+                .map(|entry| entry.subtree > 0)
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if ancestor == "/" {
+                return false;
+            }
+            let Some(separator) = ancestor.rfind(PATH_SEPARATOR) else {
+                return false;
+            };
+            ancestor = if separator == 0 {
+                "/"
+            } else {
+                &ancestor[..separator]
+            };
+        }
+    }
+
+    fn has_scoped_descendant(&self, path: &str) -> bool {
+        let prefix = format!("{path}{PATH_SEPARATOR}");
+        self.paths
+            .range(prefix.clone()..)
+            .next()
+            .map(|(candidate, _)| candidate.starts_with(&prefix))
+            .unwrap_or(false)
+    }
+
+    fn add(&mut self, scopes: &[MetadataAdmissionScope]) {
+        for scope in scopes {
+            match scope {
+                MetadataAdmissionScope::Global => self.global += 1,
+                MetadataAdmissionScope::Exact(path) => {
+                    self.paths.entry(path.clone()).or_default().exact += 1;
+                    self.scoped += 1;
+                }
+                MetadataAdmissionScope::Subtree(path) => {
+                    self.paths.entry(path.clone()).or_default().subtree += 1;
+                    self.scoped += 1;
+                }
+            }
+        }
+    }
+
+    fn remove(&mut self, scopes: &[MetadataAdmissionScope]) {
+        for scope in scopes {
+            match scope {
+                MetadataAdmissionScope::Global => self.global -= 1,
+                MetadataAdmissionScope::Exact(path) => self.remove_path(path, true),
+                MetadataAdmissionScope::Subtree(path) => self.remove_path(path, false),
+            }
+        }
+    }
+
+    fn remove_path(&mut self, path: &str, exact: bool) {
+        let empty = {
+            let entry = self
+                .paths
+                .get_mut(path)
+                .expect("metadata admission scope must be held");
+            if exact {
+                entry.exact -= 1;
+            } else {
+                entry.subtree -= 1;
+            }
+            entry.is_empty()
+        };
+        self.scoped -= 1;
+        if empty {
+            self.paths.remove(path);
+        }
+    }
+}
+
+impl Drop for MetadataAdmissionGuard {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        state.remove(&self.scopes);
+        self.admission.changed.notify_all();
+    }
+}
+
 struct CompleteFileOptions {
     only_flush: bool,
     return_file_blocks: bool,
@@ -71,9 +274,12 @@ pub struct MasterFilesystem {
     pub worker_manager: SyncWorkerManager,
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
-    // Active-master admission gate: commit-first namespace changes take the
-    // write side while waiting for apply; legacy local-first writes take read.
-    metadata_admission_lock: Arc<RwLock<()>>,
+    metadata_journal_enabled: bool,
+    // Serializes the mode transition between local-first and commit-first writes.
+    metadata_mode_lock: Arc<RwLock<()>>,
+    // Commit-first mutations retain only their conflicting path scopes while
+    // waiting for raft application, allowing independent namespaces to batch.
+    metadata_admission: Arc<MetadataAdmission>,
     full_block_reports: Arc<Mutex<HashMap<u32, FullBlockReportState>>>,
     full_block_reconciles: Arc<Mutex<HashMap<u32, FullBlockReconcileState>>>,
     full_block_reconcile_executor: Arc<GroupExecutor>,
@@ -197,7 +403,9 @@ impl MasterFilesystem {
             worker_manager,
             master_monitor,
             conf: Arc::new(conf.master.clone()),
-            metadata_admission_lock: Default::default(),
+            metadata_journal_enabled: conf.journal.enable,
+            metadata_mode_lock: Default::default(),
+            metadata_admission: Default::default(),
             full_block_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
@@ -215,7 +423,9 @@ impl MasterFilesystem {
             worker_manager: js.worker_manager(),
             master_monitor: js.master_monitor(),
             conf: Arc::new(conf.master.clone()),
-            metadata_admission_lock: fs.metadata_admission_lock.clone(),
+            metadata_journal_enabled: fs.metadata_journal_enabled,
+            metadata_mode_lock: fs.metadata_mode_lock.clone(),
+            metadata_admission: fs.metadata_admission.clone(),
             full_block_reports: Default::default(),
             full_block_reconciles: Default::default(),
             full_block_reconcile_executor: Arc::new(GroupExecutor::new(
@@ -226,22 +436,54 @@ impl MasterFilesystem {
         }
     }
 
-    pub(crate) fn active_metadata_write_guard(&self) -> (bool, Option<RwLockWriteGuard<'_, ()>>) {
-        let active = self.master_monitor.is_active();
-        let guard = if active {
-            Some(self.metadata_admission_lock.write())
-        } else {
-            None
-        };
-        (active, guard)
+    pub(crate) fn active_metadata_write_guard(&self) -> (bool, Option<MetadataMutationGuard<'_>>) {
+        self.active_metadata_path_guard(&[MetadataAdmissionScope::Global])
     }
 
-    fn active_metadata_read_guard(&self) -> Option<RwLockReadGuard<'_, ()>> {
-        if self.master_monitor.is_active() {
-            Some(self.metadata_admission_lock.read())
-        } else {
-            None
+    fn active_metadata_path_guard(
+        &self,
+        scopes: &[MetadataAdmissionScope],
+    ) -> (bool, Option<MetadataMutationGuard<'_>>) {
+        loop {
+            let mode_read_guard = self.metadata_mode_lock.read();
+            if !self.active_metadata_journal() {
+                drop(mode_read_guard);
+
+                let mode_write_guard = self.metadata_mode_lock.write();
+                if !self.active_metadata_journal() {
+                    return (
+                        false,
+                        Some(MetadataMutationGuard {
+                            _mode_read_guard: None,
+                            _mode_write_guard: Some(mode_write_guard),
+                            _admission_guard: None,
+                        }),
+                    );
+                }
+                drop(mode_write_guard);
+                continue;
+            }
+            drop(mode_read_guard);
+
+            let admission_guard = self.metadata_admission.acquire(scopes);
+            let mode_read_guard = self.metadata_mode_lock.read();
+            if self.active_metadata_journal() {
+                return (
+                    true,
+                    Some(MetadataMutationGuard {
+                        _mode_read_guard: Some(mode_read_guard),
+                        _mode_write_guard: None,
+                        _admission_guard: Some(admission_guard),
+                    }),
+                );
+            }
+            drop(mode_read_guard);
+            drop(admission_guard);
         }
+    }
+
+    fn active_metadata_journal(&self) -> bool {
+        self.metadata_journal_enabled && self.master_monitor.is_active()
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -271,7 +513,12 @@ impl MasterFilesystem {
 
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let scopes = if opts.create_parent {
+            vec![MetadataAdmissionScope::Global]
+        } else {
+            vec![MetadataAdmissionScope::subtree(path)]
+        };
+        let (active, _metadata_write) = self.active_metadata_path_guard(&scopes);
         if active {
             return self.mkdir_with_opts_committed(path, opts);
         }
@@ -353,7 +600,8 @@ impl MasterFilesystem {
 
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
         let path = path.as_ref();
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::subtree(path)]);
         if active {
             return self.delete_committed(path, recursive);
         }
@@ -386,12 +634,12 @@ impl MasterFilesystem {
 
     pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
         let path = path.as_ref();
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::subtree(path)]);
         if active {
             return self.free_committed(path, recursive);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -426,7 +674,10 @@ impl MasterFilesystem {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) = self.active_metadata_path_guard(&[
+            MetadataAdmissionScope::subtree(src),
+            MetadataAdmissionScope::subtree(dst),
+        ]);
         if active {
             if let Some(result) = self.rename_committed(src, dst, flags)? {
                 return Ok(result);
@@ -498,6 +749,17 @@ impl MasterFilesystem {
                 }
             }
 
+            if flags.exchange_mode() {
+                if let Some(rest) = src.strip_prefix(dst) {
+                    if rest.starts_with(PATH_SEPARATOR) {
+                        return err_ext!(FsError::invalid_argument(format!(
+                            "cannot exchange {} with {}: source is under destination",
+                            src, dst
+                        )));
+                    }
+                }
+            }
+
             Self::check_parent(&dst_inp)?;
 
             let entry = fs_dir.prepare_rename_command(
@@ -542,7 +804,12 @@ impl MasterFilesystem {
 
         self.validate_create_options(path, &opts)?;
 
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let scopes = if opts.create_parent {
+            vec![MetadataAdmissionScope::Global]
+        } else {
+            vec![MetadataAdmissionScope::subtree(path)]
+        };
+        let (active, _metadata_write) = self.active_metadata_path_guard(&scopes);
         if active {
             return self.create_with_opts_committed(path, opts, flags);
         }
@@ -643,12 +910,20 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        if self.master_monitor.is_active() {
-            let _metadata_write = self.metadata_admission_lock.write();
+        let scopes = if flags.create() {
+            if opts.create_parent {
+                vec![MetadataAdmissionScope::Global]
+            } else {
+                vec![MetadataAdmissionScope::subtree(path)]
+            }
+        } else {
+            vec![MetadataAdmissionScope::exact(path)]
+        };
+        let (active, _metadata_write) = self.active_metadata_path_guard(&scopes);
+        if active {
             return self.open_file_committed(path, opts, flags);
         }
 
-        let metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -656,7 +931,7 @@ impl MasterFilesystem {
             None => {
                 return if flags.create() {
                     drop(fs_dir);
-                    drop(metadata_read);
+                    drop(_metadata_write);
                     let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
                 } else {
@@ -907,8 +1182,9 @@ impl MasterFilesystem {
         last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
-            let _metadata_write = self.metadata_admission_lock.write();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
+        if active {
             return self.add_block_committed(
                 path,
                 inode_id,
@@ -920,7 +1196,6 @@ impl MasterFilesystem {
             );
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         let file = inode.as_file_ref()?;
@@ -1071,8 +1346,9 @@ impl MasterFilesystem {
     ) -> FsResult<Option<FileBlocks>> {
         let path = path.as_ref();
         let client_name = client_name.as_ref();
-        if self.master_monitor.is_active() {
-            let _metadata_write = self.metadata_admission_lock.write();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
+        if active {
             return self.complete_file_committed(
                 path,
                 inode_id,
@@ -1084,7 +1360,6 @@ impl MasterFilesystem {
             );
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let mut inode = Self::resolve_file_inode(&fs_dir, path, inode_id)?;
         fs_dir.complete_file(
@@ -1964,7 +2239,6 @@ impl MasterFilesystem {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
-        let _metadata_read = self.active_metadata_read_guard();
         let removed_block_ids = {
             let fs_dir = self.fs_dir.write();
             fs_dir.delete_locations(worker_id)?
@@ -2008,7 +2282,8 @@ impl MasterFilesystem {
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
         if active {
             return self.set_attr_committed(path, opts);
         }
@@ -2051,12 +2326,12 @@ impl MasterFilesystem {
         owner: Option<String>,
         group: Option<String>,
     ) -> FsResult<()> {
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::subtree(link.as_ref())]);
         if active {
             return self.symlink_committed(target, link, force, mode, owner, group);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
@@ -2097,7 +2372,6 @@ impl MasterFilesystem {
             return self.link_committed(src_path, dst_path);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
@@ -2122,12 +2396,12 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
-            let _metadata_write = self.metadata_admission_lock.write();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
+        if active {
             return self.resize_committed(path, opts);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         // This snapshot only rejects individually impossible requests; it is not a
         // reservation, so concurrent fallocates may observe the same capacity.
         // Worker-side block allocation remains the hard enforcement point.
@@ -2210,12 +2484,12 @@ impl MasterFilesystem {
         exclude_workers: Vec<u32>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
-        if self.master_monitor.is_active() {
-            let _metadata_write = self.metadata_admission_lock.write();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
+        if active {
             return self.assign_worker_committed(path, block, client_addr, exclude_workers);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -2281,12 +2555,12 @@ impl MasterFilesystem {
     pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
         let path = path.as_ref();
 
-        let (active, _metadata_write) = self.active_metadata_write_guard();
+        let (active, _metadata_write) =
+            self.active_metadata_path_guard(&[MetadataAdmissionScope::exact(path)]);
         if active {
             return self.set_lock_committed(path, lock);
         }
 
-        let _metadata_read = self.active_metadata_read_guard();
         let fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 

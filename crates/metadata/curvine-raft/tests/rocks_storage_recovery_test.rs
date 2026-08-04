@@ -209,3 +209,52 @@ fn apply_snapshot_compacts_the_durable_log_range() {
     assert_eq!(storage.first_index(), 4);
     assert_eq!(storage.last_index(), 3);
 }
+
+#[test]
+fn startup_rejects_corrupt_persisted_raft_metadata() {
+    let cases = [
+        (
+            "index-range",
+            RocksStorageCore::INDEX_KEY,
+            "failed to decode raft index range",
+        ),
+        (
+            "hard-state",
+            RocksStorageCore::STATE_KEY,
+            "failed to decode raft hard state",
+        ),
+        (
+            "snapshot",
+            RocksStorageCore::SNAP_KEY,
+            "failed to decode raft snapshot",
+        ),
+        (
+            "conf-state",
+            RocksStorageCore::CONF_STATE_KEY,
+            "failed to decode raft conf state",
+        ),
+    ];
+
+    for (name, key, expected) in cases {
+        let conf = test_conf(name);
+        FileUtils::delete_path(&conf.base_dir, true).unwrap();
+
+        let db = DBEngine::new(
+            conf.clone()
+                .add_cf(RocksStorageCore::CF_ENTRIES)
+                .add_cf(RocksStorageCore::CF_META),
+            true,
+        )
+        .unwrap();
+        db.put_cf(RocksStorageCore::CF_META, key, [0xff]).unwrap();
+        drop(db);
+
+        let mut storage = RocksStorageCore::new(conf, false);
+        let error = storage.init_state().unwrap_err().to_string();
+        assert!(error.contains(expected), "{name}: {error}");
+        assert!(
+            error.contains("corrupted local directory"),
+            "{name}: {error}"
+        );
+    }
+}

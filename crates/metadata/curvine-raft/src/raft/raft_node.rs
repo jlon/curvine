@@ -30,7 +30,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::{CallChannel, CallReceiver};
 use log::{debug, error, info, warn};
 use prost::Message as PMessage;
-use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
+use raft::eraftpb::{ConfChange, ConfState, Entry, EntryType, HardState, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
 use raft::{RawNode, SoftState};
 use std::collections::HashMap;
@@ -42,6 +42,11 @@ use tokio::time::{interval, MissedTickBehavior};
 struct ProposeApply {
     response: ProposeResponse,
     apply_done: Option<CallReceiver<RaftResult<()>>>,
+}
+
+enum ConfChangeApply {
+    Applied,
+    Rejected(RaftError),
 }
 
 pub struct RaftNode<A, B>
@@ -108,7 +113,9 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let max_batch_size = conf.raft_batch_size.max(1);
 
-        let last_applied = Self::install_snapshot(&log_store, &app_store, group.voters()).await?;
+        let last_applied = Self::install_snapshot(&log_store, &app_store, group.voters())
+            .await
+            .map_err(|error| error.ctx(format!("raft node {} startup recovery failed", id)))?;
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
 
@@ -157,6 +164,23 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let max_batch_size = conf.raft_batch_size.max(1);
 
+        let state = log_store.initial_state().map_err(|error| {
+            RaftError::from(error).ctx(format!("raft node {} join startup failed", id))
+        })?;
+        let first_index = log_store.first_index()?;
+        let last_index = log_store.last_index()?;
+        if state.hard_state != HardState::default()
+            || state.conf_state != ConfState::default()
+            || last_index >= first_index
+            || log_store.latest_snapshot()?.is_some()
+        {
+            return err_box!(
+                "raft node {} join startup requires empty local raft storage; use normal startup \
+                 to recover an existing voter from its persisted meta+journal pair",
+                id
+            );
+        }
+
         // raft basic configuration.
         let config = conf.new_raft_conf(id, 0);
         config.validate()?;
@@ -190,7 +214,8 @@ where
         app_store: &B,
         voters: Vec<u64>,
     ) -> RaftResult<u64> {
-        info!("init raft state: {:?}", log_store.initial_state()?);
+        let raft_state = log_store.initial_state()?;
+        info!("init raft state: {:?}", raft_state);
 
         let spend = TimeSpent::new();
 
@@ -198,7 +223,13 @@ where
             None => {
                 let fsm_state = app_store.get_fsm_state();
                 let mut snapshot = Snapshot::default();
-                snapshot.mut_metadata().mut_conf_state().voters = voters;
+                if raft_state.conf_state == ConfState::default() {
+                    snapshot.mut_metadata().mut_conf_state().voters = voters;
+                } else {
+                    snapshot
+                        .mut_metadata()
+                        .set_conf_state(raft_state.conf_state.clone());
+                }
 
                 log_store.apply_snapshot(snapshot.clone())?;
                 // A leader that steps down before the first raft snapshot is
@@ -215,11 +246,10 @@ where
                 }
             }
 
-            Some(mut snapshot) => {
-                snapshot.mut_metadata().mut_conf_state().voters = voters;
-                // log store application snapshot.
-                log_store.apply_snapshot(snapshot.clone())?;
-                // app store app snapshot.
+            Some(snapshot) => {
+                // The snapshot already belongs to log_store. Reapplying it would
+                // violate the Storage contract after compaction; only restore the
+                // application state and replay its persisted suffix.
                 let snapshot_data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
 
                 info!(
@@ -471,7 +501,8 @@ where
         // Process snapshots.
         if *ready.snapshot() != Snapshot::default() {
             self.storage
-                .gen_apply_snapshot_job(ready.snapshot().clone())?;
+                .apply_snapshot_for_ready(ready.snapshot().clone())
+                .await?;
         }
 
         // Persist entries before the HardState that may commit them. A crash may
@@ -577,13 +608,52 @@ where
         Ok(())
     }
 
-    pub fn apply_config_change(&mut self, entry: &Entry) -> RaftResult<ConfChangeResponse> {
+    fn apply_config_change(&mut self, entry: &Entry) -> RaftResult<ConfChangeApply> {
         let change: ConfChange = PMessage::decode(entry.get_data())?;
         let id = change.get_node_id();
 
-        match change.get_change_type() {
-            ConfChangeType::AddNode => {
-                let addr: InetAddr = SerdeUtils::deserialize(change.get_context())?;
+        let addr = match change.get_change_type() {
+            ConfChangeType::AddNode => match SerdeUtils::deserialize(change.get_context()) {
+                Ok(addr) => Some(addr),
+                Err(error) => {
+                    return Ok(ConfChangeApply::Rejected(RaftError::from(error).ctx(
+                        format!(
+                            "raft configuration change at index {} has an invalid node address",
+                            entry.index
+                        ),
+                    )));
+                }
+            },
+            ConfChangeType::RemoveNode => None,
+            change_type => {
+                return Ok(ConfChangeApply::Rejected(RaftError::other(
+                    format!(
+                        "unsupported raft config change type {:?} for node {}",
+                        change_type, id
+                    )
+                    .into(),
+                )));
+            }
+        };
+
+        // Invalid changes return above without calling apply_conf_change, as
+        // required by raft-rs. For accepted changes, persist membership before
+        // updating local routing.
+        let conf_state = match self.raw.apply_conf_change(&change) {
+            Ok(conf_state) => conf_state,
+            Err(error) => {
+                return Ok(ConfChangeApply::Rejected(RaftError::from(error).ctx(
+                    format!(
+                        "raft configuration change at index {} rejected",
+                        entry.index
+                    ),
+                )));
+            }
+        };
+        self.raw.mut_store().set_conf_state(&conf_state)?;
+
+        match addr {
+            Some(addr) => {
                 info!(
                     "Raft adding node: {}({}), current leader: {}({:?})",
                     id,
@@ -591,28 +661,14 @@ where
                     self.leader(),
                     self.group.get_addr(&self.leader())
                 );
-                self.group.insert(id, &addr);
                 self.client.add_node(id, &addr)?;
+                self.group.insert(id, &addr);
             }
-
-            ConfChangeType::RemoveNode => {
-                if change.get_node_id() == self.id() {
-                    self.role_monitor.advance_exit();
-                } else {
-                    self.group.remove(&id);
-                }
-            }
-
-            _ => unimplemented!(),
+            None if id == self.id() => self.role_monitor.advance_exit(),
+            None => self.group.remove(&id),
         }
 
-        // When a new node joins, create a snapshot.
-        if let Ok(cs) = self.raw.apply_conf_change(&change) {
-            let store = self.raw.mut_store();
-            store.set_conf_state(&cs)?;
-        }
-
-        Ok(ConfChangeResponse::default())
+        Ok(ConfChangeApply::Applied)
     }
 
     async fn apply_propose(
@@ -723,10 +779,20 @@ where
                 (0, 0, None)
             };
             let rep_msg = if is_conf_change {
-                let rep = self.apply_config_change(&entry)?;
-                Builder::new_rpc(RaftCode::ConfChange)
-                    .response(ResponseStatus::Success)
-                    .proto_header(rep)
+                match self.apply_config_change(&entry)? {
+                    ConfChangeApply::Applied => Builder::new_rpc(RaftCode::ConfChange)
+                        .response(ResponseStatus::Success)
+                        .proto_header(ConfChangeResponse::default()),
+                    ConfChangeApply::Rejected(error) => {
+                        warn!(
+                            "raft configuration change rejected, index {}, term {}: {}",
+                            entry.index, entry.term, error
+                        );
+                        Builder::new_rpc(RaftCode::ConfChange)
+                            .response(ResponseStatus::Error)
+                            .data(DataSlice::Buffer(error.encode()))
+                    }
+                }
             } else {
                 let apply = self.apply_propose(entry, should_respond).await?;
                 if should_respond {

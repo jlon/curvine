@@ -17,11 +17,12 @@ use crate::master::journal::{JournalCommandBatch, JournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
+use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ pub struct SenderTask {
     pub(crate) flush_batch_size: u64,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
+    metadata_acks: Vec<mpsc::SyncSender<FsResult<()>>>,
 }
 
 impl SenderTask {
@@ -43,6 +45,7 @@ impl SenderTask {
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
+            metadata_acks: vec![],
         };
 
         Ok(sender)
@@ -82,6 +85,7 @@ impl SenderTask {
     }
 
     pub(crate) fn handle(&mut self, req: Option<JournalWriteRequest>) -> FsResult<()> {
+        let mut start_metadata_batch = false;
         let force = if let Some(req) = req {
             match req {
                 JournalWriteRequest::Legacy(entry) => {
@@ -91,24 +95,22 @@ impl SenderTask {
                     force
                 }
                 JournalWriteRequest::Metadata(commands, ack) => {
+                    start_metadata_batch = self.batch.is_empty();
                     for command in commands {
                         self.batch.push_metadata(command);
                     }
                     self.metrics.journal_queue_len.dec();
-                    let res = self.flush_pending();
-                    let err = res.as_ref().err().map(ToString::to_string);
-                    if ack.send(res).is_err() {
-                        log::warn!("metadata journal receiver dropped response");
-                    }
-                    if let Some(err) = err {
-                        return err_box!("{}", err);
-                    }
-                    return Ok(());
+                    self.metadata_acks.push(ack);
+                    false
                 }
             }
         } else {
             false
         };
+
+        if start_metadata_batch {
+            self.last_flush_ms = LocalTime::mills();
+        }
 
         let len = self.batch.len() as u64;
         if len == 0 {
@@ -133,18 +135,43 @@ impl SenderTask {
 
         let spend = TimeSpent::new();
 
-        let bytes = crate::master::journal::JournalEnvelope::encode(self.batch.clone())?;
-        self.client.block_on_send_propose(bytes)?;
+        let bytes = match crate::master::journal::JournalEnvelope::encode(self.batch.clone()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let message = error.to_string();
+                self.complete_metadata_acks(Some(&message));
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.client.block_on_send_propose(bytes) {
+            let message = error.to_string();
+            self.complete_metadata_acks(Some(&message));
+            return Err(error.into());
+        }
 
         self.metrics.journal_flush_count.inc();
         self.metrics
             .journal_flush_time
             .inc_by(spend.used_us() as i64);
 
+        self.complete_metadata_acks(None);
+
         // Scroll to the next batch.
         self.batch.next();
         self.last_flush_ms = LocalTime::mills();
 
         Ok(())
+    }
+
+    fn complete_metadata_acks(&mut self, error: Option<&str>) {
+        for ack in std::mem::take(&mut self.metadata_acks) {
+            let result = match error {
+                Some(error) => Err(FsError::common(error)),
+                None => Ok(()),
+            };
+            if ack.send(result).is_err() {
+                log::warn!("metadata journal receiver dropped response");
+            }
+        }
     }
 }

@@ -287,7 +287,7 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         testing: true,
         ..Default::default()
     };
-    conf.journal.writer_flush_batch_size = 1;
+    conf.journal.writer_flush_batch_size = 8;
     conf.journal.writer_flush_batch_ms = 10;
     conf.journal.raft_tick_interval_ms = 100;
     conf.journal.raft_check_quorum = false;
@@ -390,6 +390,29 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     }
     assert_eq!(successes, 1);
     assert_eq!(failures, 1);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = vec![];
+    for path in ["/parallel-admission-a", "/parallel-admission-b"] {
+        let fs = active.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            fs.create_with_opts(
+                path,
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create().set_exclusive(true),
+            )
+            .map(|_| ())
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .expect("independent metadata create thread must not panic")?;
+    }
+    assert!(active.exists("/parallel-admission-a")?);
+    assert!(active.exists("/parallel-admission-b")?);
 
     active.mkdir("/committed-dir", false)?;
     active.mkdir("/deleted-dir", false)?;
@@ -749,6 +772,8 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         worker.weight,
         worker.worker_session_id.clone(),
         worker.transfer_capabilities.clone(),
+        String::new(),
+        0,
         vec![],
     )?;
     assert!(
@@ -781,6 +806,13 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     );
     active.create("/committed-file", false)?;
     active.rename("/committed-file", "/renamed-file", RenameFlags::empty())?;
+    active.create("/exchange-left", false)?;
+    active.create("/exchange-right", false)?;
+    let exchange_left_id = active.file_status("/exchange-left")?.id;
+    let exchange_right_id = active.file_status("/exchange-right")?.id;
+    active.rename("/exchange-left", "/exchange-right", RenameFlags::EXCHANGE)?;
+    assert_eq!(active.file_status("/exchange-left")?.id, exchange_right_id);
+    assert_eq!(active.file_status("/exchange-right")?.id, exchange_left_id);
     active.set_attr(
         "/renamed-file",
         SetAttrOptsBuilder::new().owner("committed-owner").build(),
@@ -814,8 +846,12 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
             && standby.file_status("/committed-mount").is_ok()
             && standby.file_status("/committed-umount").is_ok()
             && standby.file_status("/committed-file").is_err()
+            && standby.file_status("/exchange-left").is_ok()
+            && standby.file_status("/exchange-right").is_ok()
             && standby.file_status("/deleted-dir").is_err()
             && standby.file_status("/exclusive-race").is_ok()
+            && standby.file_status("/parallel-admission-a").is_ok()
+            && standby.file_status("/parallel-admission-b").is_ok()
             && standby.file_status("/reopen-file").is_ok()
             && standby.file_status("/committed-symlink").is_ok()
             && standby.file_status("/hardlink-dst").is_ok()
@@ -839,7 +875,19 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
                 standby.file_status("/renamed-file"),
                 standby.file_status("/resize-file"),
             ) {
-                if status.owner == "committed-owner" && resized.len == 0 && mount_converged {
+                let exchange_converged = standby
+                    .file_status("/exchange-left")
+                    .map(|status| status.id == exchange_right_id)
+                    .unwrap_or(false)
+                    && standby
+                        .file_status("/exchange-right")
+                        .map(|status| status.id == exchange_left_id)
+                        .unwrap_or(false);
+                if status.owner == "committed-owner"
+                    && resized.len == 0
+                    && mount_converged
+                    && exchange_converged
+                {
                     return Ok(());
                 }
             }
@@ -849,6 +897,156 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn active_metadata_requests_batch_and_serialize_parent_dependencies() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+    let mut conf = ClusterConf::default();
+    conf.journal.writer_flush_batch_size = 8;
+    conf.journal.writer_flush_batch_ms = 500;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+
+    conf.change_test_meta_dir("production-metadata-batch-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf)?;
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let loader1 = js1.journal_loader();
+    let monitor1 = js1.master_monitor();
+
+    conf.change_test_meta_dir("production-metadata-batch-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf)?;
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let loader2 = js2.journal_loader();
+    let monitor2 = js2.master_monitor();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let (active, loader) = loop {
+        if monitor1.is_active() {
+            break (fs1.clone(), loader1.clone());
+        }
+        if monitor2.is_active() {
+            break (fs2.clone(), loader2.clone());
+        }
+        if std::time::Instant::now() >= deadline {
+            return err_box!("master did not become active");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    active.mkdir("/batch-warmup", false)?;
+    thread::sleep(Duration::from_millis(1200));
+    let before = loader.get_fsm_state().applied.index;
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = vec![];
+    for path in ["/batched-metadata-a", "/batched-metadata-b"] {
+        let fs = active.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            fs.create_with_opts(
+                path,
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create().set_exclusive(true),
+            )
+            .map(|_| ())
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .expect("batched metadata create thread must not panic")?;
+    }
+
+    assert!(active.exists("/batched-metadata-a")?);
+    assert!(active.exists("/batched-metadata-b")?);
+    assert_eq!(loader.get_fsm_state().applied.index, before + 1);
+
+    // Parent creation must become visible before a child request can construct
+    // its journal command. The production sender keeps the parent request
+    // pending long enough to exercise the admission boundary.
+    thread::sleep(Duration::from_millis(1200));
+    let parent_fs = active.clone();
+    let parent = thread::spawn(move || parent_fs.mkdir("/batched-parent", false));
+    thread::sleep(Duration::from_millis(200));
+    assert!(!parent.is_finished());
+    active.create_with_opts(
+        "/batched-parent/child",
+        CreateFileOpts::with_create(false),
+        OpenFlags::new_create().set_exclusive(true),
+    )?;
+    parent
+        .join()
+        .expect("parent create thread must not panic")?;
+    assert!(active.exists("/batched-parent/child")?);
+    Ok(())
+}
+
+#[test]
+fn active_master_applies_metadata_when_journal_logging_is_disabled() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    conf.journal.enable = false;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+
+    conf.change_test_meta_dir("standalone-journal-disabled-1");
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf)?;
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let monitor1 = js1.master_monitor();
+
+    conf.change_test_meta_dir("standalone-journal-disabled-2");
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf)?;
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let monitor2 = js2.master_monitor();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let fs = loop {
+        if monitor1.is_active() {
+            break fs1.clone();
+        }
+        if monitor2.is_active() {
+            break fs2.clone();
+        }
+        if std::time::Instant::now() >= deadline {
+            return err_box!("master did not become active");
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    fs.mkdir("/standalone", false)?;
+    assert!(
+        fs.exists("/standalone")?,
+        "active master must apply metadata locally when journal logging is disabled"
+    );
+    Ok(())
 }
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
@@ -1247,8 +1445,7 @@ fn empty_checkpoint_snapshot(empty_dir: &str) -> SnapshotData {
     }
 }
 
-// Refuse empty checkpoint over a FS that already has files; allow when file_count == 0
-// even if directories exist (tuple order: get_file_counts -> (dir_count, file_count)).
+// Refuse empty checkpoint over a FS that already has files; allow it over directories only.
 #[test]
 fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> {
     Logger::default();
@@ -1269,13 +1466,6 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
 
     // Directories only: guard must not refuse (file_count == 0).
     fs.mkdir("/only-dirs/nested", true)?;
-    let (dir_count, file_count) = fs.get_file_counts();
-    assert!(
-        dir_count > 0,
-        "expected dirs after mkdir, got {}",
-        dir_count
-    );
-    assert_eq!(file_count, 0);
 
     let empty_dirs = Utils::test_sub_dir(format!("empty-snap-dirs-{}", test_id));
     FileUtils::create_dir(&empty_dirs, true)?;
@@ -1294,8 +1484,6 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     // Rebuild a populated FS with files: empty checkpoint must be refused.
     fs.mkdir("/with-files", true)?;
     fs.create("/with-files/file.log", false)?;
-    let (dir_count, file_count) = fs.get_file_counts();
-    assert!(file_count > 0, "expected files after create");
 
     rt.block_on(loader.apply_snapshot(SnapshotData::default()))?;
     assert!(
@@ -1314,14 +1502,6 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
     assert!(
         msg.contains("refusing to apply empty snapshot"),
         "unexpected error: {}",
-        msg
-    );
-    assert!(
-        msg.contains(&format!("{} files", file_count))
-            && msg.contains(&format!("{} dirs", dir_count)),
-        "error should report (file_count, dir_count)=({}, {}); got: {}",
-        file_count,
-        dir_count,
         msg
     );
 

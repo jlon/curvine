@@ -25,6 +25,7 @@ use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage};
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 // raft log packaging class
 // Unify the access interfaces of app_store and log_store. Convenient to code use.
@@ -162,55 +163,54 @@ where
         self.app_store.role_change(role).await
     }
 
-    pub fn gen_apply_snapshot_job(&self, snapshot: Snapshot) -> RaftResult<()> {
+    pub async fn apply_snapshot_for_ready(&self, snapshot: Snapshot) -> RaftResult<()> {
         if self.is_snapshot_applying() {
             return err_box!("Currently applying snapshot");
         }
 
-        let log_store = self.log_store.clone();
+        // RawNode::advance may only run after the Ready snapshot is durable.
+        if let Err(e) = self.log_store.apply_snapshot(snapshot.clone()) {
+            return if e.is_snapshot_out_of_date() {
+                warn!("{}, skip apply; local state is already newer", e);
+                Ok(())
+            } else {
+                Err(e)
+            };
+        }
+
         let app_store = self.app_store.clone();
         let rt = self.rt.clone();
 
         let job_ctl = JobCtl::new();
-        let mut snap_state = self.snap_state.lock().unwrap();
-        *snap_state = SnapshotState::Applying(job_ctl.clone());
+        {
+            let mut snap_state = self.snap_state.lock().unwrap();
+            *snap_state = SnapshotState::Applying(job_ctl.clone());
+        }
 
         let client = self.client.clone();
         let conf = self.conf.clone();
         let executor = self.executor.clone();
+        let (done_tx, done_rx) = oneshot::channel();
         let job = move || {
             let mut snap_data = SnapshotData::decode(snapshot.get_data())?;
             let mut spend = TimeSpent::new();
 
-            // Start downloading the snapshot.
-            match snap_data.files_data {
-                None => panic!("Not found snapshot data"),
-                Some(ref mut files) => {
-                    let dir = app_store.snapshot_dir(Utils::rand_id())?;
-                    let mut download_job = DownloadJob::new(
-                        executor,
-                        snap_data.node_id,
-                        dir,
-                        files.clone(),
-                        &conf,
-                        client,
-                    );
+            if let Some(files) = snap_data.files_data.as_mut() {
+                let dir = app_store.snapshot_dir(Utils::rand_id())?;
+                let mut download_job = DownloadJob::new(
+                    executor,
+                    snap_data.node_id,
+                    dir,
+                    files.clone(),
+                    &conf,
+                    client,
+                );
 
-                    // Modify the data in the local directory.
-                    files.dir = download_job.run()?;
-                }
+                // Modify the data in the local directory.
+                files.dir = download_job.run()?;
             }
             let download_ms = spend.used_ms();
             spend.reset();
-
-            if let Err(e) = log_store.apply_snapshot(snapshot) {
-                return if e.is_snapshot_out_of_date() {
-                    warn!("{}, skip apply; local state is already newer", e);
-                    Ok(())
-                } else {
-                    Err(e)
-                };
-            }
 
             rt.block_on(app_store.apply_snapshot(snap_data.clone()))?;
             let apply_ms = spend.used_ms();
@@ -223,7 +223,22 @@ where
             Ok::<(), RaftError>(())
         };
 
-        self.spawn_job(job, job_ctl)
+        self.executor.spawn(move || {
+            job_ctl.advance_state(JobState::Running);
+            let result = job();
+            match &result {
+                Ok(_) => job_ctl.advance_state(JobState::Finished),
+                Err(e) => {
+                    job_ctl.advance_state(JobState::Failed);
+                    error!("apply snapshot: {}", e);
+                }
+            }
+            let _ = done_tx.send(result);
+        })?;
+
+        done_rx
+            .await
+            .map_err(|_| RaftError::other("snapshot apply worker stopped".into()))?
     }
 
     pub fn gen_create_snapshot_job(&self) -> RaftResult<()> {

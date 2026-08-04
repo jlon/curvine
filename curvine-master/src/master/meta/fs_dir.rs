@@ -564,17 +564,30 @@ impl FsDir {
         mtime: i64,
         flags: RenameFlags,
     ) -> FsResult<RenameEntry> {
-        if src_inp.get_last_inode().is_none() {
-            return err_ext!(FsError::file_not_found(src_inp.path()));
-        }
+        let src_inode = match src_inp.get_last_inode() {
+            Some(inode) => inode,
+            None => return err_ext!(FsError::file_not_found(src_inp.path())),
+        };
         if flags.exchange_mode() {
-            return err_box!("Rename failed, because exchange mode is not supported");
+            let dst_inode = match dst_inp.get_last_inode() {
+                Some(inode) => inode,
+                None => return err_ext!(FsError::file_not_found(dst_inp.path())),
+            };
+            return Ok(RenameEntry {
+                op_id: self.next_op_id(),
+                rpc_id: 0,
+                src: src_inp.path().to_string(),
+                dst: dst_inp.path().to_string(),
+                mtime,
+                flags: flags.value(),
+                src_inode_id: src_inode.id(),
+                dst_inode_id: dst_inode.id(),
+            });
         }
         if dst_inp.get_inode(-2).is_none() {
             return err_box!("Parent {} does not exist", dst_inp.get_parent_path());
         }
         if let Some(dst_inode) = dst_inp.get_last_inode() {
-            let src_inode = src_inp.get_last_inode().expect("checked above");
             let src_is_file = src_inode.is_file();
             let dst_is_file = dst_inode.is_file();
             if flags.no_replace() {

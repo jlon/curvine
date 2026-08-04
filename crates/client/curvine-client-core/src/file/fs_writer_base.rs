@@ -215,6 +215,34 @@ impl FsWriterBase {
         }
     }
 
+    /// Finalize cached random-write blocks before an operation needs their
+    /// metadata on the master.
+    ///
+    /// `add_block` validates `file_len` against all block commits it receives.
+    /// A cached writer has already advanced the local file length but has not
+    /// produced that commit yet, so it must be finalized before appending a
+    /// later block.
+    async fn complete_cached_writers(&mut self) -> FsResult<()> {
+        let block_ids: Vec<_> = self.cache_writers.keys().copied().collect();
+        for block_id in block_ids {
+            // Keep each successful worker completion immediately recoverable.
+            // If a later writer fails, cancel() must submit this commit rather
+            // than treat the already-completed block as disposable.
+            let commit = self
+                .cache_writers
+                .get_mut(&block_id)
+                .expect("cached writer exists")
+                .complete()
+                .await?;
+            self.add_durable_commit(commit)?;
+        }
+
+        // Completed writers cannot be reused; a later random write reopens a
+        // staging writer from the committed block metadata.
+        self.cache_writers.clear();
+        Ok(())
+    }
+
     fn committed_len(&self) -> i64 {
         self.file_blocks
             .block_locs
@@ -311,28 +339,15 @@ impl FsWriterBase {
             self.cache_writers.insert(writer.block_id(), writer);
         };
 
-        let mut writer_commits = Vec::with_capacity(self.cache_writers.len());
-        for (_, writer) in self.cache_writers.iter_mut() {
-            // Always finalize on the worker. `only_flush` only keeps the master
-            // write lease open; it must still publish block data.
-            //
-            // A prior resize/flush may already have finalized an older
-            // generation. Later writes reopen as a staging rewrite while
-            // `get_readable_block` prefers the committed generation. Calling
-            // `flush()` here without `complete()` leaves that rewrite
-            // unpublished, so FUSE dirty-read / LTP ftest/pwrite see EIO or
-            // stale holes after sparse write-then-read.
-            let commit_block = writer.complete().await?;
-            writer_commits.push(commit_block);
-        }
-
-        for commit in writer_commits {
-            self.file_blocks.add_commit(commit)?;
-        }
-
-        // `complete()` ends the worker write session; drop handles so the next
-        // write reopens against the newly published generation.
-        self.cache_writers.clear();
+        // Always finalize on the worker. `only_flush` only keeps the master
+        // write lease open; it must still publish block data.
+        //
+        // A prior resize/flush may already have finalized an older generation.
+        // Later writes reopen as a staging rewrite while `get_readable_block`
+        // prefers the committed generation. Calling `flush()` here without
+        // `complete()` leaves that rewrite unpublished, so FUSE dirty-read /
+        // LTP ftest/pwrite see EIO or stale holes after sparse write-then-read.
+        self.complete_cached_writers().await?;
 
         let commit_blocks = self.file_blocks.take_commit_blocks();
         // From this point onward a request may have reached the master even if
@@ -413,6 +428,12 @@ impl FsWriterBase {
 
                     None => {
                         self.update_writer(None, false).await?;
+
+                        // The local length already includes bytes held by
+                        // cached random-write blocks. AddBlock validates its
+                        // file_len before allocating the next block, so submit
+                        // every cached block commit in that same request.
+                        self.complete_cached_writers().await?;
 
                         let commit_blocks = self.file_blocks.take_commit_blocks();
                         let last_block = self.file_blocks.last_block();

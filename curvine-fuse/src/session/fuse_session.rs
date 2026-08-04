@@ -37,6 +37,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_sys as sys;
 use curvine_sys::version::GIT_VERSION;
 use curvine_sys::{RawIO, SignalKind, SignalWatch};
+use futures::future::select_all;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -87,6 +88,27 @@ fn flatten_run_all_result(
     match result {
         Ok(inner) => inner,
         Err(err) => Err(err.into()),
+    }
+}
+
+/// A FUSE receiver or sender only exits after the mounted connection is no
+/// longer usable. Stop sibling tasks immediately instead of waiting for their
+/// response queues to drain after the kernel has aborted the connection.
+async fn finish_on_first_session_task(
+    handles: Vec<tokio::task::JoinHandle<CommonResult<()>>>,
+) -> CommonResult<()> {
+    if handles.is_empty() {
+        return Ok(());
+    }
+
+    let (result, _, remaining) = select_all(handles).await;
+    for handle in remaining {
+        handle.abort();
+    }
+
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -366,7 +388,9 @@ impl<T: FileSystem> FuseSession<T> {
                 let handle = rt.spawn(async move {
                     if let Err(err) = receiver.start(shutdown_rx).await {
                         error!("fuse receiver exited with error: {}", err);
+                        return Err(err.into());
                     }
+                    Ok(())
                 });
                 handles.push(handle);
             }
@@ -375,18 +399,15 @@ impl<T: FileSystem> FuseSession<T> {
                 let handle = rt.spawn(async move {
                     if let Err(err) = sender.start().await {
                         error!("fuse sender exited with error: {}", err);
+                        return Err(err.into());
                     }
+                    Ok(())
                 });
                 handles.push(handle);
             }
         }
 
-        // Wait for all receiver/sender tasks to finish.
-        for handle in handles {
-            handle.await?;
-        }
-
-        Ok(())
+        finish_on_first_session_task(handles).await
     }
 
     async fn setup_mnts(conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
@@ -630,7 +651,21 @@ mod cleanup_guard_tests {
 
 #[cfg(test)]
 mod run_all_shutdown_result_tests {
-    use super::flatten_run_all_result;
+    use super::{finish_on_first_session_task, flatten_run_all_result};
+    use curvine_core_error::{CommonError, CommonResult};
+    use curvine_runtime::runtime::{RpcRuntime, Runtime};
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
     fn clean_inner_result_succeeds() {
@@ -658,5 +693,51 @@ mod run_all_shutdown_result_tests {
         let err = flatten_run_all_result(handle.await).expect_err("join error must be returned");
 
         assert!(err.to_string().contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn first_finished_session_task_cancels_pending_sibling() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let rt = Runtime::new("fuse-session-test", 1, 1);
+        let mut handles = vec![];
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let pending_dropped = dropped.clone();
+        handles.push(rt.spawn(async move {
+            let _flag = DropFlag(pending_dropped);
+            let _ = started_tx.send(());
+            pending::<CommonResult<()>>().await
+        }));
+        started_rx.await.expect("pending sibling starts");
+        handles.push(rt.spawn(async { Ok::<(), CommonError>(()) }));
+
+        finish_on_first_session_task(handles)
+            .await
+            .expect("the completed session task succeeds");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending sibling is cancelled");
+
+        tokio::task::spawn_blocking(move || drop(rt))
+            .await
+            .expect("test runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn first_finished_session_task_preserves_error() {
+        let handles = vec![tokio::spawn(async {
+            Err::<(), CommonError>(std::io::Error::other("receiver failed").into())
+        })];
+
+        let err = finish_on_first_session_task(handles)
+            .await
+            .expect_err("a failed session task must fail run_all");
+
+        assert_eq!(err.to_string(), "receiver failed");
     }
 }

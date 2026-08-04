@@ -316,4 +316,44 @@ mod tests {
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
     }
+
+    #[test]
+    fn parses_transfer_routing_from_java_toml() {
+        let conf = FilesystemConf::from_str(
+            r#"
+                master_addrs = "master-0:8995"
+                client_hostname = "java-client"
+                io_threads = 16
+                worker_threads = 16
+                replicas = 1
+                block_size = "128MB"
+                write_chunk_size = "128KB"
+                write_chunk_num = 8
+                read_chunk_size = "128KB"
+                read_chunk_num = 8
+                read_parallel = 1
+                read_slice_size = "0"
+                read_ahead_len = "0"
+                drop_cache_len = "1MB"
+                storage_type = "disk"
+                ttl_ms = "0"
+                ttl_action = "none"
+                small_file_size = "4MB"
+                large_file_size = "10GB"
+
+                [transfer]
+                enabled = true
+                endpoints = ["transfer-0:9010", "transfer-1:9010"]
+            "#,
+        )
+        .unwrap();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert!(cluster.transfer.enabled);
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
+    }
 }

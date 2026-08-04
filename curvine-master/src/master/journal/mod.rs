@@ -31,6 +31,9 @@ pub use self::sender_task::SenderTask;
 mod ufs_loader;
 pub use self::ufs_loader::UfsLoader;
 
+mod ufs_replayer;
+pub(crate) use self::ufs_replayer::{UfsReplayNotifier, UfsReplayProgress, UfsReplayer};
+
 #[cfg(test)]
 #[path = "tests/journal_entry_compat_test.rs"]
 mod journal_entry_compat_test;

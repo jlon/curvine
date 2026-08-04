@@ -91,43 +91,30 @@ impl MountManager {
     ///
     /// ufs_uri maybe scheme://authority/xxxx/yyy,
     /// base_uri is scheme://authority/
-    fn add_mount(
-        &self,
-        mnt_id: Option<u32>,
-        mount_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        let assign_id = match mnt_id {
-            Some(id) => id,
-            None => self.mount_table.assign_mount_id()?,
-        };
-        let mut mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
-        Self::normalize_mount_config(&mut mount)?;
-        let _ = self.create_mount_point(mount_path)?;
-
-        let mut normalized_options = mnt_opt.clone();
-        normalized_options.add_properties = mount.properties;
-        self.mount_table
-            .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+    fn add_mount(&self, mount: MountInfo) -> FsResult<()> {
+        self.mount_table.add_mount(mount)
     }
 
-    fn add_mount_committed(
+    fn add_mount_committed(&self, mount: MountInfo) -> FsResult<()> {
+        let entry = self.mount_table.prepare_add_mount_command(mount)?;
+        self.mount_table
+            .commit_metadata_command(MetadataCommand::Mount(entry))
+    }
+
+    fn prepare_mount(
         &self,
         mnt_id: Option<u32>,
         mount_path: &str,
         ufs_path: &str,
         mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        let assign_id = match mnt_id {
+    ) -> FsResult<MountInfo> {
+        let mount_id = match mnt_id {
             Some(id) => id,
             None => self.mount_table.assign_mount_id()?,
         };
-        let entry = self
-            .mount_table
-            .prepare_add_mount_command(assign_id, mount_path, ufs_path, mnt_opt)?;
-        self.mount_table
-            .commit_metadata_command(MetadataCommand::Mount(entry))
+        let mut mount = mnt_opt.clone().to_info(mount_id, mount_path, ufs_path);
+        Self::normalize_mount_config(&mut mount)?;
+        Ok(mount)
     }
 
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
@@ -146,7 +133,9 @@ impl MountManager {
         let Some(existing) = self.get_mount_info(&path)? else {
             return err_box!("mount point {} not found for update", cv_path);
         };
-        let merged = existing.merge_with(mnt_opt.clone());
+        let mut merged = existing.merge_with(mnt_opt.clone());
+        Self::normalize_mount_config(&mut merged)?;
+        self.wait_for_ufs_replay()?;
         let entry = self.mount_table.prepare_update_mount_command(merged)?;
         self.mount_table
             .commit_metadata_command(MetadataCommand::Mount(entry))
@@ -171,13 +160,15 @@ impl MountManager {
             return self.update_mount(cv_path, mnt_opt);
         }
 
-        let _ = self.create_mount_point(cv_path)?;
+        let mount = self.prepare_mount(mnt_id, cv_path, ufs_path, mnt_opt)?;
+        self.create_mount_point(&mount.cv_path)?;
         let (active, _metadata_write) = self.master_fs.active_metadata_write_guard();
         if active {
-            return self.add_mount_committed(mnt_id, cv_path, ufs_path, mnt_opt);
+            self.wait_for_ufs_replay()?;
+            return self.add_mount_committed(mount);
         }
 
-        self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
+        self.add_mount(mount)
     }
 
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
@@ -194,8 +185,17 @@ impl MountManager {
 
     fn umount_committed(&self, cv_path: &str) -> FsResult<()> {
         let entry = self.mount_table.prepare_unmount_command(cv_path)?;
+        self.wait_for_ufs_replay()?;
         self.mount_table
             .commit_metadata_command(MetadataCommand::UnMount(entry))
+    }
+
+    fn wait_for_ufs_replay(&self) -> FsResult<()> {
+        let writer = {
+            let fs_dir = self.master_fs.fs_dir.read();
+            fs_dir.journal_writer.clone()
+        };
+        writer.wait_for_ufs_replay()
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {

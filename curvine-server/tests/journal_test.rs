@@ -32,7 +32,7 @@ use curvine_server::master::journal::{
     JournalBatch, JournalCommandBatch, JournalEntry, JournalEnvelope, JournalLoader, JournalSystem,
     UfsLoader,
 };
-use curvine_server::master::{Master, MountManager};
+use curvine_server::master::{Master, MasterMonitor, MountManager};
 use log::info;
 use raft::{eraftpb::Entry, StateRole};
 use std::collections::HashMap;
@@ -99,6 +99,56 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
+fn start_active_master_pair(
+    name: &str,
+    configure: impl FnOnce(&mut ClusterConf),
+) -> CommonResult<(MasterFilesystem, Arc<MountManager>, MasterMonitor)> {
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
+    let mut conf = ClusterConf::default();
+    conf.journal.writer_flush_batch_size = 1;
+    conf.journal.writer_flush_batch_ms = 1;
+    conf.journal.raft_tick_interval_ms = 100;
+    conf.journal.raft_check_quorum = false;
+    configure(&mut conf);
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
+        RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),
+    ];
+
+    let test_id = Utils::rand_str(6);
+    conf.change_test_meta_dir(format!("{name}-{test_id}-1"));
+    conf.journal.rpc_port = port1;
+    let js1 = JournalSystem::from_conf(&conf)?;
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    let mount_manager1 = js1.mount_manager();
+    let monitor1 = js1.master_monitor();
+
+    conf.change_test_meta_dir(format!("{name}-{test_id}-2"));
+    conf.journal.rpc_port = port2;
+    let js2 = JournalSystem::from_conf(&conf)?;
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    let mount_manager2 = js2.mount_manager();
+    let monitor2 = js2.master_monitor();
+
+    js1.start_blocking()?;
+    js2.start_blocking()?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if monitor1.is_active() {
+            return Ok((fs1, mount_manager1, monitor1));
+        }
+        if monitor2.is_active() {
+            return Ok((fs2, mount_manager2, monitor2));
+        }
+        if std::time::Instant::now() >= deadline {
+            return err_box!("master did not become active");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -330,6 +380,23 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
     let worker = WorkerInfo::default();
     active.add_test_worker(worker.clone());
     standby.add_test_worker(worker.clone());
+    let invalid_s3_options = MountOptions::builder()
+        .add_property("s3.endpoint_url", "http://s3.example.com")
+        .add_property("s3.credentials.access", "access-key")
+        .add_property("s3.credentials.secret", "secret-key")
+        .add_property("s3.region_name", "cn-test-1")
+        .add_property("s3.list_objects_version", "v3")
+        .build();
+    active_mnt
+        .mount(
+            None,
+            "/invalid-committed-s3-mount",
+            "s3://bucket/path",
+            &invalid_s3_options,
+        )
+        .expect_err("invalid active S3 mount configuration must be rejected");
+    assert!(!active.exists("/invalid-committed-s3-mount")?);
+
     let mount_opts = MountOptions::builder().build();
     let mount_ufs = new_test_ufs_uri("active-committed-mount")?;
     active_mnt.mount(
@@ -897,6 +964,135 @@ fn active_namespace_changes_replicate_without_legacy_writer_queue() -> CommonRes
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn active_metadata_commit_does_not_wait_for_failed_ufs_replay() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let (active, mount_manager, monitor) = start_active_master_pair("failed-ufs-replay", |_| {})?;
+
+    let mount_options = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(None, "/mnt", "file:///dev/null", &mount_options)?;
+
+    let start = std::time::Instant::now();
+    active.mkdir("/mnt/async", false)?;
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "metadata request waited for failed UFS replay"
+    );
+    assert!(active.exists("/mnt/async")?);
+    thread::sleep(Duration::from_millis(200));
+    assert!(monitor.is_active());
+    Ok(())
+}
+
+#[test]
+fn active_master_replays_ufs_after_metadata_commit() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let (active, mount_manager, monitor) =
+        start_active_master_pair("successful-ufs-replay", |_| {})?;
+    let ufs_dir = std::env::temp_dir().join(format!(
+        "curvine-ufs-replay-{}-{}",
+        std::process::id(),
+        orpc::common::LocalTime::mills()
+    ));
+    std::fs::create_dir_all(&ufs_dir)?;
+    let mount_options = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(
+        None,
+        "/mnt",
+        format!("file://{}/", ufs_dir.display()).as_str(),
+        &mount_options,
+    )?;
+
+    active.mkdir("/mnt/async", false)?;
+    assert!(active.exists("/mnt/async")?);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !ufs_dir.join("async").is_dir() {
+        if std::time::Instant::now() >= deadline {
+            return err_box!("UFS replay did not create the committed directory");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(monitor.is_active());
+    std::fs::remove_dir_all(ufs_dir)?;
+    Ok(())
+}
+
+#[test]
+fn active_mount_does_not_replay_its_namespace_directory_to_ufs() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let (active, mount_manager, monitor) = start_active_master_pair("mount-ufs-barrier", |conf| {
+        conf.journal.max_retry_num = 2;
+        conf.journal.retry_interval_secs = 1;
+    })?;
+    let mount_options = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(None, "/blocked", "file:///dev/null", &mount_options)?;
+    active.mkdir("/blocked/stall", false)?;
+
+    let base = std::env::temp_dir().join(format!(
+        "curvine-mount-ufs-barrier-{}-{}",
+        std::process::id(),
+        orpc::common::LocalTime::mills()
+    ));
+    std::fs::create_dir_all(&base)?;
+    let ufs_root = base.join("remote-root");
+    mount_manager.mount(
+        None,
+        "/mnt",
+        format!("file://{}", ufs_root.display()).as_str(),
+        &mount_options,
+    )?;
+
+    thread::sleep(Duration::from_millis(200));
+    assert!(active.exists("/mnt")?);
+    assert!(
+        !ufs_root.exists(),
+        "mount point mkdir must not be replayed after its UFS mapping is committed"
+    );
+    assert!(monitor.is_active());
+    std::fs::remove_dir_all(base)?;
+    Ok(())
+}
+
+#[test]
+fn active_unmount_waits_for_prior_ufs_replay() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let (active, mount_manager, monitor) =
+        start_active_master_pair("unmount-ufs-barrier", |conf| {
+            conf.journal.max_retry_num = 2;
+            conf.journal.retry_interval_secs = 1;
+        })?;
+    let mount_options = MountOptions::builder()
+        .write_type(WriteType::FsMode)
+        .build();
+    mount_manager.mount(None, "/mnt", "file:///dev/null", &mount_options)?;
+    active.mkdir("/mnt/async", false)?;
+
+    let manager = mount_manager.clone();
+    let unmount = thread::spawn(move || manager.umount("/mnt"));
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !unmount.is_finished(),
+        "unmount removed the mount before prior UFS replay completed"
+    );
+    unmount.join().expect("unmount thread must not panic")?;
+
+    assert!(mount_manager.get_mount_table()?.is_empty());
+    assert!(monitor.is_active());
+    Ok(())
 }
 
 #[test]

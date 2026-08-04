@@ -20,6 +20,7 @@ use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::err_box;
+use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
@@ -29,7 +30,7 @@ use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, Blocking
 use curvine_runtime::sync::AtomicCounter;
 use log::{debug, info, warn};
 use std::collections::VecDeque;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 pub(crate) enum JournalWriteRequest {
     Legacy(JournalEntry),
@@ -50,6 +51,7 @@ pub struct JournalWriter {
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<BlockingReceiver<JournalWriteRequest>>>,
     metadata_delta_log: Mutex<MetadataDeltaLog>,
+    ufs_replay_progress: Mutex<Option<Arc<UfsReplayProgress>>>,
 
     snapshot_entries: u64,
     entries_since_snapshot: AtomicCounter,
@@ -85,6 +87,7 @@ impl JournalWriter {
             metrics,
             receiver,
             metadata_delta_log: Mutex::new(MetadataDeltaLog::new(conf.metadata_delta_log_capacity)),
+            ufs_replay_progress: Mutex::new(None),
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
         })
@@ -133,6 +136,26 @@ impl JournalWriter {
     pub fn commit_metadata_commands(&self, commands: Vec<MetadataCommand>) -> FsResult<()> {
         let commit = self.enqueue_metadata_commands(commands)?;
         self.wait_metadata_commit(commit)
+    }
+
+    pub(crate) fn set_ufs_replay_progress(&self, progress: Arc<UfsReplayProgress>) {
+        if let Ok(mut current) = self.ufs_replay_progress.lock() {
+            *current = Some(progress);
+        }
+    }
+
+    pub(crate) fn wait_for_ufs_replay(&self) -> FsResult<()> {
+        let progress = self
+            .ufs_replay_progress
+            .lock()
+            .map_err(|error| {
+                FsError::common(format!("UFS replay progress lock poisoned: {}", error))
+            })?
+            .clone();
+        if let Some(progress) = progress {
+            progress.wait_for_current()?;
+        }
+        Ok(())
     }
 
     fn flush_test_journal(

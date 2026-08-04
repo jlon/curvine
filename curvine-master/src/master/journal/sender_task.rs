@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::journal_writer::JournalWriteRequest;
-use crate::master::journal::{JournalCommandBatch, JournalEntry};
+use crate::master::journal::{JournalCommandBatch, JournalEntry, MetadataCommand};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
@@ -95,13 +95,22 @@ impl SenderTask {
                     force
                 }
                 JournalWriteRequest::Metadata(commands, ack) => {
+                    let force = commands.iter().any(|command| {
+                        matches!(
+                            command,
+                            MetadataCommand::Mount(_) | MetadataCommand::UnMount(_)
+                        )
+                    });
+                    if force {
+                        self.flush_pending()?;
+                    }
                     start_metadata_batch = self.batch.is_empty();
                     for command in commands {
                         self.batch.push_metadata(command);
                     }
                     self.metrics.journal_queue_len.dec();
                     self.metadata_acks.push(ack);
-                    false
+                    force
                 }
             }
         } else {

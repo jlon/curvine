@@ -173,24 +173,21 @@ impl MountTable {
         Ok(())
     }
 
-    pub fn add_mount(
-        &self,
-        mount_id: u32,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        if self.exists(ufs_path)? {
-            return err_box!("{} already exists in mount table", ufs_path);
+    fn validate_new_mount(&self, info: &MountInfo) -> FsResult<()> {
+        if self.exists(&info.ufs_path)? {
+            return err_box!("{} already exists in mount table", info.ufs_path);
         }
 
-        if self.mount_point_inuse(cv_path)? {
-            return err_box!("{} already exists in mount table", cv_path);
+        if self.mount_point_inuse(&info.cv_path)? {
+            return err_box!("{} already exists in mount table", info.cv_path);
         }
 
-        self.check_conflict(cv_path, ufs_path)?;
+        self.check_conflict(&info.cv_path, &info.ufs_path)
+    }
 
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+    pub fn add_mount(&self, info: MountInfo) -> FsResult<()> {
+        self.validate_new_mount(&info)?;
+
         self.unprotected_add_mount(info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
@@ -198,23 +195,8 @@ impl MountTable {
         Ok(())
     }
 
-    pub fn prepare_add_mount_command(
-        &self,
-        mount_id: u32,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<MountEntry> {
-        if self.exists(ufs_path)? {
-            return err_box!("{} already exists in mount table", ufs_path);
-        }
-
-        if self.mount_point_inuse(cv_path)? {
-            return err_box!("{} already exists in mount table", cv_path);
-        }
-
-        self.check_conflict(cv_path, ufs_path)?;
-        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+    pub fn prepare_add_mount_command(&self, info: MountInfo) -> FsResult<MountEntry> {
+        self.validate_new_mount(&info)?;
         let fs_dir = self.fs_dir.read();
         Ok(MountEntry {
             op_id: fs_dir.next_op_id(),

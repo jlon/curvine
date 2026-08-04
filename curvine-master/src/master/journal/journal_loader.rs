@@ -23,7 +23,7 @@ use crate::master::{
     JobManager, Master, MasterMetrics, MountManager, SyncFsDir, SyncWorkerManager,
 };
 use curvine_config::JournalConf;
-use curvine_core_error::{err_box, ternary, CommonResult};
+use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsError;
 use curvine_model::{FreeResult, RenameFlags};
 use curvine_raft::conf::JournalConfExt;
@@ -39,7 +39,6 @@ use raft::StateRole;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 use std::{fs, mem};
 
 // Replay the master metadata operation log.
@@ -49,17 +48,13 @@ pub struct JournalLoader {
     fs_dir: SyncFsDir,
     worker_manager: Option<SyncWorkerManager>,
     mnt_mgr: Arc<MountManager>,
-    journal_writer: Arc<JournalWriter>,
-    ufs_loader: UfsLoader,
+    ufs_replayer: Option<UfsReplayNotifier>,
     log_store: RocksLogStorage,
     sender: AsyncSender<ApplyMsg>,
     fsm_state: Arc<Mutex<FsmState>>,
     retain_checkpoint_num: usize,
     ignore_reply_error: bool,
-    max_retry_num: u64,
-    skip_failed_ufs_replay_after_retry: bool,
     batch_size: u64,
-    retry_interval: Duration,
     metrics: &'static MasterMetrics,
     has_apply_worker: bool,
 }
@@ -124,25 +119,34 @@ impl JournalLoader {
         journal_writer: Arc<JournalWriter>,
         testing: bool,
     ) -> CommonResult<Self> {
-        let ufs_loader = UfsLoader::new(job_manager, conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
+        let fsm_state = Arc::new(Mutex::new(FsmState::default()));
+        let metrics = Master::get_metrics()?;
+        let ufs_replayer = (!testing).then(|| {
+            UfsReplayer::spawn(
+                rt.clone(),
+                UfsLoader::new(job_manager, conf),
+                journal_writer.clone(),
+                log_store.clone(),
+                conf,
+            )
+        });
+        if let Some(replayer) = &ufs_replayer {
+            journal_writer.set_ufs_replay_progress(replayer.progress());
+        }
         let loader = Self {
             node_id: conf.node_id()?,
             fs_dir,
             worker_manager,
             mnt_mgr,
-            journal_writer,
-            ufs_loader,
+            ufs_replayer,
             log_store,
             sender,
-            fsm_state: Arc::new(Mutex::new(FsmState::default())),
+            fsm_state,
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_reply_error: conf.ignore_reply_error,
-            max_retry_num: conf.max_retry_num,
-            skip_failed_ufs_replay_after_retry: conf.skip_failed_ufs_replay_after_retry,
             batch_size: conf.scan_batch_size,
-            retry_interval: Duration::from_secs(conf.retry_interval_secs),
-            metrics: Master::get_metrics()?,
+            metrics,
             has_apply_worker: !testing,
         };
 
@@ -179,24 +183,9 @@ impl JournalLoader {
         std::process::abort();
     }
 
-    fn set_applied(
-        &self,
-        is_leader: bool,
-        applied: AppliedIndex,
-        has_ufs_affecting: bool,
-    ) -> CommonResult<()> {
-        if is_leader && has_ufs_affecting {
-            self.journal_writer
-                .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
-        }
-
+    fn set_applied(&self, applied: AppliedIndex) -> CommonResult<()> {
         let mut state = self.fsm_state()?;
-        if is_leader {
-            state.ufs_applied = applied.clone();
-            state.applied = applied;
-        } else {
-            state.applied = applied;
-        }
+        state.applied = applied;
 
         self.metrics.journal_applied.set(state.applied.index as i64);
         self.metrics
@@ -219,19 +208,13 @@ impl JournalLoader {
         }
     }
 
-    async fn apply0(
-        &self,
-        is_leader: bool,
-        entry: &Entry,
-        skip_ufs_error: bool,
-    ) -> CommonResult<()> {
+    async fn apply0(&self, is_leader: bool, entry: &Entry) -> CommonResult<()> {
         if entry.data.is_empty() {
             return Ok(());
         }
 
         let cur = self.fsm_state_snapshot()?;
-        let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
-        if entry.index <= role_applied {
+        if entry.index <= cur.applied.index {
             info!(
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur
@@ -243,7 +226,6 @@ impl JournalLoader {
         let batch_len = batch.len();
         let mut snapshot = None;
         let mut applied = Self::build_applied(entry);
-        let mut has_ufs_affecting = false;
 
         for (seq, command) in batch.into_commands().into_iter().enumerate() {
             applied.op_id = command.op_id();
@@ -260,10 +242,7 @@ impl JournalLoader {
                     continue;
                 }
 
-                JournalCommand::Legacy(JournalEntry::CacheInvalidation(_))
-                | JournalCommand::Legacy(JournalEntry::UfsApplied(_)) => (),
-
-                _ => has_ufs_affecting = true,
+                _ => (),
             }
 
             if !is_leader {
@@ -288,50 +267,21 @@ impl JournalLoader {
 
             match command {
                 JournalCommand::Legacy(op_entry) => {
-                    let res = if is_leader {
-                        self.ufs_loader.apply_entry(&op_entry).await
-                    } else {
-                        self.apply_entry(op_entry.clone())
-                    };
-
-                    if let Err(e) = res {
-                        if is_leader && skip_ufs_error {
-                            error!(
-                                "skip failed UFS replay after retries, entry index={}, term={}, journal={:?}, error={}",
-                                entry.index, entry.term, op_entry, e
-                            );
-                            continue;
-                        }
-
-                        return err_box!("failed to apply journal: {:?}: {}", op_entry, e);
-                    }
+                    self.apply_entry(op_entry.clone())?;
                 }
 
                 JournalCommand::Metadata(command) => {
-                    let res = self
-                        .apply_metadata_command(is_leader, command.clone())
-                        .await;
-
-                    if let Err(e) = res {
-                        if is_leader && skip_ufs_error {
-                            error!(
-                                "skip failed committed metadata command after retries, entry index={}, term={}, command={:?}, error={}",
-                                entry.index, entry.term, command, e
-                            );
-                            continue;
-                        }
-
-                        return err_box!(
-                            "failed to apply committed metadata command: {:?}: {}",
-                            command,
-                            e
-                        );
-                    }
+                    self.apply_metadata_command(is_leader, command.clone())?;
                 }
             }
         }
 
-        self.set_applied(is_leader, applied, has_ufs_affecting)?;
+        self.set_applied(applied.clone())?;
+        if is_leader {
+            if let Some(replayer) = &self.ufs_replayer {
+                replayer.notify_metadata_applied(applied);
+            }
+        }
 
         if let Some(e) = snapshot {
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
@@ -348,23 +298,15 @@ impl JournalLoader {
         Ok(())
     }
 
-    async fn apply_msg(
-        &self,
-        is_leader: bool,
-        msg: &ApplyMsg,
-        skip_ufs_error: bool,
-    ) -> CommonResult<()> {
+    async fn apply_msg(&self, is_leader: bool, msg: &ApplyMsg) -> CommonResult<()> {
         match msg {
             ApplyMsg::Entry(entry) | ApplyMsg::EntryWithAck((entry, _)) => {
-                self.apply0(is_leader, entry, skip_ufs_error).await?;
+                self.apply0(is_leader, entry).await?;
                 Ok(())
             }
 
             ApplyMsg::Scan(applied_index) => {
                 let mut last_applied = applied_index.index;
-                if is_leader && skip_ufs_error {
-                    last_applied = last_applied.max(self.fsm_state_snapshot()?.ufs_applied.index);
-                }
 
                 let commit_index = self.log_store.hard_state().commit;
                 loop {
@@ -409,12 +351,9 @@ impl JournalLoader {
                             )
                             .into();
                         }
-                        self.apply0(is_leader, &entry, skip_ufs_error).await?;
+                        self.apply0(is_leader, &entry).await?;
                         last_applied = entry.index;
                         expected_index += 1;
-                        if skip_ufs_error {
-                            return Ok(());
-                        }
                     }
                 }
             }
@@ -433,8 +372,7 @@ impl JournalLoader {
 
     async fn catch_up_committed_metadata(&self) -> RaftResult<()> {
         let applied = self.fsm_state_snapshot()?.applied;
-        self.apply_msg(false, &ApplyMsg::new_scan(applied), false)
-            .await?;
+        self.apply_msg(false, &ApplyMsg::new_scan(applied)).await?;
 
         let metadata_applied = self.fsm_state_snapshot()?.applied.index;
         let committed = self.log_store.hard_state().commit;
@@ -449,27 +387,11 @@ impl JournalLoader {
         Ok(())
     }
 
-    async fn next_apply_msg(
-        &self,
-        receiver: &mut AsyncReceiver<ApplyMsg>,
-        retry_msg: &mut Option<ApplyMsg>,
-    ) -> Option<ApplyMsg> {
-        match retry_msg.take() {
-            Some(msg) => {
-                tokio::time::sleep(self.retry_interval).await;
-                Some(msg)
-            }
-            None => receiver.recv().await,
-        }
-    }
-
     async fn run_apply(self, mut receiver: AsyncReceiver<ApplyMsg>) {
-        let mut retry_msg: Option<ApplyMsg> = None;
-        let mut retry_num: u64 = 0;
         let mut is_leader = false;
 
         loop {
-            let apply_msg = match self.next_apply_msg(&mut receiver, &mut retry_msg).await {
+            let apply_msg = match receiver.recv().await {
                 Some(v) => v,
                 None => break,
             };
@@ -479,14 +401,12 @@ impl JournalLoader {
                     if let Err(e) = tx.send(self.create_snapshot0(None)) {
                         warn!("send create snapshot result failed: {}", e);
                     }
-                    retry_num = 0;
                 }
 
                 ApplyMsg::ApplySnapshot((tx, snapshot)) => {
                     if let Err(e) = tx.send(self.apply_snapshot0(snapshot)) {
                         warn!("send apply snapshot result failed: {}", e);
                     }
-                    retry_num = 0;
                 }
 
                 ApplyMsg::RoleChange((role, tx)) => {
@@ -497,10 +417,15 @@ impl JournalLoader {
                             self.catch_up_committed_metadata().await?;
                             is_leader = true;
                             let ufs_applied = self.get_ufs_applied()?;
-                            info!("metadata caught up for leader promotion, scheduling UFS replay from {:?}", ufs_applied);
-                            retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
+                            let metadata_applied = self.fsm_state_snapshot()?.applied;
+                            if let Some(replayer) = &self.ufs_replayer {
+                                replayer.become_leader(ufs_applied, metadata_applied);
+                            }
                         } else {
                             is_leader = false;
+                            if let Some(replayer) = &self.ufs_replayer {
+                                replayer.become_follower();
+                            }
                         }
                         Ok(())
                     }
@@ -516,9 +441,8 @@ impl JournalLoader {
                     break;
                 }
 
-                msg => match self.apply_msg(is_leader, &msg, false).await {
+                msg => match self.apply_msg(is_leader, &msg).await {
                     Ok(_) => {
-                        retry_num = 0;
                         Self::complete_entry_ack(msg, Ok(()));
                     }
 
@@ -526,43 +450,9 @@ impl JournalLoader {
                         if self.ignore_reply_error {
                             error!("apply entry failed(skip): {}", error);
                             Self::complete_entry_ack(msg, Ok(()));
-                        } else if is_leader {
-                            retry_num += 1;
-
-                            if retry_num >= self.max_retry_num {
-                                if self.skip_failed_ufs_replay_after_retry {
-                                    error!(
-                                        "apply entry failed(retry_num={}), skipping failed UFS replay to keep master alive: {}",
-                                        retry_num, error
-                                    );
-                                    let continue_scan = matches!(&msg, ApplyMsg::Scan(_));
-                                    if let Err(skip_error) =
-                                        self.apply_msg(is_leader, &msg, true).await
-                                    {
-                                        Self::abort_on_fatal_apply_error(format!(
-                                            "apply entry failed while skipping failed UFS replay: {}",
-                                            skip_error
-                                        ));
-                                    }
-                                    retry_num = 0;
-                                    if continue_scan {
-                                        retry_msg.replace(msg);
-                                    } else {
-                                        Self::complete_entry_ack(msg, Ok(()));
-                                    }
-                                } else {
-                                    Self::abort_on_fatal_apply_error(format!(
-                                        "apply entry failed(retry_num={}): {}",
-                                        retry_num, error
-                                    ));
-                                }
-                            } else {
-                                error!("apply entry failed(retry_num={}): {}", retry_num, error);
-                                retry_msg.replace(msg);
-                            }
                         } else {
                             Self::abort_on_fatal_apply_error(format!(
-                                "apply entry failed on follower: {}",
+                                "failed to apply committed metadata: {}",
                                 error
                             ));
                         }
@@ -726,20 +616,13 @@ impl JournalLoader {
         fs_dir.store.apply_cache_invalidations(entry.inodes)
     }
 
-    async fn apply_metadata_command(
+    fn apply_metadata_command(
         &self,
         is_leader: bool,
         command: MetadataCommand,
     ) -> CommonResult<()> {
         match command {
-            MetadataCommand::Mkdir(entry) => {
-                self.mkdir(entry.clone())?;
-                if is_leader {
-                    self.ufs_loader.mkdir(&entry).await
-                } else {
-                    Ok(())
-                }
-            }
+            MetadataCommand::Mkdir(entry) => self.mkdir(entry),
             MetadataCommand::CreateFile(entry) => self.create_file(entry),
             MetadataCommand::ReopenFile(entry) => self.reopen_file(entry),
             MetadataCommand::OverWriteFile(entry) => {
@@ -753,25 +636,13 @@ impl JournalLoader {
                 if let Some(del_res) = self.complete_file(entry.clone())? {
                     self.remove_deleted_blocks(is_leader, &del_res);
                 }
-                if is_leader {
-                    self.ufs_loader
-                        .apply_entry(&JournalEntry::CompleteFile(entry))
-                        .await
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             MetadataCommand::Rename(entry) => {
                 if let Some(del_res) = self.rename(entry.clone())? {
                     self.remove_deleted_blocks(is_leader, &del_res);
                 }
-                if is_leader {
-                    self.ufs_loader
-                        .apply_entry(&JournalEntry::Rename(entry))
-                        .await
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             MetadataCommand::Mount(entry) => self.mount(entry),
             MetadataCommand::UnMount(entry) => self.unmount(entry),
@@ -780,13 +651,7 @@ impl JournalLoader {
                 if let Some(del_res) = self.delete(entry.clone())? {
                     self.remove_deleted_blocks(is_leader, &del_res);
                 }
-                if is_leader {
-                    self.ufs_loader
-                        .apply_entry(&JournalEntry::Delete(entry))
-                        .await
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             MetadataCommand::Free(entry) => {
                 let free_res = self.free(entry)?;
@@ -1096,12 +961,14 @@ impl JournalLoader {
 
     pub fn ufs_applied(&self, entry: UfsAppliedEntry) -> CommonResult<()> {
         let mut lock = self.fsm_state()?;
-        lock.ufs_applied = AppliedIndex {
-            op_id: entry.op_id,
-            rpc_id: entry.rpc_id,
-            term: entry.term,
-            index: entry.index,
-        };
+        if entry.index > lock.ufs_applied.index {
+            lock.ufs_applied = AppliedIndex {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                term: entry.term,
+                index: entry.index,
+            };
+        }
         Ok(())
     }
 
@@ -1144,6 +1011,9 @@ impl JournalLoader {
     }
 
     pub async fn shutdown(&self) -> RaftResult<()> {
+        if let Some(replayer) = &self.ufs_replayer {
+            replayer.shutdown();
+        }
         let (tx, rx) = CallChannel::channel();
         self.sender.send(ApplyMsg::Shutdown(tx)).await?;
         rx.receive().await?;
@@ -1151,7 +1021,7 @@ impl JournalLoader {
     }
 
     async fn apply_direct(&self, msg: ApplyMsg) -> RaftResult<()> {
-        let result = if let Err(e) = self.apply_msg(false, &msg, false).await {
+        let result = if let Err(e) = self.apply_msg(false, &msg).await {
             if self.ignore_reply_error {
                 error!("apply entry failed: {}", e);
                 Ok(())

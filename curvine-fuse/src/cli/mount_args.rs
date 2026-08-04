@@ -65,6 +65,12 @@ pub struct FuseMountArgs {
     #[arg(long, help = "Stream channel size (optional)")]
     pub stream_channel_size: Option<usize>,
 
+    #[arg(
+        long,
+        help = "Maximum independent readers per FUSE file handle (optional)"
+    )]
+    pub per_handle_read_parallel: Option<usize>,
+
     #[arg(long, help = "Enable direct IO (optional)")]
     pub direct_io: Option<bool>,
 
@@ -219,6 +225,10 @@ impl FuseMountArgs {
 
         if let Some(stream_channel_size) = self.stream_channel_size {
             conf.fuse.stream_channel_size = stream_channel_size;
+        }
+
+        if let Some(per_handle_read_parallel) = self.per_handle_read_parallel {
+            conf.fuse.per_handle_read_parallel = per_handle_read_parallel;
         }
 
         if let Some(direct_io) = self.direct_io {
@@ -381,6 +391,16 @@ mod tests {
         );
 
         assert_eq!(conf.fuse.fuse_opts, vec!["ro"]);
+    }
+
+    #[test]
+    fn get_conf_cli_overrides_per_handle_read_parallel() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nper_handle_read_parallel = 2\n",
+            &["--per-handle-read-parallel", "3"],
+        );
+
+        assert_eq!(conf.fuse.per_handle_read_parallel, 3);
     }
 
     #[test]

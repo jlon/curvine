@@ -105,6 +105,11 @@ pub struct FuseConf {
     // Read and write file request queue size, default is 0
     pub stream_channel_size: usize,
 
+    // Maximum number of independent readers opened lazily for one FUSE file
+    // handle. Readers are mutable because they retain block/cache state, so a
+    // request must never share a reader concurrently with another request.
+    pub per_handle_read_parallel: usize,
+
     // Mount the configuration, needs to be passed to the linux kernel.
     pub fuse_opts: Vec<String>,
 
@@ -245,9 +250,16 @@ impl FuseConf {
     /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
     pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
+    /// Preserve the legacy single-reader ordering per FUSE handle by default.
+    /// Higher values are an explicit throughput tuning for measured concurrent reads.
+    pub const DEFAULT_PER_HANDLE_READ_PARALLEL: usize = 1;
+
     pub fn init(&mut self) -> CommonResult<()> {
         if self.io_threads == 0 {
             return err_box!("fuse.io_threads must be > 0");
+        }
+        if self.per_handle_read_parallel == 0 {
+            return err_box!("fuse.per_handle_read_parallel must be > 0");
         }
         if self.mnt_number == 0 {
             return err_box!("fuse.mnt_number must be > 0");
@@ -537,6 +549,7 @@ impl Default for FuseConf {
             clone_fd: true,
             fuse_channel_size: 0,
             stream_channel_size: 0,
+            per_handle_read_parallel: Self::DEFAULT_PER_HANDLE_READ_PARALLEL,
             fuse_opts: vec![],
             readonly: false,
             umask: Self::DEFAULT_UMASK,
@@ -725,6 +738,27 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn init_rejects_zero_per_handle_read_parallel() {
+        let mut conf = FuseConf {
+            per_handle_read_parallel: 0,
+            ..Default::default()
+        };
+        let err = conf
+            .init()
+            .expect_err("zero per_handle_read_parallel must be rejected");
+        assert!(
+            err.to_string().contains("per_handle_read_parallel"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn default_preserves_single_reader_per_handle() {
+        assert_eq!(FuseConf::default().per_handle_read_parallel, 1);
     }
 
     #[test]

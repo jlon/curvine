@@ -15,62 +15,263 @@
 use crate::fs::operator::Read;
 use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
 use crate::session::FuseResponse;
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_client::unified::UnifiedReader;
 use curvine_config::FuseConf;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::{Path, Reader};
+use curvine_fs_api::{FileSystem, Path, Reader};
 use curvine_model::FileStatus;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use curvine_runtime::sync::channel::{
-    AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender,
-};
-use curvine_runtime::sync::ErrorMonitor;
-use log::{error, warn};
+use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+use curvine_runtime::sync::{AsyncMutex, FastMutex};
+use log::warn;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-enum ReadTask {
-    Read(i64, usize, FuseResponse),
-    Complete(CallSender<FsResult<()>>, Option<FuseResponse>),
+type ReaderOpenFuture = Pin<Box<dyn Future<Output = FsResult<UnifiedReader>> + Send>>;
+type ReaderOpener = Arc<dyn Fn(Path) -> ReaderOpenFuture + Send + Sync>;
+
+struct ReaderPoolState {
+    closing: bool,
+    in_flight: usize,
+    reader_count: usize,
+    opening_count: usize,
+    expansion_failed: bool,
+}
+
+struct ReaderPool {
+    available_sender: AsyncSender<UnifiedReader>,
+    available_receiver: AsyncMutex<AsyncReceiver<UnifiedReader>>,
+    opener: Option<ReaderOpener>,
+    path: Path,
+    max_readers: usize,
+    read_permits: Option<Arc<Semaphore>>,
+    state: FastMutex<ReaderPoolState>,
+    idle: Notify,
+}
+
+struct ReadLease {
+    pool: Arc<ReaderPool>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        self.pool.finish_read();
+    }
+}
+
+impl ReaderPool {
+    fn new(conf: &FuseConf, opener: Option<ReaderOpener>, reader: UnifiedReader) -> Arc<Self> {
+        let max_readers = if opener.is_some() {
+            conf.per_handle_read_parallel
+        } else {
+            1
+        };
+        // The legacy reader had one active worker plus `stream_channel_size`
+        // queued requests. A pool has up to `max_readers` active requests, so
+        // preserve that queue bound without throttling the reader slots.
+        let read_permits = (conf.stream_channel_size != 0).then(|| {
+            Arc::new(Semaphore::new(
+                conf.stream_channel_size
+                    .saturating_add(max_readers)
+                    .min(Semaphore::MAX_PERMITS),
+            ))
+        });
+        let path = reader.path().clone();
+        let (available_sender, available_receiver) = AsyncChannel::new(0).split();
+        available_sender
+            .send_sync(reader)
+            .expect("new reader pool receiver must be alive");
+
+        Arc::new(Self {
+            available_sender,
+            available_receiver: AsyncMutex::new(available_receiver),
+            opener,
+            path,
+            max_readers,
+            read_permits,
+            state: FastMutex::new(ReaderPoolState {
+                closing: false,
+                in_flight: 0,
+                reader_count: 1,
+                opening_count: 0,
+                expansion_failed: false,
+            }),
+            idle: Notify::new(),
+        })
+    }
+
+    async fn begin_read(self: &Arc<Self>) -> FsResult<ReadLease> {
+        let permit = match &self.read_permits {
+            Some(permits) => Some(
+                permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| FsError::common("FUSE reader is closing"))?,
+            ),
+            None => None,
+        };
+        let mut state = self.state.lock();
+        if state.closing {
+            return Err(FsError::common("FUSE reader is closing"));
+        }
+        state.in_flight += 1;
+        Ok(ReadLease {
+            pool: self.clone(),
+            _permit: permit,
+        })
+    }
+
+    fn finish_read(&self) {
+        let notify = {
+            let mut state = self.state.lock();
+            debug_assert!(state.in_flight > 0, "reader pool in-flight underflow");
+            state.in_flight -= 1;
+            state.closing && state.in_flight == 0
+        };
+        if notify {
+            self.idle.notify_waiters();
+        }
+    }
+
+    async fn try_take_available(&self) -> FsResult<Option<UnifiedReader>> {
+        Ok(self.available_receiver.lock().await.try_recv()?)
+    }
+
+    async fn acquire(&self) -> FsResult<UnifiedReader> {
+        if let Some(reader) = self.try_take_available().await? {
+            return Ok(reader);
+        }
+
+        let open_reader = {
+            let mut state = self.state.lock();
+            if !state.expansion_failed
+                && state.reader_count + state.opening_count < self.max_readers
+            {
+                state.opening_count += 1;
+                true
+            } else {
+                false
+            }
+        };
+
+        if open_reader {
+            let opener = self
+                .opener
+                .as_ref()
+                .expect("reader pool can grow only with an opener")
+                .clone();
+            let res = opener(self.path.clone()).await;
+            let mut state = self.state.lock();
+            state.opening_count -= 1;
+            match res {
+                Ok(reader) => {
+                    state.reader_count += 1;
+                    return Ok(reader);
+                }
+                Err(e) => {
+                    // The original reader remains valid for this open handle.
+                    // An opportunistic pool expansion must not turn a request
+                    // that could wait for it into a new read failure. Avoid
+                    // retrying a failing open for every concurrent request;
+                    // the next FUSE handle starts with a fresh pool.
+                    state.expansion_failed = true;
+                    warn!("failed to expand FUSE reader pool for {}: {}", self.path, e);
+                }
+            }
+        }
+
+        Ok(self.available_receiver.lock().await.recv_check().await?)
+    }
+
+    async fn release(&self, reader: UnifiedReader) -> FsResult<()> {
+        self.available_sender.send(reader).await?;
+        Ok(())
+    }
+
+    async fn close_and_take_all(&self) -> FsResult<Vec<UnifiedReader>> {
+        {
+            let mut state = self.state.lock();
+            if state.closing {
+                return Err(FsError::common("FUSE reader is already closing"));
+            }
+            state.closing = true;
+        }
+        if let Some(permits) = &self.read_permits {
+            permits.close();
+        }
+
+        loop {
+            let notified = self.idle.notified();
+            if self.state.lock().in_flight == 0 {
+                break;
+            }
+            notified.await;
+        }
+
+        let reader_count = self.state.lock().reader_count;
+        let mut receiver = self.available_receiver.lock().await;
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            readers.push(receiver.recv_check().await?);
+        }
+        Ok(readers)
+    }
 }
 
 pub struct FuseReader {
     path: Path,
     len: i64,
-    sender: AsyncSender<ReadTask>,
-    err_monitor: Arc<ErrorMonitor<FsError>>,
+    pool: Arc<ReaderPool>,
+    rt: Arc<Runtime>,
     status: FileStatus,
+    path_type: &'static str,
+    metrics_enabled: bool,
 }
 
 impl FuseReader {
     pub fn new(conf: &FuseConf, rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
+        Self::new_inner(conf, rt, None, reader)
+    }
+
+    pub fn new_with_filesystem(
+        conf: &FuseConf,
+        rt: Arc<Runtime>,
+        fs: UnifiedFileSystem,
+        reader: UnifiedReader,
+    ) -> Self {
+        let opener: ReaderOpener = Arc::new(move |path| {
+            let fs = fs.clone();
+            Box::pin(async move { fs.open(&path).await })
+        });
+        Self::new_inner(conf, rt, Some(opener), reader)
+    }
+
+    fn new_inner(
+        conf: &FuseConf,
+        rt: Arc<Runtime>,
+        opener: Option<ReaderOpener>,
+        reader: UnifiedReader,
+    ) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
-        let err_monitor = Arc::new(ErrorMonitor::new());
-        let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
         let status = reader.status().clone();
         let path_type = reader.path_type();
-        let metrics_enabled = conf.metrics_enabled;
-
-        let monitor = err_monitor.clone();
-        rt.spawn(async move {
-            let res = Self::read_future(reader, receiver, path_type, metrics_enabled).await;
-            match res {
-                Ok(_) => (),
-
-                Err(e) => {
-                    error!("fuse reader error: {}", e);
-                    monitor.set_error(e);
-                }
-            }
-        });
+        let pool = ReaderPool::new(conf, opener, reader);
 
         Self {
             path,
             len,
-            sender,
-            err_monitor,
+            pool,
+            rt,
             status,
+            path_type,
+            metrics_enabled: conf.metrics_enabled,
         }
     }
 
@@ -90,87 +291,91 @@ impl FuseReader {
         &self.status
     }
 
-    fn check_error(&self, e: FsError) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e)
-    }
-
     pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
-        let res = self
-            .sender
-            .send(ReadTask::Read(
-                op.arg.offset as i64,
-                op.arg.size as usize,
-                reply,
-            ))
-            .await
-            .map_err(|e| self.check_error(e.into()));
-        res
+        let lease = self.pool.begin_read().await?;
+        let pool = self.pool.clone();
+        let path_type = self.path_type;
+        let metrics_enabled = self.metrics_enabled;
+        let off = op.arg.offset as i64;
+        let len = op.arg.size as usize;
+        self.rt.spawn(async move {
+            Self::read_future(pool, off, len, reply, path_type, metrics_enabled).await;
+            drop(lease);
+        });
+        Ok(())
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let fun = async {
-            let (rx, tx) = CallChannel::channel();
-            self.sender.send(ReadTask::Complete(rx, reply)).await?;
-            // Double `?`: unwrap the channel receive, then propagate the real
-            // backend complete result.
-            tx.receive().await??;
-            Ok::<(), FsError>(())
-        };
-        fun.await.map_err(|e| self.check_error(e))
+        let readers = self.pool.close_and_take_all().await?;
+        let mut error = None;
+        for mut reader in readers {
+            if let Err(e) = reader.complete().await {
+                error.get_or_insert(e);
+            }
+        }
+        let result = error.map_or(Ok(()), Err);
+
+        match reply {
+            Some(reply) => {
+                let result: Result<(), crate::FuseError> = result.map_err(Into::into);
+                if let Err(e) = reply.send_rep(result).await {
+                    warn!("failed to send FUSE reader complete reply: {}", e);
+                }
+                Ok(())
+            }
+            None => result,
+        }
     }
 
     async fn read_future(
-        mut reader: UnifiedReader,
-        mut req_receiver: AsyncReceiver<ReadTask>,
+        pool: Arc<ReaderPool>,
+        off: i64,
+        len: usize,
+        reply: FuseResponse,
         path_type: &'static str,
         metrics_enabled: bool,
-    ) -> FsResult<()> {
-        while let Some(task) = req_receiver.recv().await {
-            match task {
-                ReadTask::Read(off, len, reply) => {
-                    let io_start = if metrics_enabled {
-                        Some(mono_now())
-                    } else {
-                        None
-                    };
-                    let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
-                    let data = reader.fuse_read(off, len).await;
-                    drop(inflight);
+    ) {
+        let data = match pool.acquire().await {
+            Ok(mut reader) => {
+                let io_start = if metrics_enabled {
+                    Some(mono_now())
+                } else {
+                    None
+                };
+                let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
+                let data = reader.fuse_read(off, len).await;
+                drop(inflight);
 
-                    if let Some(start) = io_start {
-                        let ok = data.is_ok();
-                        // Actual bytes read (short reads count actual); requested
-                        // size is `len` (the request-size distribution).
-                        let bytes = data
-                            .as_ref()
-                            .map(|v| v.iter().map(|s| s.len() as u64).sum())
-                            .unwrap_or(0);
-                        FuseMetrics::get().record_stream_io(
-                            IO_TYPE_READ,
-                            path_type,
-                            ok,
-                            bytes,
-                            len as u64,
-                            start.elapsed().as_micros() as u64,
-                        );
-                    }
-
-                    if let Err(e) = reply.send_data(data.map_err(|x| x.into())).await {
-                        // Losing this reply receiver must not kill the shared worker.
-                        warn!("failed to send FUSE read reply: {}", e);
-                    }
+                if let Some(start) = io_start {
+                    let ok = data.is_ok();
+                    // Actual bytes read (short reads count actual); requested
+                    // size is `len` (the request-size distribution).
+                    let bytes = data
+                        .as_ref()
+                        .map(|v| v.iter().map(|s| s.len() as u64).sum())
+                        .unwrap_or(0);
+                    FuseMetrics::get().record_stream_io(
+                        IO_TYPE_READ,
+                        path_type,
+                        ok,
+                        bytes,
+                        len as u64,
+                        start.elapsed().as_micros() as u64,
+                    );
                 }
 
-                ReadTask::Complete(tx, reply) => {
-                    // Complete/release IO accounting lives at send_stream to avoid double-counting.
-                    let res = reader.complete().await;
-                    // Deliver the real backend result to the caller (tx) first,
-                    // then the kernel reply.
-                    crate::fs::deliver_stream_result(res, tx, reply).await?;
+                match pool.release(reader).await {
+                    Ok(()) => data,
+                    Err(e) => Err(e),
                 }
             }
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = reply.send_data(data.map_err(Into::into)).await {
+            // Losing this reply receiver must not terminate another request.
+            warn!("failed to send FUSE read reply: {}", e);
         }
-        Ok(())
     }
 }
 
@@ -189,6 +394,8 @@ mod tests {
     use curvine_runtime::runtime::AsyncRuntime;
     use curvine_runtime::sync::channel::AsyncChannel;
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{timeout, Duration};
 
     fn metrics_reply(rt: &AsyncRuntime) -> FuseResponse {
         FuseMetrics::ensure_init().unwrap();
@@ -223,6 +430,163 @@ mod tests {
             flags: 0,
             padding: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn reader_pool_opens_lazily_and_stays_bounded() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, b"reader-pool").unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let factory_path = path.clone();
+        let factory_count = open_count.clone();
+        let opener: ReaderOpener = Arc::new(move |_| {
+            let path = factory_path.clone();
+            let open_count = factory_count.clone();
+            Box::pin(async move {
+                open_count.fetch_add(1, Ordering::Relaxed);
+                Ok(UnifiedReader::Local(LocalReader::new(&path, 4096)?))
+            })
+        });
+        let conf = FuseConf {
+            per_handle_read_parallel: 2,
+            ..Default::default()
+        };
+        let initial = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let pool = ReaderPool::new(&conf, Some(opener), initial);
+
+        let first = pool.acquire().await.unwrap();
+        assert_eq!(
+            open_count.load(Ordering::Relaxed),
+            0,
+            "initial reader is reused"
+        );
+
+        let second = pool.acquire().await.unwrap();
+        assert_eq!(
+            open_count.load(Ordering::Relaxed),
+            1,
+            "the second concurrent lease opens exactly one reader"
+        );
+
+        assert!(
+            timeout(Duration::from_millis(20), pool.acquire())
+                .await
+                .is_err(),
+            "pool must wait instead of opening beyond per_handle_read_parallel"
+        );
+
+        pool.release(first).await.unwrap();
+        let third = pool.acquire().await.unwrap();
+        assert_eq!(
+            open_count.load(Ordering::Relaxed),
+            1,
+            "an available reader is reused without another open"
+        );
+        pool.release(second).await.unwrap();
+        pool.release(third).await.unwrap();
+        let _ = std::fs::remove_file(&path_buf);
+    }
+
+    #[tokio::test]
+    async fn reader_pool_falls_back_when_expansion_fails() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_fallback_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, b"reader-pool-fallback").unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let factory_count = open_count.clone();
+        let opener: ReaderOpener = Arc::new(move |_| {
+            let open_count = factory_count.clone();
+            Box::pin(async move {
+                open_count.fetch_add(1, Ordering::Relaxed);
+                Err(FsError::common("reader pool expansion failed"))
+            })
+        });
+        let conf = FuseConf {
+            per_handle_read_parallel: 2,
+            ..Default::default()
+        };
+        let initial = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let pool = ReaderPool::new(&conf, Some(opener), initial);
+
+        let first = pool.acquire().await.unwrap();
+        let waiting_pool = pool.clone();
+        let waiting = tokio::spawn(async move { waiting_pool.acquire().await });
+        for _ in 0..20 {
+            if open_count.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            open_count.load(Ordering::Relaxed),
+            1,
+            "the waiting request first attempts one pool expansion"
+        );
+
+        pool.release(first).await.unwrap();
+        let second = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting request should fall back to the initial reader")
+            .unwrap()
+            .unwrap();
+        assert!(
+            pool.state.lock().expansion_failed,
+            "a failed expansion must disable retries for this handle"
+        );
+        pool.release(second).await.unwrap();
+        let _ = std::fs::remove_file(&path_buf);
+    }
+
+    #[tokio::test]
+    async fn reader_pool_preserves_stream_channel_backpressure() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_backpressure_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, b"reader-pool-backpressure").unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let conf = FuseConf {
+            per_handle_read_parallel: 2,
+            stream_channel_size: 1,
+            ..Default::default()
+        };
+        let initial = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let opener: ReaderOpener = Arc::new(|_| unreachable!());
+        let pool = ReaderPool::new(&conf, Some(opener), initial);
+
+        let first = pool.begin_read().await.unwrap();
+        let second = pool.begin_read().await.unwrap();
+        let third = pool.begin_read().await.unwrap();
+
+        let waiting_pool = pool.clone();
+        let mut waiting = tokio::spawn(async move { waiting_pool.begin_read().await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "two active readers plus one queued request must apply backpressure"
+        );
+
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(
+            timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let _ = std::fs::remove_file(&path_buf);
     }
 
     #[test]

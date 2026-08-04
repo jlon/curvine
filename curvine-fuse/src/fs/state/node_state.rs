@@ -412,7 +412,12 @@ impl NodeState {
 
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
         let reader = self.fs.open(path).await?;
-        let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
+        let reader = FuseReader::new_with_filesystem(
+            &self.conf,
+            self.fs.clone_runtime(),
+            self.fs.clone(),
+            reader,
+        );
         Ok(reader)
     }
 

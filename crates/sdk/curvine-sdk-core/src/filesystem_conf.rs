@@ -14,7 +14,7 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use curvine_config::{ClientConf, ClusterConf};
+use curvine_config::{ClientConf, ClusterConf, TransferConf};
 use curvine_core_error::{err_box, try_err};
 use curvine_error::FsResult;
 use curvine_net::net::InetAddr;
@@ -116,6 +116,17 @@ pub struct FilesystemConf {
     pub large_file_size: String,
     pub max_read_parallel: i64,
     pub sequential_read_threshold: u64,
+
+    /// Client-side Transfer routing only. Service-side store and scheduler settings remain
+    /// owned by the Transfer process configuration.
+    pub transfer: TransferClientConf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TransferClientConf {
+    pub enabled: bool,
+    pub endpoints: Vec<String>,
 }
 
 impl FilesystemConf {
@@ -272,9 +283,37 @@ impl FilesystemConf {
         let mut cluster = ClusterConf {
             client,
             log,
+            transfer: TransferConf {
+                enabled: self.transfer.enabled,
+                endpoints: self.transfer.endpoints,
+                ..Default::default()
+            },
             ..Default::default()
         };
         cluster.client.init()?;
+        cluster.transfer.init()?;
         Ok(cluster)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilesystemConf, TransferClientConf};
+
+    #[test]
+    fn keeps_transfer_routing_in_cluster_conf() {
+        let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
+        conf.transfer = TransferClientConf {
+            enabled: true,
+            endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
+        };
+
+        let cluster = conf.into_cluster_conf().unwrap();
+
+        assert!(cluster.transfer.enabled);
+        assert_eq!(
+            cluster.transfer.endpoints,
+            vec!["transfer-0:9010", "transfer-1:9010"]
+        );
     }
 }

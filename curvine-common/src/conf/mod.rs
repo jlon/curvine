@@ -12,29 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_config::{
-    CliConf, ClientConf, ClientConfCliOverrides, FuseConf, JobConf, TransferConf,
-    TransferStoreType, UfsConf, UfsConfBuilder,
-};
-
+pub use curvine_config::*;
 pub use curvine_fault::FaultHttpConfig;
+pub use curvine_raft::conf::JournalConfExt;
 
-mod master_conf;
-pub use self::master_conf::*;
-
-mod worker_conf;
-pub use self::worker_conf::*;
-
-mod cluster_conf;
-pub use self::cluster_conf::*;
-
-pub use curvine_raft::conf::JournalConf;
-
-mod spdk_conf;
 #[cfg(test)]
 mod tests {
-    use crate::conf::{ClusterConf, WorkerDataDir};
-    use crate::state::StorageType;
+    use curvine_config::{ClusterConf, WorkerDataDir};
+    use curvine_model::StorageType;
     use orpc::common::ByteUnit;
 
     #[test]

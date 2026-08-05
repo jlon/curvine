@@ -128,6 +128,21 @@ impl FsReaderParallel {
         self.parallel_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_chunk_size(&self) -> usize {
+        self.inner.fs_context().read_chunk_size()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_ahead_enabled(&self) -> bool {
+        self.inner.fs_context().conf().client.enable_read_ahead
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pos(&self) -> i64 {
+        self.inner.pos()
+    }
+
     pub async fn read(&mut self) -> FsResult<FileChunk> {
         match self.cur_idx {
             None => {

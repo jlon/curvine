@@ -172,6 +172,32 @@ impl ReaderAdapter {
             ReaderAdapter::Base(r) => r.seek(pos).await,
         }
     }
+
+    async fn resume(&mut self, pos: i64) -> FsResult<()> {
+        match self {
+            ReaderAdapter::Buffer(r) => {
+                r.seek(pos).await?;
+                r.pause(pos, false).await
+            }
+            ReaderAdapter::Base(r) => r.seek(pos).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn pos(&self) -> i64 {
+        match self {
+            ReaderAdapter::Buffer(_) => unreachable!("test uses unbuffered readers"),
+            ReaderAdapter::Base(r) => r.pos(),
+        }
+    }
+
+    #[cfg(test)]
+    fn prefetch_not_started(&self) -> bool {
+        match self {
+            ReaderAdapter::Buffer(r) => r.prefetch.is_some(),
+            ReaderAdapter::Base(_) => false,
+        }
+    }
 }
 
 // Reader with buffer.
@@ -358,9 +384,7 @@ impl FsReaderBuffer {
             .record_read(start_pos, self.pos, &self.path);
 
         if is_changed && self.read_detector.is_sequential() {
-            for reader in &mut self.readers {
-                reader.pause(self.pos, false).await?;
-            }
+            self.resume_sequential_readers().await?;
         }
 
         Ok(bytes)
@@ -372,15 +396,28 @@ impl FsReaderBuffer {
         }
 
         self.read_detector.record_seek(&self.path);
-        for reader in &mut self.readers {
-            reader.seek(pos).await?;
+        if self.read_detector.is_random() {
+            // Random reads always select the base reader. Do not start and seek
+            // sequential prefetch readers that cannot serve this request.
+            self.readers[self.base_reader_index].seek(pos).await?;
+        } else {
+            for reader in &mut self.readers {
+                reader.seek(pos).await?;
 
-            if !self.read_detector.enabled {
-                reader.pause(pos, false).await?;
+                if !self.read_detector.enabled {
+                    reader.pause(pos, false).await?;
+                }
             }
         }
 
         self.pos = pos;
+        Ok(())
+    }
+
+    async fn resume_sequential_readers(&mut self) -> FsResult<()> {
+        for reader in &mut self.readers {
+            reader.resume(self.pos).await?;
+        }
         Ok(())
     }
 
@@ -464,7 +501,7 @@ impl FsReaderBuffer {
 mod tests {
     use super::*;
     use curvine_config::ClusterConf;
-    use curvine_model::FileStatus;
+    use curvine_model::{ExtendedBlock, FileStatus, LocatedBlock};
 
     fn sparse_file_blocks(len: i64) -> FileBlocks {
         FileBlocks::new(
@@ -476,6 +513,53 @@ mod tests {
             },
             vec![],
         )
+    }
+
+    fn file_blocks(len: i64) -> FileBlocks {
+        FileBlocks::new(
+            FileStatus {
+                id: 1,
+                len,
+                is_complete: true,
+                ..Default::default()
+            },
+            vec![LocatedBlock {
+                block: ExtendedBlock {
+                    id: 1,
+                    len,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        )
+    }
+
+    fn reader_for_seek(
+        enable_smart_prefetch: bool,
+        read_chunk_num: usize,
+    ) -> (Arc<Runtime>, FsReaderBuffer) {
+        let mut conf = ClusterConf::default();
+        conf.client.enable_smart_prefetch = enable_smart_prefetch;
+        conf.client.read_parallel = 4;
+        conf.client.read_chunk_num = read_chunk_num;
+        conf.client.sequential_read_threshold = 1;
+        conf.client.read_chunk_size_str = "64KB".to_string();
+        conf.client.read_slice_size_str = "1MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.init().unwrap();
+
+        let len = conf.client.read_slice_size * 4;
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let rt = fs_context.clone_runtime();
+        let read_detector = ReadDetector::with_conf(&fs_context.conf().client, len);
+        let reader = FsReaderBuffer::new(
+            Path::from_str("/seek-reader").unwrap(),
+            fs_context,
+            file_blocks(len),
+            read_detector,
+        )
+        .unwrap();
+        (rt, reader)
     }
 
     #[test]
@@ -500,5 +584,74 @@ mod tests {
         rt.block_on(reader.seek(file_len)).unwrap();
         assert!(reader.read_detector.is_random());
         assert!(reader.get_reader().is_ok());
+    }
+
+    #[test]
+    fn random_seek_repositions_only_the_base_reader() {
+        let (rt, mut reader) = reader_for_seek(true, 1);
+
+        let seek_pos = 64 * 1024;
+        rt.block_on(reader.seek(seek_pos)).unwrap();
+
+        assert!(reader.read_detector.is_random());
+        for sequential_reader in &reader.readers[..reader.base_reader_index] {
+            assert_eq!(sequential_reader.pos(), 0);
+        }
+        assert_eq!(reader.readers[reader.base_reader_index].pos(), seek_pos);
+    }
+
+    #[test]
+    fn random_seek_does_not_start_sequential_prefetch() {
+        let (rt, mut reader) = reader_for_seek(true, 8);
+
+        rt.block_on(reader.seek(64 * 1024)).unwrap();
+
+        assert!(reader.read_detector.is_random());
+        assert!(reader.readers[..reader.base_reader_index]
+            .iter()
+            .all(ReaderAdapter::prefetch_not_started));
+    }
+
+    #[test]
+    fn seek_keeps_all_readers_aligned_without_smart_prefetch() {
+        let (rt, mut reader) = reader_for_seek(false, 1);
+
+        let seek_pos = 64 * 1024;
+        rt.block_on(reader.seek(seek_pos)).unwrap();
+
+        assert!(reader.read_detector.is_sequential());
+        for (index, sequential_reader) in reader.readers.iter().enumerate() {
+            let expected = if index == reader.base_reader_index {
+                seek_pos
+            } else {
+                seek_pos.max(index as i64 * reader.slice_size)
+            };
+            assert_eq!(sequential_reader.pos(), expected);
+        }
+    }
+
+    #[test]
+    fn sequential_transition_realigns_readers_after_a_random_seek() {
+        let (rt, mut reader) = reader_for_seek(true, 1);
+        let seek_pos = 64 * 1024;
+        let read_end = seek_pos + 64 * 1024;
+
+        rt.block_on(reader.seek(seek_pos)).unwrap();
+        assert!(reader.read_detector.is_random());
+        reader.pos = read_end;
+        assert!(reader
+            .read_detector
+            .record_read(seek_pos, read_end, &reader.path));
+        assert!(reader.read_detector.is_sequential());
+
+        rt.block_on(reader.resume_sequential_readers()).unwrap();
+        for (index, sequential_reader) in reader.readers.iter().enumerate() {
+            let expected = if index == reader.base_reader_index {
+                read_end
+            } else {
+                read_end.max(index as i64 * reader.slice_size)
+            };
+            assert_eq!(sequential_reader.pos(), expected);
+        }
     }
 }

@@ -428,6 +428,13 @@ impl NodeState {
         Ok(())
     }
 
+    // With FUSE write-back caching, the kernel may issue a READ on an O_WRONLY
+    // handle to complete a partially written page. Curvine-backed write handles
+    // therefore need a reader even when userspace requested write-only access.
+    fn write_handle_needs_reader(mode: OpenFlags, write_back_cache: bool) -> bool {
+        mode == OpenFlags::RDWR || (mode == OpenFlags::WRONLY && write_back_cache)
+    }
+
     pub async fn new_handle(
         &self,
         ino: Option<u64>,
@@ -470,18 +477,18 @@ impl NodeState {
             }
         };
 
-        let reader = if mode == OpenFlags::RDWR {
-            if writer.is_ufs() {
+        let reader = if writer.is_ufs() {
+            if mode == OpenFlags::RDWR {
                 warn!(
                     "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
                     path,
                     writer.path().full_path()
                 );
-                None
-            } else {
-                let reader = self.new_reader(path).await?;
-                Some(RawPtr::from_owned(reader))
             }
+            None
+        } else if Self::write_handle_needs_reader(mode, self.conf.write_back_cache) {
+            let reader = self.new_reader(path).await?;
+            Some(RawPtr::from_owned(reader))
         } else {
             None
         };
@@ -1430,7 +1437,7 @@ mod test {
     use curvine_fs_api::Writer;
     use curvine_fs_api::{ListStream, Path};
     use curvine_fs_api::{StateReader, StateWriter};
-    use curvine_model::FileStatus;
+    use curvine_model::{FileStatus, OpenFlags};
     use curvine_runtime::common::{FastHashMap, Utils};
     use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use std::sync::Arc;
@@ -1492,6 +1499,19 @@ mod test {
 
         let (removed, did_remove) = NodeState::map_remove_handle(&mut map, 1, 99);
         assert!(removed.is_none() && !did_remove);
+    }
+
+    #[test]
+    fn writeback_write_only_curvine_handle_needs_reader() {
+        assert!(NodeState::write_handle_needs_reader(OpenFlags::RDWR, false));
+        assert!(NodeState::write_handle_needs_reader(
+            OpenFlags::WRONLY,
+            true
+        ));
+        assert!(!NodeState::write_handle_needs_reader(
+            OpenFlags::WRONLY,
+            false
+        ));
     }
 
     #[test]

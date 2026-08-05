@@ -29,6 +29,8 @@ use log::error;
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
 
+const RANDOM_READ_CHUNK_SIZE_MAX: usize = 128 * 1024;
+
 // Control task type
 enum ReadTask {
     Seek(i64, CallSender<i8>),
@@ -231,8 +233,16 @@ impl FsReaderBuffer {
         let pos = 0;
         let len = file_blocks.status.len;
 
+        let random_context = if read_detector.enabled
+            && (chunk_size > RANDOM_READ_CHUNK_SIZE_MAX || conf.enable_read_ahead)
+        {
+            fs_context.with_random_read_options(chunk_size.min(RANDOM_READ_CHUNK_SIZE_MAX))
+        } else {
+            fs_context.clone()
+        };
+
         let base = FsReaderParallel::from_base(
-            FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone()),
+            FsReaderBase::new(path.clone(), random_context, file_blocks.clone()),
             read_detector.read_parallel() as usize,
             slice_size,
             vec![FileSlice::new(0, len)],
@@ -610,6 +620,53 @@ mod tests {
         assert!(reader.readers[..reader.base_reader_index]
             .iter()
             .all(ReaderAdapter::prefetch_not_started));
+    }
+
+    #[test]
+    fn random_base_reader_uses_small_chunks_without_prefetch() {
+        let mut conf = ClusterConf::default();
+        conf.client.enable_smart_prefetch = true;
+        conf.client.read_parallel = 1;
+        conf.client.read_chunk_size_str = "512KB".to_string();
+        conf.client.read_slice_size_str = "4MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.init().unwrap();
+
+        let len = conf.client.read_slice_size;
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let read_detector = ReadDetector::with_conf(&fs_context.conf().client, len);
+        let reader = FsReaderBuffer::new(
+            Path::from_str("/random-reader").unwrap(),
+            fs_context,
+            file_blocks(len),
+            read_detector,
+        )
+        .unwrap();
+
+        let ReaderAdapter::Base(random_reader) = &reader.readers[reader.base_reader_index] else {
+            panic!("random reader must be unbuffered")
+        };
+        let ReaderAdapter::Buffer(sequential_reader) = &reader.readers[0] else {
+            panic!("sequential reader must keep its prefetch buffer")
+        };
+
+        assert_eq!(random_reader.read_chunk_size(), RANDOM_READ_CHUNK_SIZE_MAX);
+        assert!(!random_reader.read_ahead_enabled());
+        assert_eq!(
+            sequential_reader
+                .prefetch
+                .as_ref()
+                .unwrap()
+                .reader
+                .read_chunk_size(),
+            512 * 1024
+        );
+        assert!(sequential_reader
+            .prefetch
+            .as_ref()
+            .unwrap()
+            .reader
+            .read_ahead_enabled());
     }
 
     #[test]

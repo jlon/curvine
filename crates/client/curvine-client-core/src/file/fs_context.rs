@@ -182,6 +182,32 @@ impl FsContext {
         self.os_cache.clone()
     }
 
+    /// Build a context for random reads without allocating another RPC runtime or
+    /// connection pool. Random readers use smaller block reads and must not ask
+    /// workers or the local page cache to prefetch contiguous data.
+    pub(crate) fn with_random_read_options(&self, read_chunk_size: usize) -> Arc<Self> {
+        let mut conf = self.conf.clone();
+        conf.client.read_chunk_size = read_chunk_size;
+        conf.client.read_chunk_size_str = format!("{read_chunk_size}B");
+        conf.client.enable_read_ahead = false;
+        conf.client.read_ahead_len = 0;
+        conf.client.read_ahead_len_str = "0B".to_owned();
+
+        Arc::new(Self {
+            conf,
+            connector: self.connector.clone(),
+            client_addr: self.client_addr.clone(),
+            os_cache: CacheManager::new(
+                false,
+                0,
+                self.os_cache.drop_cache_len,
+                read_chunk_size as i64,
+            ),
+            failed_workers: self.failed_workers.clone(),
+            block_pool: self.block_pool.clone(),
+        })
+    }
+
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
         CLIENT_METRICS.get().expect("client get metrics error!")
     }
@@ -265,5 +291,31 @@ impl FsContext {
     async fn metrics_report(context: &Arc<FsContext>) -> FsResult<()> {
         let metrics = ClientMetrics::encode()?;
         FsClient::new(context.clone()).metrics_report(metrics).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_read_context_uses_small_chunks_without_prefetch() {
+        let mut conf = ClusterConf::default();
+        conf.client.read_chunk_size_str = "512KB".to_owned();
+        conf.client.read_chunk_num = 8;
+        conf.client.init().unwrap();
+
+        let context = FsContext::new(conf).unwrap();
+        let random = context.with_random_read_options(128 * 1024);
+
+        assert_eq!(random.read_chunk_size(), 128 * 1024);
+        assert_eq!(random.conf.client.read_chunk_size_str, "131072B");
+        assert!(!random.conf.client.enable_read_ahead);
+        assert_eq!(random.conf.client.read_ahead_len, 0);
+        assert_eq!(random.conf.client.read_ahead_len_str, "0B");
+        assert!(!random.os_cache.enable);
+        assert_eq!(random.os_cache.chunk_size, 128 * 1024);
+        assert!(Arc::ptr_eq(&context.connector, &random.connector));
+        assert!(Arc::ptr_eq(&context.block_pool, &random.block_pool));
     }
 }

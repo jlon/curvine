@@ -28,6 +28,19 @@ use curvine_runtime::sync::AtomicCounter;
 use log::info;
 use std::collections::hash_map::Iter;
 
+/// Snapshot of dentry state before `unlink`, used to roll back local mutations when
+/// the master delete fails.
+#[derive(Debug, Clone)]
+pub struct UnlinkRollback {
+    pub ino: u64,
+    pub parent: u64,
+    pub name: String,
+    pub set_inode_mark_delete: bool,
+    pub canonical_parent: u64,
+    pub canonical_name: String,
+    pub repointed: bool,
+}
+
 pub struct DirTree {
     inodes: FastHashMap<u64, Inode>,
     id_creator: AtomicCounter,
@@ -271,20 +284,31 @@ impl DirTree {
         self.get_inode_mut_check(ino, None)
     }
 
-    pub fn unlink(&mut self, parent: u64, name: &str, mark_delete: bool) -> FuseResult<()> {
+    pub fn unlink(
+        &mut self,
+        parent: u64,
+        name: &str,
+        mark_delete: bool,
+    ) -> FuseResult<(bool, UnlinkRollback)> {
         let ino = self.get_ino_check(parent, Some(name))?;
-        let should_remove = {
+        let (canonical_parent, canonical_name, was_canonical) = {
+            let inode = self.get_inode_check(ino, None)?;
+            let was_canonical = inode.parent == parent && inode.name == name;
+            (inode.parent, inode.name.clone(), was_canonical)
+        };
+        let (last_link, should_remove, set_inode_mark_delete) = {
             let inode = self.get_inode_mut_check(ino, None)?;
             // Only mark the whole inode deleted when removing its last link.
             // Otherwise remaining hardlink names would see is_deleted() and
             // LOOKUP would spuriously return ENOENT (LTP prot_hsymlinks cleanup).
             let last_link = inode.nlink <= 1;
-            if mark_delete && last_link {
+            let set_inode_mark_delete = mark_delete && last_link;
+            if set_inode_mark_delete {
                 inode.mark_delete = true;
             }
             inode.sub_ref(1);
             inode.sub_link(1);
-            inode.should_unref()
+            (last_link, inode.should_unref(), set_inode_mark_delete)
         };
 
         // Remove directory entry; keep parent inode's `DirEntry` even when `children` is empty.
@@ -294,11 +318,82 @@ impl DirTree {
             dir.mark_deleted_child(name);
         }
 
+        // get_path(ino) is used for subsequent opens. If the canonical dentry
+        // was removed, repoint it at one of the surviving hard-link names.
+        let mut repointed = false;
+        if !last_link && was_canonical {
+            let replacement = self.inodes.iter().find_map(|(parent_ino, parent_inode)| {
+                parent_inode.dir.as_ref().and_then(|entry| {
+                    entry.children.iter().find_map(|(child_name, child_ino)| {
+                        (*child_ino == ino).then(|| (*parent_ino, child_name.clone()))
+                    })
+                })
+            });
+            if let Some((new_parent, new_name)) = replacement {
+                let inode = self.get_inode_mut_check(ino, None)?;
+                inode.parent = new_parent;
+                inode.name = new_name;
+                repointed = true;
+            }
+        }
+
         if should_remove && !mark_delete {
             self.remove_inode(ino);
         }
 
+        let rollback = UnlinkRollback {
+            ino,
+            parent,
+            name: name.to_owned(),
+            set_inode_mark_delete,
+            canonical_parent,
+            canonical_name,
+            repointed,
+        };
+        Ok((last_link, rollback))
+    }
+
+    pub fn restore_unlink(&mut self, rb: UnlinkRollback) -> FuseResult<()> {
+        if self.get_inode(rb.ino, None).is_none() {
+            return Ok(());
+        }
+
+        if rb.repointed {
+            let inode = self.get_inode_mut_check(rb.ino, None)?;
+            inode.parent = rb.canonical_parent;
+            inode.name = rb.canonical_name.clone();
+        }
+
+        {
+            let inode = self.get_inode_mut_check(rb.ino, None)?;
+            inode.add_ref(1);
+            inode.add_link(1);
+            inode.mark_delete = false;
+        }
+
+        let parent_dir = self.get_dir_mut_check(rb.parent)?;
+        parent_dir.add_child(rb.name, rb.ino);
         Ok(())
+    }
+
+    pub fn canonical_matches(&self, ino: u64, parent: u64, name: &str) -> bool {
+        self.get_inode(ino, None)
+            .is_some_and(|inode| inode.parent == parent && inode.name == name)
+    }
+
+    pub fn repoint_canonical(&mut self, ino: u64, parent: u64, name: String) -> FuseResult<()> {
+        let inode = self.get_inode_mut_check(ino, None)?;
+        inode.parent = parent;
+        inode.name = name;
+        Ok(())
+    }
+
+    pub fn cached_dir_inos(&self) -> Vec<u64> {
+        self.inodes
+            .iter()
+            .filter(|(_, inode)| inode.status.is_dir)
+            .map(|(ino, _)| *ino)
+            .collect()
     }
 
     pub fn forget(&mut self, ino: u64, n_lookup: u64) -> FuseResult<()> {
@@ -455,7 +550,10 @@ impl DirTree {
         inode.add_link(1);
 
         inode.update_status(status);
-        inode.name = new_name.to_string();
+        // Hardlinks share one inode across multiple (parent, name) dentries.
+        // Keep the original primary parent/name so get_path / clear_mark_delete
+        // and deferred-delete do not jump to the newest hardlink location.
+        // Unlink/lookup resolve paths via the caller's (parent, name), not these fields.
 
         Ok(inode)
     }
@@ -990,6 +1088,55 @@ mod test {
         assert_eq!(t.get_inode_check(f, None).unwrap().ref_ctr, n_ref + 1);
         assert_eq!(t.get_inode_check(f, None).unwrap().n_lookup, n_lookup + 1);
         assert_eq!(t.get_inode(400, Some("hard")).unwrap().ino, f);
+    }
+
+    /// Hard links must not rewrite the inode's canonical parent/name; get_path
+    /// needs a stable source path for subsequent linkat calls.
+    #[test]
+    fn hard_link_preserves_source_path() {
+        let mut t = DirTree::default();
+        t.lookup(FUSE_ROOT_ID, "olddir", dir_st("olddir", 500), true)
+            .unwrap();
+        t.lookup(FUSE_ROOT_ID, "newdir", dir_st("newdir", 501), true)
+            .unwrap();
+        let f = t
+            .lookup(500, "oldfile", file_st("oldfile", 0), true)
+            .unwrap()
+            .ino;
+        let before = t.get_path(f).unwrap().full_path().to_string();
+        let mut link_status = file_st("newfile", f as i64);
+        link_status.nlink = 2;
+        t.link(f, 501, "newfile", link_status).unwrap();
+        let after = t.get_path(f).unwrap().full_path().to_string();
+        assert_eq!(after, before);
+        assert!(after.contains("olddir"));
+        assert!(after.contains("oldfile"));
+
+        t.unlink(500, "oldfile", true).unwrap();
+        let surviving_path = t.get_path(f).unwrap().full_path().to_string();
+        assert!(surviving_path.contains("newdir"), "{surviving_path}");
+        assert!(surviving_path.contains("newfile"));
+        assert!(!surviving_path.contains("oldfile"));
+    }
+
+    #[test]
+    fn unlink_rollback_restores_dentry_and_link_count() {
+        let mut t = DirTree::default();
+        let mut st = file_st("f", 0);
+        st.nlink = 1;
+        let f = t.lookup(FUSE_ROOT_ID, "f", st, true).unwrap().ino;
+        let nlink_before = t.get_inode_check(f, None).unwrap().nlink;
+        let (_, rollback) = t.unlink(FUSE_ROOT_ID, "f", true).unwrap();
+        assert!(t.get_inode(FUSE_ROOT_ID, Some("f")).is_none());
+        assert_eq!(
+            t.get_inode_check(f, None).unwrap().nlink,
+            nlink_before.saturating_sub(1)
+        );
+
+        t.restore_unlink(rollback).unwrap();
+        assert_eq!(t.get_inode(FUSE_ROOT_ID, Some("f")).unwrap().ino, f);
+        assert_eq!(t.get_inode_check(f, None).unwrap().nlink, nlink_before);
+        assert!(!t.get_inode_check(f, None).unwrap().mark_delete);
     }
 
     /// Hard link: `link` adds ref_ctr; each `unlink` of a dirent subtracts ref_ctr; inode removed when zero (after forget if n_lookup).

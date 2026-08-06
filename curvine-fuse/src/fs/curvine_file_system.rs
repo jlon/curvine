@@ -58,6 +58,11 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    fn is_ofd_lock_pid(pid: u32) -> bool {
+        // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
+        pid == 0 || pid == u32::MAX
+    }
+
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
         FuseMetrics::ensure_init()?;
 
@@ -280,15 +285,11 @@ impl CurvineFileSystem {
         Ok(RenameFlags::from_bits(flags).unwrap_or(RenameFlags::empty()))
     }
 
-    fn to_file_lock(&self, arg: &fuse_lk_in, header_pid: u32) -> FileLock {
+    fn to_file_lock(&self, arg: &fuse_lk_in, _header_pid: u32) -> FileLock {
         let client_id = self.fs.cv().fs_context().clone_client_name();
-        // Prefer the flock pid from the kernel request; fall back to the FUSE
-        // header pid when the kernel leaves lk.pid unset (common on some paths).
-        let pid = if arg.lk.pid != 0 {
-            arg.lk.pid
-        } else {
-            header_pid
-        };
+        // Keep the kernel pid intact. OFD locks use either 0 or -1 depending on
+        // the kernel and are owned by the open file description, not a process.
+        let pid = arg.lk.pid;
         FileLock {
             client_id,
             owner_id: arg.owner,
@@ -2141,6 +2142,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks: u64 = 0;
         let time = TimeSpent::new();
 
+        // Linux reports OFD locks with lk.pid == 0 or -1 and does not perform
+        // deadlock detection for F_OFD_SETLKW; keep them out of the POSIX wait graph.
+        let detect_deadlock = !Self::is_ofd_lock_pid(op.arg.lk.pid);
         let mut lock = self.to_file_lock(op.arg, op.header.pid);
         let is_unlock = lock.lock_type == LockType::UnLock;
         let full_range_unlock = Self::is_full_range_unlock(&lock);
@@ -2175,8 +2179,17 @@ impl fs::FileSystem for CurvineFileSystem {
             }
 
             let blocker = conflict.as_ref().expect("conflict lock");
-            let decision = wait_guard
-                .register_blocked_by(LockOwner::new(blocker.client_id.clone(), blocker.owner_id));
+            // An OFD blocker (pid == 0) does not represent a process wait edge,
+            // so a POSIX waiter blocked by it cannot close a POSIX deadlock cycle.
+            let decision = if detect_deadlock && !Self::is_ofd_lock_pid(blocker.pid) {
+                Some(wait_guard.register_blocked_by(LockOwner::new(
+                    blocker.client_id.clone(),
+                    blocker.owner_id,
+                )))
+            } else {
+                wait_guard.clear_blocked_by();
+                None
+            };
             debug!(
                 "plock SETLKW wait decision unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
                 op.header.unique,
@@ -2192,7 +2205,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 blocker.end,
                 decision
             );
-            if decision.is_deadlock() {
+            if decision
+                .as_ref()
+                .is_some_and(PlockWaitDecision::is_process_deadlock)
+            {
                 // Cycle in the local wait graph. Re-sample Master once while
                 // keeping our edge published so a peer in a true multi-resource
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
@@ -2212,10 +2228,15 @@ impl fs::FileSystem for CurvineFileSystem {
                     return Ok(());
                 }
                 let blocker2 = conflict2.as_ref().expect("conflict lock");
-                let decision2 = wait_guard.register_blocked_by(LockOwner::new(
-                    blocker2.client_id.clone(),
-                    blocker2.owner_id,
-                ));
+                let decision2 = if !Self::is_ofd_lock_pid(blocker2.pid) {
+                    Some(wait_guard.register_blocked_by(LockOwner::new(
+                        blocker2.client_id.clone(),
+                        blocker2.owner_id,
+                    )))
+                } else {
+                    wait_guard.clear_blocked_by();
+                    None
+                };
                 debug!(
                     "plock SETLKW deadlock recheck unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] blocker_pid={} blocker_owner_id={} blocker_range=[{},{}] decision={:?}",
                     op.header.unique,
@@ -2231,19 +2252,21 @@ impl fs::FileSystem for CurvineFileSystem {
                     blocker2.end,
                     decision2
                 );
-                if let PlockWaitDecision::Deadlock { cycle, .. } = decision2 {
-                    debug!(
-                        "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
-                        op.header.unique,
-                        lock.pid,
-                        lock.owner_id,
-                        op.header.nodeid,
-                        path,
-                        lock.start,
-                        lock.end,
-                        cycle
-                    );
-                    return err_fuse!(libc::EDEADLK);
+                if let Some(PlockWaitDecision::Deadlock { cycle, .. }) = decision2 {
+                    if cycle.spans_multiple_processes() {
+                        debug!(
+                            "plock SETLKW returning EDEADLK unique={} pid={} owner_id={} nodeid={} path={} range=[{},{}] cycle={:?}",
+                            op.header.unique,
+                            lock.pid,
+                            lock.owner_id,
+                            op.header.nodeid,
+                            path,
+                            lock.start,
+                            lock.end,
+                            cycle
+                        );
+                        return err_fuse!(libc::EDEADLK);
+                    }
                 }
             }
 
@@ -2836,11 +2859,7 @@ mod tests {
 
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC
-            | FUSE_POSIX_ACL
-            | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | FUSE_INIT_EXT;
+        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
         let conf = init_conf(false, false);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
@@ -2850,13 +2869,14 @@ mod tests {
         );
     }
 
-    // EXPORT_SUPPORT stays out: Curvine cannot serve kernel `.`/`..` handle reconstruction.
+    // Root `.`/`..` lookup reconstruction is supported, so kernel file handles
+    // remain valid across dcache eviction.
     #[test]
-    fn export_support_not_in_allowlist() {
+    fn export_support_is_in_allowlist() {
         assert_eq!(
             SUPPORTED_INIT_FLAGS & FUSE_EXPORT_SUPPORT,
-            0,
-            "FUSE_EXPORT_SUPPORT must not be advertised until root `.`/`..` lookup works"
+            FUSE_EXPORT_SUPPORT,
+            "FUSE_EXPORT_SUPPORT must be advertised when root lookup works"
         );
     }
 
@@ -2909,11 +2929,7 @@ mod tests {
     #[test]
     fn negotiate_out_flags_containment() {
         let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
-        let unsafe_bits = FUSE_ATOMIC_O_TRUNC
-            | FUSE_POSIX_ACL
-            | FUSE_HAS_IOCTL_DIR
-            | FUSE_EXPORT_SUPPORT
-            | FUSE_INIT_EXT;
+        let unsafe_bits = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
         let allowed = SUPPORTED_INIT_FLAGS | splice | FUSE_WRITEBACK_CACHE;
         let conf = init_conf(true, true);
         let out = CurvineFileSystem::negotiate_out_flags(u32::MAX, &conf);

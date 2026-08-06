@@ -195,7 +195,21 @@ impl BlockReader {
                     {
                         Ok(LocalReaderOpen::Local(reader)) => Ok(Local(reader)),
                         Ok(LocalReaderOpen::Remote(reader)) => Ok(Remote(reader)),
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            warn!(
+                                "fail to create local block reader for {}, falling back to remote: {}",
+                                loc, e
+                            );
+                            BlockReaderRemote::new(
+                                &fs_context,
+                                block.clone(),
+                                loc.clone(),
+                                off,
+                                len,
+                            )
+                            .await
+                            .map(Remote)
+                        }
                     }
                 } else {
                     BlockReaderRemote::new(&fs_context, block.clone(), loc.clone(), off, len)

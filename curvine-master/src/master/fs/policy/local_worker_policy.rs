@@ -16,10 +16,12 @@ use crate::master::fs::policy::{ChooseContext, RobinWorkerPolicy, WorkerPolicy};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{WorkerAddress, WorkerInfo};
 use indexmap::IndexMap;
+use std::collections::HashSet;
 
 /// Local workers are preferred, and polling policies are used if there are no local workers
 pub struct LocalWorkerPolicy {
     inner: RobinWorkerPolicy,
+    local_only_workers: HashSet<String>,
 }
 
 impl Default for LocalWorkerPolicy {
@@ -30,8 +32,29 @@ impl Default for LocalWorkerPolicy {
 
 impl LocalWorkerPolicy {
     pub fn new() -> Self {
+        Self::with_local_only_workers(&[])
+    }
+
+    pub fn with_local_only_workers(local_only_workers: &[String]) -> Self {
         Self {
             inner: RobinWorkerPolicy::new(),
+            local_only_workers: local_only_workers.iter().cloned().collect(),
+        }
+    }
+
+    fn exclude_local_only_workers(
+        &self,
+        workers: &IndexMap<u32, WorkerInfo>,
+        excluded: &mut HashSet<u32>,
+    ) {
+        if self.local_only_workers.is_empty() {
+            return;
+        }
+
+        for (id, worker) in workers {
+            if self.local_only_workers.contains(&worker.address.hostname) {
+                excluded.insert(*id);
+            }
         }
     }
 }
@@ -66,6 +89,7 @@ impl WorkerPolicy for LocalWorkerPolicy {
 
         let replicas = ctx.replicas;
         if res.len() < replicas as usize {
+            self.exclude_local_only_workers(workers, &mut ctx.exclude_workers);
             let remote_res = self.inner.choose(workers, ctx)?;
             for item in remote_res {
                 res.push(item);
@@ -84,7 +108,67 @@ impl WorkerPolicy for LocalWorkerPolicy {
         count: Option<usize>,
         exclude_workers: Vec<u32>,
     ) -> CommonResult<Vec<WorkerAddress>> {
-        // Since you do not rely on block information, you cannot judge the local worker, and use the polling strategy directly
-        self.inner.choose_workers(workers, count, exclude_workers)
+        // This operation has no client hostname, so local-only workers must not
+        // receive replication or other remote allocations.
+        let mut excluded = HashSet::from_iter(exclude_workers);
+        self.exclude_local_only_workers(workers, &mut excluded);
+        self.inner
+            .choose_workers(workers, count, excluded.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::fs::policy::ChooseContext;
+
+    fn worker(id: u32, hostname: &str) -> WorkerInfo {
+        WorkerInfo {
+            address: WorkerAddress {
+                worker_id: id,
+                hostname: hostname.to_string(),
+                ..Default::default()
+            },
+            capacity: 1024,
+            available: 1024,
+            ..Default::default()
+        }
+    }
+
+    fn context(client_host: &str) -> ChooseContext {
+        ChooseContext {
+            replicas: 1,
+            block_size: 1,
+            storage_policy: Default::default(),
+            client_host: client_host.to_string(),
+            exclude_workers: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn local_only_workers_are_selected_only_for_matching_clients() {
+        let workers = IndexMap::from([(1, worker(1, "node-a")), (2, worker(2, "node-b"))]);
+        let policy = LocalWorkerPolicy::with_local_only_workers(&["node-a".to_string()]);
+
+        let local = policy.choose(&workers, context("node-a")).unwrap();
+        assert_eq!(local[0].worker_id, 1);
+
+        let remote = policy.choose(&workers, context("node-c")).unwrap();
+        assert_eq!(remote[0].worker_id, 2);
+
+        let replication = policy.choose_workers(&workers, Some(1), vec![]).unwrap();
+        assert_eq!(replication[0].worker_id, 2);
+    }
+
+    #[test]
+    fn empty_local_only_workers_keep_remote_fallback() {
+        let workers = IndexMap::from([(1, worker(1, "node-a"))]);
+        let policy = LocalWorkerPolicy::new();
+
+        let remote = policy.choose(&workers, context("node-b")).unwrap();
+        assert_eq!(remote[0].worker_id, 1);
+
+        let replication = policy.choose_workers(&workers, Some(1), vec![]).unwrap();
+        assert_eq!(replication[0].worker_id, 1);
     }
 }

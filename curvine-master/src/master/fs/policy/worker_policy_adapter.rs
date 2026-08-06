@@ -39,8 +39,16 @@ impl WorkerPolicyAdapter {
 
     pub fn from_conf(conf: &ClusterConf) -> CommonResult<Self> {
         let policy_str = conf.master.worker_policy.as_str();
+        if policy_str != Self::LOCAL && !conf.master.local_only_workers.is_empty() {
+            return err_box!(
+                "master.local_only_workers requires master.worker_policy=local, got {}",
+                policy_str
+            );
+        }
         let policy = match policy_str {
-            Self::LOCAL => Local(LocalWorkerPolicy::new()),
+            Self::LOCAL => Local(LocalWorkerPolicy::with_local_only_workers(
+                &conf.master.local_only_workers,
+            )),
             Self::ROBIN => Robin(RobinWorkerPolicy::new()),
             Self::RANDOM => Random(RandomWorkerPolicy::new()),
             Self::LOAD_BASED => LoadBased(LoadBasedWorkerPolicy::new()),
@@ -77,5 +85,22 @@ impl WorkerPolicyAdapter {
             LoadBased(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
             Weighted(ref f) => f.choose_workers(workers, Some(count), exclude_workers),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_only_workers_require_local_policy() {
+        let mut conf = ClusterConf::default();
+        conf.master.worker_policy = WorkerPolicyAdapter::ROBIN.to_string();
+        conf.master.local_only_workers = vec!["node-a".to_string()];
+
+        let err = WorkerPolicyAdapter::from_conf(&conf).err().unwrap();
+        assert!(err
+            .to_string()
+            .contains("requires master.worker_policy=local"));
     }
 }

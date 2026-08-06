@@ -60,6 +60,10 @@ pub struct MasterConf {
     // Worker selects strategy
     pub worker_policy: String,
 
+    /// Worker hostnames reserved for clients on the same host when using the
+    /// `local` policy. They are excluded from remote allocation and replication.
+    pub local_only_workers: Vec<String>,
+
     pub executor_threads: usize,
 
     pub executor_channel_size: usize,
@@ -280,6 +284,7 @@ impl Default for MasterConf {
             block_report_limit: 1000,
 
             worker_policy: "local".to_string(),
+            local_only_workers: vec![],
 
             executor_threads: 10,
             executor_channel_size: 1000,

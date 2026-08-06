@@ -17,7 +17,7 @@ use curvine_core_error::err_box;
 use curvine_error::FsResult;
 use curvine_model::{JobTaskProgress, JobTaskState};
 use curvine_runtime::sync::FastDashMap;
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
@@ -219,10 +219,32 @@ impl JobStore {
     pub fn remove_callbacks(&self, job_id: &str) -> FsResult<()> {
         let mut callbacks = match self.callbacks.write() {
             Ok(callbacks) => callbacks,
-            Err(e) => return err_box!("failed to remove job callbacks for {}: {}", job_id, e),
+            Err(e) => {
+                warn!(
+                    "job callback registry was poisoned while removing callbacks for {}, recovering",
+                    job_id
+                );
+                self.callbacks.clear_poison();
+                e.into_inner()
+            }
         };
         callbacks.remove(job_id);
         Ok(())
+    }
+
+    pub fn remove_job_if<F>(
+        &self,
+        job_id: &str,
+        should_remove: F,
+    ) -> FsResult<Option<(String, JobContext)>>
+    where
+        F: FnOnce(&JobContext) -> bool,
+    {
+        let removed = self.jobs.remove_if(job_id, |_, job| should_remove(job));
+        if removed.is_some() {
+            self.remove_callbacks(job_id)?;
+        }
+        Ok(removed)
     }
 }
 

@@ -321,13 +321,13 @@ impl JournalBatch {
             Err(current_err) => match deserialize_legacy_batch(bytes) {
                 Ok(batch) => {
                     debug!(
-                        "replaying legacy journal batch without rename exchange inode ids, seq_id={}",
+                        "replaying legacy journal batch with pre-extension entry schemas, seq_id={}",
                         batch.seq_id
                     );
                     Ok(batch.into())
                 }
                 Err(legacy_err) => err_box!(
-                    "failed to deserialize journal batch with current or legacy rename schema: current={}, legacy={}",
+                    "failed to deserialize journal batch with current or legacy schemas: current={}, legacy={}",
                     current_err,
                     legacy_err
                 ),
@@ -373,6 +373,17 @@ struct LegacyRenameEntry {
     flags: u32,
 }
 
+// FreeEntry::recursive was appended in #721. Old bincode entries do not have
+// this field, so decoding them with the current type consumes the next entry's
+// enum tag as a bool.
+#[derive(Deserialize)]
+struct LegacyFreeEntry {
+    op_id: u64,
+    rpc_id: i64,
+    path: String,
+    mtime: i64,
+}
+
 #[derive(Deserialize)]
 enum LegacyJournalEntry {
     Mkdir(MkdirEntry),
@@ -389,7 +400,7 @@ enum LegacyJournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
-    Free(FreeEntry),
+    Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
 }
@@ -444,7 +455,13 @@ impl From<LegacyJournalEntry> for JournalEntry {
             LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
             LegacyJournalEntry::Link(entry) => Self::Link(entry),
             LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
-            LegacyJournalEntry::Free(entry) => Self::Free(entry),
+            LegacyJournalEntry::Free(entry) => Self::Free(FreeEntry {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                path: entry.path,
+                mtime: entry.mtime,
+                recursive: false,
+            }),
             LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
             LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
         }

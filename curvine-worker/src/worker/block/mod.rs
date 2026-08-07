@@ -25,3 +25,7 @@ pub use self::block_actor::BlockActor;
 
 mod heartbeat_task;
 pub use self::heartbeat_task::HeartbeatTask;
+
+#[cfg(test)]
+#[path = "tests/heartbeat_task_test.rs"]
+mod heartbeat_task_test;

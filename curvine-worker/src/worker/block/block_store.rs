@@ -296,19 +296,33 @@ impl BlockStore {
     }
 
     // Asynchronously delete block.
-    pub fn async_remove_block(&self, id: i64) -> CommonResult<BlockMeta> {
+    pub fn async_remove_block(&self, id: i64) -> CommonResult<Option<BlockMeta>> {
         let _block_lock = self.block_lock(id, "remove");
         let removed = self.with_dataset_write("remove", |state| {
-            let remove_result = state.remove_block_state_by_id(id);
+            let remove_result = match state.get_block(id) {
+                Some(_) => state.remove_block_state_by_id(id).map(Some),
+                None => Ok(None),
+            };
             // Heartbeat increments this counter before scheduling the task.
             // Consume it even when metadata removal reports an error.
             state.decrement_blocks_to_delete();
             remove_result
         })?;
 
-        removed.deallocate()?;
-        removed.release_space();
-        Ok(removed.meta)
+        let Some(removed) = removed else {
+            return Ok(None);
+        };
+
+        if let Err(e) = removed.deallocate() {
+            self.with_dataset_write("restore", |state| {
+                state.restore_removed_block(removed);
+                Ok(())
+            })?;
+            return Err(e);
+        }
+
+        removed.release();
+        Ok(Some(removed.meta))
     }
 
     // Get all storage information and check whether the storage directory is normal.
@@ -329,6 +343,8 @@ mod tests {
     use curvine_io::DataSlice;
     use curvine_runtime::common::FileUtils;
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
@@ -365,18 +381,45 @@ mod tests {
         Ok(())
     }
 
+    struct DeleteDenied {
+        parent: PathBuf,
+        permissions: std::fs::Permissions,
+    }
+
+    impl Drop for DeleteDenied {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.parent, self.permissions.clone());
+        }
+    }
+
+    fn deny_block_delete(store: &BlockStore) -> CommonResult<DeleteDenied> {
+        let mut block = ExtendedBlock::with_id(1);
+        block.len = 100;
+        let meta = finalize_block(store, &block)?;
+        let path = store.short_circuit(&meta)?.unwrap();
+        let parent = PathBuf::from(path).parent().unwrap().to_path_buf();
+        let permissions = std::fs::metadata(&parent)?.permissions();
+        let mut readonly = permissions.clone();
+        readonly.set_mode(0o500);
+        std::fs::set_permissions(&parent, readonly)?;
+        Ok(DeleteDenied {
+            parent,
+            permissions,
+        })
+    }
+
     #[test]
     fn async_remove_missing_block_releases_delete_count() -> CommonResult<()> {
         let store = create_store("missing-block")?;
         store.read()?.increment_blocks_to_delete();
 
-        assert!(store.async_remove_block(1).is_err());
+        assert!(store.async_remove_block(1)?.is_none());
         assert_eq!(store.read()?.num_blocks_to_delete(), 0);
         Ok(())
     }
 
     #[test]
-    fn async_remove_invalid_dir_releases_delete_count() -> CommonResult<()> {
+    fn async_remove_invalid_dir_keeps_block_for_retry() -> CommonResult<()> {
         let store = create_store("invalid-dir")?;
         {
             let mut state = store.write()?;
@@ -388,8 +431,33 @@ mod tests {
 
         assert!(store.async_remove_block(1).is_err());
         let state = store.read()?;
-        assert!(state.get_block(1).is_none());
+        assert!(state.get_block(1).is_some());
         assert_eq!(state.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn async_remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
+        let store = create_store("deallocate-error")?;
+        let _delete_denied = deny_block_delete(&store)?;
+        store.read()?.increment_blocks_to_delete();
+
+        let result = store.async_remove_block(1);
+        assert!(result.is_err());
+        let state = store.read()?;
+        assert!(state.get_block(1).is_some());
+        assert_eq!(state.num_blocks_to_delete(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_deallocate_error_keeps_block_for_retry() -> CommonResult<()> {
+        let store = create_store("remove-deallocate-error")?;
+        let _delete_denied = deny_block_delete(&store)?;
+
+        let result = store.remove_block(1);
+        assert!(result.is_err());
+        assert!(store.read()?.get_block(1).is_some());
         Ok(())
     }
 

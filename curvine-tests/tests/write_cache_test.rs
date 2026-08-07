@@ -213,8 +213,8 @@ fn test_cache_mode_free_child_with_unified_disabled() {
         let (ufs_path, mount) = fs
             .get_mount(&path, RpcCode::GetMountInfo)
             .await
-            .unwrap()
-            .unwrap();
+        .unwrap()
+        .unwrap();
 
         fs.disable_unified();
         fs.free(&parent, true).await.unwrap();

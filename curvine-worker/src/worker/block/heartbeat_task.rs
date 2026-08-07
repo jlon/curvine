@@ -21,7 +21,7 @@ use curvine_model::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
 use curvine_rpc::server::ServerState;
 use curvine_runtime::runtime::{GroupExecutor, LoopTask};
 use curvine_runtime::sync::StateCtl;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use log::{error, warn};
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ pub struct HeartbeatTask {
     pub(crate) client: MasterClient,
     pub(crate) store: BlockStore,
     pub(crate) report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+    pub(crate) pending_deletes: Arc<DashSet<i64>>,
 }
 
 impl HeartbeatTask {
@@ -40,12 +41,13 @@ impl HeartbeatTask {
         store: BlockStore,
         cmds: Vec<WorkerCommand>,
         report_blocks: Arc<DashMap<i64, BlockReportInfo>>,
+        pending_deletes: Arc<DashSet<i64>>,
     ) {
         for cmd in cmds {
             match cmd {
                 WorkerCommand::DeleteBlock(c) => {
                     for block in c.blocks {
-                        if report_blocks.contains_key(&block) {
+                        if !pending_deletes.insert(block) {
                             continue;
                         }
 
@@ -53,25 +55,38 @@ impl HeartbeatTask {
                             .write()
                             .map(|state| state.increment_blocks_to_delete())
                         {
+                            pending_deletes.remove(&block);
                             error!("failed to mark block {} deleting: {}", block, e);
                             continue;
                         }
 
-                        // Whether or not it is successfully deleted, it is marked as deleted
-                        report_blocks.insert(block, BlockReportInfo::with_deleted(block, 0));
-
                         let store1 = store.clone();
-                        let res = executor.spawn(move || {
-                            match store1.async_remove_block(block) {
-                                Ok(v) => v.len,
-                                Err(e) => {
-                                    warn!("async_remove_block {}: {}", block, e);
-                                    0
-                                }
-                            };
+                        let report_blocks1 = report_blocks.clone();
+                        let pending_deletes1 = pending_deletes.clone();
+                        let res = executor.spawn(move || match store1.async_remove_block(block) {
+                            Ok(Some(meta)) => {
+                                report_blocks1
+                                    .insert(block, BlockReportInfo::with_deleted(block, meta.len));
+                            }
+                            Ok(None) => {
+                                report_blocks1
+                                    .insert(block, BlockReportInfo::with_deleted(block, 0));
+                            }
+                            Err(e) => {
+                                warn!("async_remove_block {}: {}", block, e);
+                                pending_deletes1.remove(&block);
+                            }
                         });
 
-                        if let Err(e) = &res {
+                        if let Err(e) = res {
+                            pending_deletes.remove(&block);
+                            match store.write() {
+                                Ok(state) => state.decrement_blocks_to_delete(),
+                                Err(err) => error!(
+                                    "failed to clear deleting state for block {}: {}",
+                                    block, err
+                                ),
+                            }
                             warn!("{}", e);
                         }
                     }
@@ -101,6 +116,14 @@ impl HeartbeatTask {
             self.report_blocks.insert(block.id, block);
         }
     }
+
+    fn acknowledge_reports(&self, blocks: &[BlockReportInfo]) {
+        for block in blocks {
+            if block.status == curvine_model::BlockReportStatus::Deleted {
+                self.pending_deletes.remove(&block.id);
+            }
+        }
+    }
 }
 
 impl LoopTask for HeartbeatTask {
@@ -124,6 +147,7 @@ impl LoopTask for HeartbeatTask {
                     self.store.clone(),
                     cmds,
                     self.report_blocks.clone(),
+                    self.pending_deletes.clone(),
                 );
             }
 
@@ -143,12 +167,14 @@ impl LoopTask for HeartbeatTask {
         let res = self.client.incr_block_report(&report_blocks);
         match res {
             Ok(v) => {
+                self.acknowledge_reports(&report_blocks);
                 let cmds = ProtoUtils::worker_cmd_from_pb(v.cmds);
                 Self::delete_block_task(
                     self.executor.clone(),
                     self.store.clone(),
                     cmds,
                     self.report_blocks.clone(),
+                    self.pending_deletes.clone(),
                 );
             }
 

@@ -82,7 +82,12 @@ impl RemovedBlockState {
         Ok(())
     }
 
-    pub fn release_space(&self) {
+    pub fn release(&self) {
+        self.layout.release(&self.dir, &self.meta);
+        if let Some(committed) = self.committed.as_ref() {
+            self.layout.release(&self.dir, committed);
+        }
+
         self.dir
             .release_space(self.meta.is_final(), self.meta.physical_bytes());
         if let Some(committed) = self.committed.as_ref() {
@@ -480,21 +485,17 @@ impl VfsDataset {
     }
 
     pub fn remove_block_state_by_id(&mut self, id: i64) -> CommonResult<RemovedBlockState> {
-        let meta = match self.meta.remove(id) {
+        let meta = match self.meta.get(id).cloned() {
             None => return err_box!("Not found block {}", id),
             Some(meta) => meta,
         };
-        let committed = self.committed_rewrites.remove(&id);
         let layout = self.layouts.get(meta.storage_type()).clone();
         let dir = match self.dir_list.get_dir(meta.dir_id()) {
             None => return err_box!("No storage directory found: {:?}", meta.dir_id()),
             Some(dir) => dir.clone(),
         };
-
-        layout.release(&dir, &meta);
-        if let Some(committed) = committed.as_ref() {
-            layout.release(&dir, committed);
-        }
+        let meta = self.meta.remove(id).expect("block metadata must exist");
+        let committed = self.committed_rewrites.remove(&id);
 
         Ok(RemovedBlockState {
             meta,
@@ -504,10 +505,21 @@ impl VfsDataset {
         })
     }
 
+    pub fn restore_removed_block(&mut self, removed: RemovedBlockState) {
+        let id = removed.meta.id();
+        self.meta.put(removed.meta);
+        if let Some(committed) = removed.committed {
+            self.committed_rewrites.insert(id, committed);
+        }
+    }
+
     pub(crate) fn remove_block_by_id(&mut self, id: i64) -> CommonResult<BlockMeta> {
         let removed = self.remove_block_state_by_id(id)?;
-        removed.deallocate()?;
-        removed.release_space();
+        if let Err(e) = removed.deallocate() {
+            self.restore_removed_block(removed);
+            return Err(e);
+        }
+        removed.release();
         Ok(removed.meta)
     }
 
@@ -871,7 +883,7 @@ mod test {
         Ok(())
     }
     #[test]
-    fn failed_file_deallocate_keeps_capacity_reserved() -> CommonResult<()> {
+    fn failed_file_deallocate_keeps_block_and_capacity_reserved() -> CommonResult<()> {
         let mut ds = create_data_set(true, "deallocate-failure");
         let block = ExtendedBlock::with_mem(1, "100B")?;
         let available = ds.available();
@@ -884,10 +896,13 @@ mod test {
         std::fs::write(block_path.join("child"), b"data")?;
 
         assert!(ds.abort_block(&block).is_err());
-        assert!(ds.get_block(block.id).is_none());
+        assert!(ds.get_block(block.id).is_some());
         assert_eq!(ds.available(), available - 100);
 
         FileUtils::delete_path(block_path, true)?;
+        ds.abort_block(&block)?;
+        assert!(ds.get_block(block.id).is_none());
+        assert_eq!(ds.available(), available);
         Ok(())
     }
     #[test]

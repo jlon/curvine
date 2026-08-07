@@ -272,7 +272,17 @@ impl UnifiedFileSystem {
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let fut = async {
-            match self.get_mount(path, RpcCode::Free).await? {
+            let mount = if self.enable_unified {
+                self.get_mount(path, RpcCode::Free)
+                    .await?
+                    .map(|(_, mount)| mount.info.clone())
+            } else {
+                // Cache-only commands still need the master's hierarchical mount
+                // lookup, but must not initialize or access a UFS client.
+                self.get_mount_info(path).await?
+            };
+
+            match mount {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
@@ -280,28 +290,35 @@ impl UnifiedFileSystem {
                 // Master delete already releases worker blocks; calling free first
                 // would only clear locs then delete the inode — redundant.
                 // Use cv.delete (not UnifiedFileSystem::delete) so UFS is untouched.
-                Some((_, mount)) if mount.info.is_cache_mode() => {
-                    if path.path() == mount.info.cv_path {
-                        if recursive {
-                            for status in self.cv.list_status(path).await? {
-                                let child = Path::from_str(status.path)?;
-                                if let Err(e) = self.cv.delete(&child, true).await {
-                                    if !matches!(e, FsError::FileNotFound(_)) {
-                                        return Err(e);
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        self.cv.delete(path, recursive).await?;
-                    }
-
-                    Ok(FreeResult::default())
+                Some(mount) if mount.is_cache_mode() => {
+                    self.free_cache_mode(path, &mount, recursive).await
                 }
                 Some(_) => self.cv.free(path, recursive).await,
             }
         };
         self.track("Free", path.path(), "", fut).await
+    }
+
+    async fn free_cache_mode(
+        &self,
+        path: &Path,
+        mount: &MountInfo,
+        recursive: bool,
+    ) -> FsResult<FreeResult> {
+        if path.path() == mount.cv_path && recursive {
+            for status in self.cv.list_status(path).await? {
+                let child = Path::from_str(status.path)?;
+                if let Err(e) = self.cv.delete(&child, true).await {
+                    if !matches!(e, FsError::FileNotFound(_)) {
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            self.cv.delete(path, recursive).await?;
+        }
+
+        Ok(FreeResult::default())
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {

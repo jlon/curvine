@@ -27,6 +27,14 @@ struct LegacyRenameEntry {
 }
 
 #[derive(Serialize)]
+struct LegacyFreeEntry {
+    op_id: u64,
+    rpc_id: i64,
+    path: String,
+    mtime: i64,
+}
+
+#[derive(Serialize)]
 #[allow(dead_code)]
 enum LegacyJournalEntry {
     Mkdir(MkdirEntry),
@@ -43,7 +51,7 @@ enum LegacyJournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
-    Free(FreeEntry),
+    Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
 }
@@ -117,6 +125,63 @@ fn current_rename_batch_keeps_exchange_inode_ids() {
     };
     assert_eq!(entry.src_inode_id, 100);
     assert_eq!(entry.dst_inode_id, 200);
+}
+
+#[test]
+fn current_free_batch_keeps_recursive_flag() {
+    let current = JournalBatch {
+        seq_id: 44,
+        batch: vec![JournalEntry::Free(FreeEntry {
+            op_id: 9,
+            rpc_id: 11,
+            path: "/free".to_string(),
+            mtime: 13,
+            recursive: true,
+        })],
+    };
+    let bytes = SerdeUtils::serialize(&current).unwrap();
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::Free(entry) = &batch.batch[0] else {
+        panic!("expected free journal entry");
+    };
+    assert!(entry.recursive);
+}
+
+#[test]
+fn legacy_free_batch_defaults_recursive_flag() {
+    let legacy = LegacyJournalBatch {
+        seq_id: 45,
+        batch: vec![
+            LegacyJournalEntry::Free(LegacyFreeEntry {
+                op_id: 10,
+                rpc_id: 12,
+                path: "/free".to_string(),
+                mtime: 14,
+            }),
+            LegacyJournalEntry::UfsApplied(UfsAppliedEntry {
+                op_id: 11,
+                rpc_id: 13,
+                term: 2,
+                index: 15,
+            }),
+        ],
+    };
+    let bytes = SerdeUtils::serialize(&legacy).unwrap();
+
+    assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::Free(entry) = &batch.batch[0] else {
+        panic!("expected free journal entry");
+    };
+    assert_eq!(entry.op_id, 10);
+    assert_eq!(entry.path, "/free");
+    assert!(!entry.recursive);
+    let JournalEntry::UfsApplied(entry) = &batch.batch[1] else {
+        panic!("expected ufs applied journal entry");
+    };
+    assert_eq!(entry.index, 15);
 }
 
 #[test]

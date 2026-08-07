@@ -195,6 +195,43 @@ fn test_cache_mode_free() {
 }
 
 #[test]
+fn test_cache_mode_free_child_with_unified_disabled() {
+    let mut fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let parent = Path::from_str("/write_cache_CacheMode/cache_only_free").unwrap();
+        fs.mkdir(&parent, true).await.unwrap();
+        let path = Path::from_str("/write_cache_CacheMode/cache_only_free/child.log").unwrap();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string("cache-only free").await.unwrap();
+        writer.complete().await.unwrap();
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        let (ufs_path, mount) = fs
+            .get_mount(&path, RpcCode::GetMountInfo)
+            .await
+            .unwrap()
+            .unwrap();
+
+        fs.disable_unified();
+        fs.free(&parent, true).await.unwrap();
+
+        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(mount.ufs().unwrap().exists(&ufs_path).await.unwrap());
+        assert!(
+            fs.cv()
+                .exists(&Path::from_str("/write_cache_CacheMode").unwrap())
+                .await
+                .unwrap(),
+            "free must preserve the cache-mode mount point"
+        );
+    });
+}
+
+#[test]
 fn test_fs_mode_free() {
     let fs = get_fs();
     let rt = fs.clone_runtime();

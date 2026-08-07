@@ -51,6 +51,28 @@ enum LegacyJournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
+    Free(FreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+}
+
+#[derive(Serialize)]
+#[allow(dead_code)]
+enum PreRecursiveJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(LegacyRenameEntry),
+    Delete(DeleteEntry),
+    Mount(MountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(SetLocksEntry),
     Free(LegacyFreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
@@ -60,6 +82,12 @@ enum LegacyJournalEntry {
 struct LegacyJournalBatch {
     seq_id: u64,
     batch: Vec<LegacyJournalEntry>,
+}
+
+#[derive(Serialize)]
+struct PreRecursiveJournalBatch {
+    seq_id: u64,
+    batch: Vec<PreRecursiveJournalEntry>,
 }
 
 #[test]
@@ -128,6 +156,43 @@ fn current_rename_batch_keeps_exchange_inode_ids() {
 }
 
 #[test]
+fn legacy_rename_batch_keeps_current_free_schema() {
+    let legacy = LegacyJournalBatch {
+        seq_id: 44,
+        batch: vec![
+            LegacyJournalEntry::Rename(LegacyRenameEntry {
+                op_id: 9,
+                rpc_id: 11,
+                src: "/src".to_string(),
+                dst: "/dst".to_string(),
+                mtime: 13,
+                flags: 0,
+            }),
+            LegacyJournalEntry::Free(FreeEntry {
+                op_id: 10,
+                rpc_id: 12,
+                path: "/free".to_string(),
+                mtime: 14,
+                recursive: true,
+            }),
+        ],
+    };
+    let bytes = SerdeUtils::serialize(&legacy).unwrap();
+
+    assert!(SerdeUtils::deserialize::<JournalBatch>(&bytes).is_err());
+
+    let batch = JournalBatch::deserialize_compat(&bytes).unwrap();
+    let JournalEntry::Rename(rename) = &batch.batch[0] else {
+        panic!("expected rename journal entry");
+    };
+    assert_eq!(rename.src_inode_id, 0);
+    let JournalEntry::Free(free) = &batch.batch[1] else {
+        panic!("expected free journal entry");
+    };
+    assert!(free.recursive);
+}
+
+#[test]
 fn current_free_batch_keeps_recursive_flag() {
     let current = JournalBatch {
         seq_id: 44,
@@ -150,16 +215,16 @@ fn current_free_batch_keeps_recursive_flag() {
 
 #[test]
 fn legacy_free_batch_defaults_recursive_flag() {
-    let legacy = LegacyJournalBatch {
+    let legacy = PreRecursiveJournalBatch {
         seq_id: 45,
         batch: vec![
-            LegacyJournalEntry::Free(LegacyFreeEntry {
+            PreRecursiveJournalEntry::Free(LegacyFreeEntry {
                 op_id: 10,
                 rpc_id: 12,
                 path: "/free".to_string(),
                 mtime: 14,
             }),
-            LegacyJournalEntry::UfsApplied(UfsAppliedEntry {
+            PreRecursiveJournalEntry::UfsApplied(UfsAppliedEntry {
                 op_id: 11,
                 rpc_id: 13,
                 term: 2,

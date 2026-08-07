@@ -18,7 +18,7 @@ use curvine_core_error::{err_box, CommonResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use curvine_runtime::common::SerdeUtils;
 use log::debug;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::Cursor;
 
 #[derive(Debug, Clone)]
@@ -318,19 +318,29 @@ impl JournalBatch {
     pub(crate) fn deserialize_compat(bytes: &[u8]) -> CommonResult<Self> {
         match SerdeUtils::deserialize(bytes) {
             Ok(batch) => Ok(batch),
-            Err(current_err) => match deserialize_legacy_batch(bytes) {
+            Err(current_err) => match deserialize_batch::<LegacyJournalBatch>(bytes) {
                 Ok(batch) => {
                     debug!(
-                        "replaying legacy journal batch with pre-extension entry schemas, seq_id={}",
+                        "replaying legacy journal batch with legacy rename schema, seq_id={}",
                         batch.seq_id
                     );
                     Ok(batch.into())
                 }
-                Err(legacy_err) => err_box!(
-                    "failed to deserialize journal batch with current or legacy schemas: current={}, legacy={}",
-                    current_err,
-                    legacy_err
-                ),
+                Err(legacy_err) => match deserialize_batch::<PreRecursiveJournalBatch>(bytes) {
+                    Ok(batch) => {
+                        debug!(
+                            "replaying legacy journal batch with legacy rename and free schemas, seq_id={}",
+                            batch.seq_id
+                        );
+                        Ok(batch.into())
+                    }
+                    Err(pre_recursive_err) => err_box!(
+                        "failed to deserialize journal batch with current or legacy schemas: current={}, legacy={}, pre_recursive={}",
+                        current_err,
+                        legacy_err,
+                        pre_recursive_err
+                    ),
+                },
             },
         }
     }
@@ -375,7 +385,8 @@ struct LegacyRenameEntry {
 
 // FreeEntry::recursive was appended in #721. Old bincode entries do not have
 // this field, so decoding them with the current type consumes the next entry's
-// enum tag as a bool.
+// enum tag as a bool. This schema is kept separate because batches written
+// after #721 can still contain the legacy RenameEntry layout.
 #[derive(Deserialize)]
 struct LegacyFreeEntry {
     op_id: u64,
@@ -400,7 +411,7 @@ enum LegacyJournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
-    Free(LegacyFreeEntry),
+    Free(FreeEntry),
     UfsApplied(UfsAppliedEntry),
     Snapshot(SnapshotEntry),
 }
@@ -411,7 +422,34 @@ struct LegacyJournalBatch {
     batch: Vec<LegacyJournalEntry>,
 }
 
-fn deserialize_legacy_batch(bytes: &[u8]) -> CommonResult<LegacyJournalBatch> {
+#[derive(Deserialize)]
+enum PreRecursiveJournalEntry {
+    Mkdir(MkdirEntry),
+    CreateFile(CreateFileEntry),
+    ReopenFile(ReopenFileEntry),
+    OverWriteFile(OverWriteFileEntry),
+    AddBlock(AddBlockEntry),
+    CompleteFile(CompleteFileEntry),
+    Rename(LegacyRenameEntry),
+    Delete(DeleteEntry),
+    Mount(MountEntry),
+    UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
+    Link(LinkEntry),
+    SetLocks(SetLocksEntry),
+    Free(LegacyFreeEntry),
+    UfsApplied(UfsAppliedEntry),
+    Snapshot(SnapshotEntry),
+}
+
+#[derive(Deserialize)]
+struct PreRecursiveJournalBatch {
+    seq_id: u64,
+    batch: Vec<PreRecursiveJournalEntry>,
+}
+
+fn deserialize_batch<T: DeserializeOwned>(bytes: &[u8]) -> CommonResult<T> {
     let mut reader = Cursor::new(bytes);
     let batch = SerdeUtils::deserialize_from(&mut reader)?;
     if reader.position() != bytes.len() as u64 {
@@ -425,6 +463,50 @@ impl From<LegacyJournalBatch> for JournalBatch {
         Self {
             seq_id: batch.seq_id,
             batch: batch.batch.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<PreRecursiveJournalBatch> for JournalBatch {
+    fn from(batch: PreRecursiveJournalBatch) -> Self {
+        Self {
+            seq_id: batch.seq_id,
+            batch: batch
+                .batch
+                .into_iter()
+                .map(LegacyJournalEntry::from)
+                .map(JournalEntry::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<PreRecursiveJournalEntry> for LegacyJournalEntry {
+    fn from(entry: PreRecursiveJournalEntry) -> Self {
+        match entry {
+            PreRecursiveJournalEntry::Mkdir(entry) => Self::Mkdir(entry),
+            PreRecursiveJournalEntry::CreateFile(entry) => Self::CreateFile(entry),
+            PreRecursiveJournalEntry::ReopenFile(entry) => Self::ReopenFile(entry),
+            PreRecursiveJournalEntry::OverWriteFile(entry) => Self::OverWriteFile(entry),
+            PreRecursiveJournalEntry::AddBlock(entry) => Self::AddBlock(entry),
+            PreRecursiveJournalEntry::CompleteFile(entry) => Self::CompleteFile(entry),
+            PreRecursiveJournalEntry::Rename(entry) => Self::Rename(entry),
+            PreRecursiveJournalEntry::Delete(entry) => Self::Delete(entry),
+            PreRecursiveJournalEntry::Mount(entry) => Self::Mount(entry),
+            PreRecursiveJournalEntry::UnMount(entry) => Self::UnMount(entry),
+            PreRecursiveJournalEntry::SetAttr(entry) => Self::SetAttr(entry),
+            PreRecursiveJournalEntry::Symlink(entry) => Self::Symlink(entry),
+            PreRecursiveJournalEntry::Link(entry) => Self::Link(entry),
+            PreRecursiveJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
+            PreRecursiveJournalEntry::Free(entry) => Self::Free(FreeEntry {
+                op_id: entry.op_id,
+                rpc_id: entry.rpc_id,
+                path: entry.path,
+                mtime: entry.mtime,
+                recursive: false,
+            }),
+            PreRecursiveJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
+            PreRecursiveJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
         }
     }
 }
@@ -455,13 +537,7 @@ impl From<LegacyJournalEntry> for JournalEntry {
             LegacyJournalEntry::Symlink(entry) => Self::Symlink(entry),
             LegacyJournalEntry::Link(entry) => Self::Link(entry),
             LegacyJournalEntry::SetLocks(entry) => Self::SetLocks(entry),
-            LegacyJournalEntry::Free(entry) => Self::Free(FreeEntry {
-                op_id: entry.op_id,
-                rpc_id: entry.rpc_id,
-                path: entry.path,
-                mtime: entry.mtime,
-                recursive: false,
-            }),
+            LegacyJournalEntry::Free(entry) => Self::Free(entry),
             LegacyJournalEntry::UfsApplied(entry) => Self::UfsApplied(entry),
             LegacyJournalEntry::Snapshot(entry) => Self::Snapshot(entry),
         }

@@ -95,6 +95,33 @@ impl ResponseData {
         Ok(count)
     }
 
+    fn coalesce_iovec_overflow(data: Vec<DataSlice>) -> IOResult<Vec<DataSlice>> {
+        if Self::checked_iovec_count(&data).is_ok() {
+            return Ok(data);
+        }
+
+        let mut payload_len = 0usize;
+        for slice in &data {
+            payload_len = match payload_len.checked_add(slice.len()) {
+                Some(len) => len,
+                None => {
+                    return curvine_core_error::err_box!("FUSE response payload length overflow")
+                }
+            };
+        }
+        let mut payload = BytesMut::with_capacity(payload_len);
+        for slice in data {
+            // FUSE iovec replies require memory-backed data, not fd-backed IOSlice regions.
+            if matches!(slice, DataSlice::IOSlice(_)) {
+                return curvine_core_error::err_box!(
+                    "DataSlice::IOSlice is not supported in FUSE iovec responses"
+                );
+            }
+            payload.extend_from_slice(slice.as_slice());
+        }
+        Ok(vec![DataSlice::buffer(payload)])
+    }
+
     fn checked_frame_len(data: &[DataSlice]) -> IOResult<usize> {
         let mut len = FUSE_OUT_HEADER_LEN;
         for slice in data {
@@ -135,7 +162,7 @@ impl ResponseData {
     }
 
     fn create(unique: u64, error: i32, data: Vec<DataSlice>) -> IOResult<Self> {
-        Self::checked_iovec_count(&data)?;
+        let data = Self::coalesce_iovec_overflow(data)?;
         let frame_len = Self::checked_frame_len(&data)?;
         let frame_len = match u32::try_from(frame_len) {
             Ok(frame_len) => frame_len,
@@ -695,14 +722,16 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_iovec_count_over_platform_limit() {
-        let data = std::iter::repeat_with(DataSlice::empty)
+    fn create_coalesces_iovec_count_over_platform_limit() {
+        let data = std::iter::repeat_with(|| DataSlice::bytes(bytes::Bytes::from_static(b"x")))
             .take(ResponseData::iovec_max())
             .collect();
 
-        let error =
-            ResponseData::create(1, 0, data).expect_err("excessive iovec count must be rejected");
-        assert!(error.to_string().contains("exceeds IOV_MAX"));
+        let response = ResponseData::create(1, 0, data)
+            .expect("excessive memory-backed iovecs must be coalesced");
+        let (_, iovec) = response.as_iovec().unwrap();
+        assert_eq!(iovec.len(), 2);
+        assert_eq!(iovec[1].len(), ResponseData::iovec_max());
     }
 
     #[cfg(target_os = "linux")]
@@ -784,7 +813,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_success_response_falls_back_to_eio_reply() {
+    async fn oversized_success_response_is_coalesced() {
         let g = m::new_gauge("oversized_response_active", "test").unwrap();
         let (reply, mut rx) =
             reply_with_gauge_opcode_kind(64, &g, "OversizedRead", FuseReqKind::Stream);
@@ -794,7 +823,10 @@ mod tests {
 
         reply.send_data(Ok(data)).await.unwrap();
 
-        let task = rx.try_recv().unwrap().expect("an EIO reply was enqueued");
+        let task = rx
+            .try_recv()
+            .unwrap()
+            .expect("a success reply was enqueued");
         match &task {
             FuseTask::RequestReply {
                 data,
@@ -802,19 +834,21 @@ mod tests {
                 errno,
                 ..
             } => {
-                assert_eq!(data.header().error, -libc::EIO);
+                assert_eq!(data.header().error, 0);
                 assert_eq!(data.len() as usize, FUSE_OUT_HEADER_LEN);
-                assert_eq!(*status, FuseReqStatus::Error);
-                assert_eq!(*errno, libc::EIO);
+                assert_eq!(*status, FuseReqStatus::Success);
+                assert_eq!(*errno, 0);
+                let (_, iovec) = data.as_iovec().unwrap();
+                assert_eq!(iovec.len(), 2);
             }
             _ => panic!("expected FuseTask::RequestReply"),
         }
         assert!(
             reply.metrics.as_ref().unwrap().lock().finished,
-            "fallback reply must finish request metrics"
+            "coalesced reply must finish request metrics"
         );
         drop(task);
-        assert_eq!(g.get(), 0, "fallback reply drops the active guard once");
+        assert_eq!(g.get(), 0, "coalesced reply drops the active guard once");
     }
 
     // T1: a normal metadata reply produces a RequestReply, finishes the slot

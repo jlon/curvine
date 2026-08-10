@@ -3,6 +3,16 @@ use curvine_core_error::CommonResult;
 use curvine_fs_api::{CurvineURI, FileSystem};
 use curvine_unified_fs::UnifiedFileSystem;
 
+pub(super) fn current_process_acl(client: &UnifiedFileSystem) -> (String, String, u32) {
+    let uid = curvine_sys::get_uid();
+    let gid = curvine_sys::get_gid();
+    (
+        curvine_sys::get_username_by_uid(uid).unwrap_or_else(|| uid.to_string()),
+        curvine_sys::get_groupname_by_gid(gid).unwrap_or_else(|| gid.to_string()),
+        client.conf().client.get_mode(),
+    )
+}
+
 /// Calculates content summary (directory size, file count, directory count) on the client side
 pub async fn calculate_content_summary(
     client: &UnifiedFileSystem,

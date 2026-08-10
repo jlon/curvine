@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodePtr, InodeView, PATH_SEPARATOR};
-use crate::master::meta::FsDir;
+use crate::master::meta::{CacheInvalidationResult, FsDir};
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
@@ -80,6 +80,12 @@ pub struct BlockReportResult {
     pub delete_blocks: Vec<i64>,
 }
 
+#[derive(Default)]
+pub struct LostWorkerLocationCleanup {
+    pub removed_block_ids: Vec<i64>,
+    pub replication_block_ids: Vec<i64>,
+}
+
 pub(crate) enum BlockInodeState {
     File,
     Missing,
@@ -128,6 +134,8 @@ const FULL_BLOCK_RECONCILE_QUEUE_SIZE: usize = 128;
 impl MasterFilesystem {
     // Max block-report location updates applied under a single fs_dir write lock.
     const BLOCK_REPORT_WRITE_CHUNK: usize = 4096;
+    // Max lost-worker block ids inspected under a single fs_dir write lock.
+    const LOST_WORKER_INVALIDATION_CHUNK: usize = Self::BLOCK_REPORT_WRITE_CHUNK;
 
     fn validate_alloc_capacity(
         current_len: i64,
@@ -1557,9 +1565,46 @@ impl MasterFilesystem {
             .unwrap_or(false)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
-        let fs_dir = self.fs_dir.write();
-        fs_dir.delete_locations(worker_id)
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<LostWorkerLocationCleanup> {
+        let removed_block_ids = {
+            let fs_dir = self.fs_dir.write();
+            fs_dir.delete_locations(worker_id)?
+        };
+        let mut invalidated = CacheInvalidationResult::default();
+
+        for chunk in removed_block_ids.chunks(Self::LOST_WORKER_INVALIDATION_CHUNK) {
+            let result = {
+                let mut fs_dir = self.fs_dir.write();
+                fs_dir.invalidate_lost_cache_files(chunk)
+            };
+            match result {
+                Ok(result) => invalidated.extend(result),
+                Err(e) => warn!(
+                    "failed to invalidate lost cache files for worker {} ({} block ids); \\
+                     continuing with normal replica recovery: {}",
+                    worker_id,
+                    chunk.len(),
+                    e
+                ),
+            }
+        }
+
+        let replication_block_ids = removed_block_ids
+            .iter()
+            .copied()
+            .filter(|block_id| !invalidated.invalidated_block_ids.contains(block_id))
+            .collect();
+
+        if !invalidated.delete_result.blocks.is_empty() {
+            self.worker_manager
+                .write()
+                .remove_blocks(&invalidated.delete_result);
+        }
+
+        Ok(LostWorkerLocationCleanup {
+            removed_block_ids,
+            replication_block_ids,
+        })
     }
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {

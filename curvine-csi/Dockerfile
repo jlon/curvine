@@ -2,10 +2,14 @@
 FROM ghcr.io/curvineio/curvine-compile:ubuntu24.04 AS builder
 
 ARG GOPROXY
+ARG BUILD_VERSION
 
 # Override ENTRYPOINT to ensure RUN commands execute correctly
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
+
+# version.sh uses bash features such as local, so RUN steps must use bash.
+SHELL ["/bin/bash", "-c"]
 
 # Set GOPROXY environment variable (Go is already installed in compile image)
 ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
@@ -65,7 +69,8 @@ RUN echo "Building Curvine from source..." && \
 
 # Build CSI binary with version info
 RUN cd /workspace/curvine-csi && \
-    VERSION=$(grep '^version =' /workspace/Cargo.toml | head -1 | sed 's/^version = "\(.*\)"/\1/') && \
+    . /workspace/build/version.sh && \
+    VERSION=$(get_build_version /workspace/Cargo.toml) && \
     GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
     GIT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "") && \
     GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "") && \

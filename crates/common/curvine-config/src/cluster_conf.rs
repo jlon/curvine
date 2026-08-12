@@ -106,7 +106,7 @@ impl ClusterConf {
     /// Load only the configuration needed by the standalone Transfer service.
     pub fn from_transfer<T: AsRef<str>>(path: T) -> CommonResult<Self> {
         let mut conf = Self::read(path)?;
-        conf.apply_hostname_overrides()?;
+        conf.apply_transfer_hostname_overrides()?;
         conf.client.init()?;
         conf.transfer.init()?;
         conf.resolve_master_addrs();
@@ -173,6 +173,31 @@ impl ClusterConf {
             }
         }
 
+        Ok(())
+    }
+
+    fn apply_transfer_hostname_overrides(&mut self) -> CommonResult<()> {
+        if !self.net_interface.is_empty() {
+            let ip = Self::interface_ipv4(&self.net_interface)?;
+            for env_key in [Self::ENV_CLIENT_HOSTNAME, Self::ENV_TRANSFER_HOSTNAME] {
+                if let Ok(v) = env::var(env_key) {
+                    eprintln!(
+                        "[WARN] net_interface '{}' is set (resolved to {}); ignoring {}='{}'. \\
+                         net_interface overrides the CURVINE_*_HOSTNAME env vars.",
+                        self.net_interface, ip, env_key, v
+                    );
+                }
+            }
+            self.client.hostname = ip.clone();
+            self.transfer.hostname = ip;
+        } else {
+            if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
+                self.client.hostname = v;
+            }
+            if let Ok(v) = env::var(Self::ENV_TRANSFER_HOSTNAME) {
+                self.transfer.hostname = v;
+            }
+        }
         Ok(())
     }
 
@@ -458,6 +483,7 @@ impl Display for ClusterConf {
 mod tests {
     use super::ClusterConf;
     use crate::RaftPeer;
+    use curvine_runtime::common::Utils;
 
     // The loopback interface is present on every supported host and always
     // carries 127.0.0.1, so it is a stable target for the happy path.
@@ -532,8 +558,11 @@ mod tests {
 
     #[test]
     fn transfer_init_skips_unused_master_validation() {
-        let path =
-            std::env::temp_dir().join(format!("curvine-transfer-conf-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "curvine-transfer-conf-{}-{}.toml",
+            std::process::id(),
+            Utils::rand_str(6)
+        ));
         std::fs::write(
             &path,
             r#"
@@ -547,8 +576,27 @@ mod tests {
         .unwrap();
 
         let conf = ClusterConf::from_transfer(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
 
         assert!(!conf.client.master_addrs.is_empty());
+    }
+
+    #[test]
+    fn transfer_net_interface_keeps_master_address() {
+        #[cfg(target_os = "macos")]
+        let loopback = "lo0";
+        #[cfg(not(target_os = "macos"))]
+        let loopback = "lo";
+
+        let mut conf = ClusterConf::default();
+        conf.net_interface = loopback.to_string();
+        conf.master.hostname = "cv-master".to_string();
+        conf.journal.journal_addrs.clear();
+
+        conf.apply_transfer_hostname_overrides().unwrap();
+        conf.resolve_master_addrs();
+
+        assert_eq!(conf.master.hostname, "cv-master");
+        assert_eq!(conf.client.master_addrs[0].hostname, "cv-master");
     }
 }

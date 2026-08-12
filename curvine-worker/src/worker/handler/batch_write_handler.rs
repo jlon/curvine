@@ -72,6 +72,18 @@ impl BatchWriteHandler {
         }
     }
 
+    pub(crate) fn abort_unfinished(&mut self) {
+        if self.is_commit {
+            return;
+        }
+
+        drop(self.file.take());
+        if let Some(contexts) = self.context.take() {
+            Self::abort_open_contexts(&self.store, &contexts);
+        }
+        self.write_handler.abort_unfinished();
+    }
+
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         let mut responses = Vec::with_capacity(header.blocks.len());

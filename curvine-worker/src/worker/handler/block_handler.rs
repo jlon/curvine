@@ -53,4 +53,12 @@ impl BlockHandler {
             Err(e) => Ok(msg.error_ext(&e)),
         }
     }
+
+    pub(crate) fn abort_unfinished(&mut self) {
+        match self {
+            Writer(handler) => handler.abort_unfinished(),
+            BatchWriter(handler) => handler.abort_unfinished(),
+            Reader(_) => {}
+        }
+    }
 }

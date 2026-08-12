@@ -19,7 +19,6 @@ use crate::worker::task::TaskManager;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::RpcCode;
 use curvine_model::LoadTaskInfo;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
@@ -35,6 +34,15 @@ pub struct WorkerHandler {
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
+}
+
+impl Drop for WorkerHandler {
+    fn drop(&mut self) {
+        let mut handler = self.handler.lock();
+        if let Some(handler) = handler.as_mut() {
+            handler.abort_unfinished();
+        }
+    }
 }
 
 impl MessageHandler for WorkerHandler {
@@ -99,7 +107,10 @@ impl WorkerHandler {
         };
 
         if need_new_handler {
-            let _ = handler.replace(BlockHandler::new(code, self.store.clone())?);
+            let next_handler = BlockHandler::new(code, self.store.clone())?;
+            if let Some(mut previous) = handler.replace(next_handler) {
+                previous.abort_unfinished();
+            }
         }
 
         match handler.as_mut() {

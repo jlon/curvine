@@ -241,6 +241,24 @@ impl WriteHandler {
         Ok(())
     }
 
+    pub(crate) fn abort_unfinished(&mut self) {
+        if self.is_commit {
+            return;
+        }
+
+        drop(self.file.take());
+        let Some(context) = self.context.take() else {
+            return;
+        };
+
+        if let Err(error) = self.store.abort_block(&context.block) {
+            warn!(
+                "failed to abort unfinished block {} after write stream closed: {}",
+                context.block.id, error
+            );
+        }
+    }
+
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         if self.is_commit {
             return if !msg.data.is_empty() {
@@ -250,10 +268,10 @@ impl WriteHandler {
             };
         }
 
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context, msg)?;
-        }
         let context = WriteContext::from_req(msg)?;
+        if let Some(open_context) = self.context.as_ref() {
+            Self::check_context(open_context, msg)?;
+        }
 
         let file = self.file.take();
         if let Some(mut file) = file {
@@ -288,6 +306,7 @@ impl WriteHandler {
 
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
+        self.context.take();
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",

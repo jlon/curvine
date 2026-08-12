@@ -1016,6 +1016,7 @@ mod test {
         assert!(!staging_path.exists());
         Ok(())
     }
+
     #[test]
     fn finalize_rewrite_publishes_staging_file() -> CommonResult<()> {
         let mut ds = create_data_set(true, "finalize-rewrite-publishes");

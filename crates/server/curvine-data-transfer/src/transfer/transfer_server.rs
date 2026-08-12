@@ -94,11 +94,10 @@ impl TransferServer {
         if !conf.transfer.enabled {
             return Err(FsError::common("curvine-transfer requires transfer.enabled=true").into());
         }
-        Logger::init(conf.master.log.clone());
+        Logger::init(conf.transfer.log.clone());
         let _ = TransferMetrics::get()?;
         info!("allocator: {}", curvine_alloc::allocator_type_name());
         info!("git version: {}", curvine_sys::version::GIT_VERSION);
-        conf.print();
 
         let rt = Arc::new(conf.transfer_server_conf().create_runtime());
         let stop = Arc::new(AtomicBool::new(false));

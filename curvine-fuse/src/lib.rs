@@ -50,6 +50,9 @@ pub const FUSE_SUCCESS: i32 = 0;
 
 pub const FUSE_OUT_HEADER_LEN: usize = size_of::<fuse_out_header>();
 
+/// Small FUSE replies are cheaper through writev than through a pipe splice.
+pub(crate) const FUSE_SPLICE_THRESHOLD: usize = 8192;
+
 pub(crate) const FILE_HANDLE_READ_BIT: u64 = 1 << 63;
 
 pub(crate) const FILE_HANDLE_WRITE_BIT: u64 = 1 << 62;

@@ -18,9 +18,9 @@ use crate::fuse_metrics::{
     NOTIFY_WRITE_FAILED,
 };
 use crate::session::{FuseTask, ResponseData};
-use crate::FuseResult;
+use crate::{FuseResult, FUSE_SPLICE_THRESHOLD};
 use curvine_core_error::{err_box, try_option_ref};
-use curvine_io::IOResult;
+use curvine_io::{IOError, IOResult};
 use curvine_metrics::Gauge;
 use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::channel::AsyncReceiver;
@@ -28,9 +28,20 @@ use curvine_sys as sys;
 use curvine_sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use log::{info, warn};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-/// Small responses use writev; splice only pays off for larger payloads.
-const SPLICE_THRESHOLD: usize = 8192;
+// A FUSE reply is already fully staged before this transfer begins.  If the
+// kernel cannot accept it for this long, its frame may be only partially
+// delivered, so the only safe recovery is to tear down the whole FUSE session.
+const FUSE_REPLY_SPLICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn should_splice_response(len: usize, pipe_capacity: usize) -> bool {
+    len >= FUSE_SPLICE_THRESHOLD && len <= pipe_capacity
+}
+
+fn is_cancelled_reply_error(error: &IOError) -> bool {
+    error.raw_error().raw_os_error() == Some(libc::ENOENT)
+}
 
 /// FuseSender reads data from queue and writes to fuse fd.
 /// 1. For metadata requests, write response directly
@@ -113,7 +124,7 @@ impl<T: FileSystem> FuseSender<T> {
                         Ok(()) => WriteOutcome::Success,
                         Err(e) => {
                             let os_errno = e.raw_error().raw_os_error();
-                            if os_errno != Some(libc::ENOENT) {
+                            if !is_cancelled_reply_error(e) {
                                 warn!("error send unique {}: {}", id, e);
                             }
                             WriteOutcome::Failed { errno: os_errno }
@@ -145,10 +156,14 @@ impl<T: FileSystem> FuseSender<T> {
                     // Record sender liveness on a successful delivery. A stalled sender
                     // stops advancing this timestamp while siblings keep refreshing,
                     // localizing the stall at scrape time.
-                    if matches!(write, WriteOutcome::Success) {
-                        if let Some(g) = &self.progress {
-                            FuseMetrics::record_sender_progress(g);
+                    match send_result {
+                        Ok(()) => {
+                            if let Some(g) = &self.progress {
+                                FuseMetrics::record_sender_progress(g);
+                            }
                         }
+                        Err(error) if is_cancelled_reply_error(&error) => {}
+                        Err(error) => return Err(error.into()),
                     }
                 }
 
@@ -181,8 +196,9 @@ impl<T: FileSystem> FuseSender<T> {
                 FuseTask::Reply(reply) => {
                     let id = reply.unique();
                     if let Err(e) = self.send(reply).await {
-                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
+                        if !is_cancelled_reply_error(&e) {
                             warn!("error send unique {}: {}", id, e);
+                            return Err(e.into());
                         }
                     }
                 }
@@ -197,11 +213,16 @@ impl<T: FileSystem> FuseSender<T> {
         }
 
         let len = rep.len() as usize;
-        if self.pipe2.is_some() && len >= SPLICE_THRESHOLD {
-            self.splice(rep).await
-        } else {
-            self.write(rep).await
+        if let Some(pipe2) = &self.pipe2 {
+            // `Pipe2::write_iov` must hold the complete FUSE frame at once.
+            // A read reply may legitimately exceed the pipe's whole-frame capacity;
+            // route that frame through writev instead of dropping its kernel reply.
+            if should_splice_response(len, pipe2.buf_size()) {
+                return self.splice(rep).await;
+            }
         }
+
+        self.write(rep).await
     }
 
     // Non-splice reply path. The fuse device has no send-buffer watermark, so writev
@@ -228,7 +249,14 @@ impl<T: FileSystem> FuseSender<T> {
             return Err(e.into());
         }
 
-        if let Err(e) = pipe2.read_io(&self.kernel_fd, len).await {
+        if let Err(e) = pipe2
+            .read_io_with_deadline(
+                &self.kernel_fd,
+                len,
+                Instant::now() + FUSE_REPLY_SPLICE_STALL_TIMEOUT,
+            )
+            .await
+        {
             Self::drain_pipe(pipe2);
             return Err(e.into());
         }
@@ -240,21 +268,7 @@ impl<T: FileSystem> FuseSender<T> {
     /// head poison every subsequent response. EINTR is retried; the loop stops on
     /// EAGAIN/EWOULDBLOCK (empty), EOF, or any other error.
     fn drain_pipe(pipe2: &Pipe2) {
-        let fd = pipe2.read_raw_fd();
-        let mut buf = [0u8; 8192];
-        loop {
-            match sys::read(fd, &mut buf) {
-                Ok(n) if n > 0 => continue,
-                Ok(_) => break, // EOF
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::EINTR) {
-                        continue; // interrupted; retry
-                    }
-                    // EAGAIN/EWOULDBLOCK: pipe is empty; any other error: stop.
-                    break;
-                }
-            }
-        }
+        pipe2.drain();
     }
 }
 
@@ -265,9 +279,12 @@ fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_dequeued;
+    use super::{is_cancelled_reply_error, mark_dequeued, should_splice_response};
     use crate::fuse_metrics::ActiveGuard;
+    use crate::FUSE_SPLICE_THRESHOLD;
+    use curvine_io::IOError;
     use curvine_metrics::Metrics as m;
+    use std::io::ErrorKind;
 
     // `mark_dequeued` decrements at the dequeue point.
     #[test]
@@ -283,5 +300,27 @@ mod tests {
     #[test]
     fn mark_dequeued_none_is_noop() {
         mark_dequeued(None);
+    }
+
+    #[test]
+    fn splice_reply_must_fit_the_pipe_buffer() {
+        let pipe_buf_size = 1024 * 1024;
+
+        assert!(!should_splice_response(
+            FUSE_SPLICE_THRESHOLD - 1,
+            pipe_buf_size
+        ));
+        assert!(should_splice_response(FUSE_SPLICE_THRESHOLD, pipe_buf_size));
+        assert!(should_splice_response(pipe_buf_size, pipe_buf_size));
+        assert!(!should_splice_response(pipe_buf_size + 1, pipe_buf_size));
+    }
+
+    #[test]
+    fn only_cancelled_fuse_requests_are_non_fatal_reply_failures() {
+        let cancelled = IOError::from(std::io::Error::from_raw_os_error(libc::ENOENT));
+        let timed_out = IOError::from(std::io::Error::new(ErrorKind::TimedOut, "stalled"));
+
+        assert!(is_cancelled_reply_error(&cancelled));
+        assert!(!is_cancelled_reply_error(&timed_out));
     }
 }

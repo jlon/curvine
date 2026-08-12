@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 // (issue #1215); instead we retry the raw splice behind a bounded async backoff.
 const SPLICE_RETRY_MIN: Duration = Duration::from_micros(50);
 const SPLICE_RETRY_MAX: Duration = Duration::from_millis(5);
-// While retrying continuous EAGAIN, log a warning this often. Until the sender
-// watchdog lands (#1215 PR-B), a stuck sender is otherwise invisible (it makes
-// no progress and emits no error); this surfaces the failure mode in the field.
+// While retrying continuous EAGAIN, log a warning this often. The protocol
+// owner must bound the whole frame transfer: it alone knows whether a partial
+// frame makes the destination session unrecoverable.
 const SPLICE_RETRY_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct Pipe2 {
@@ -142,6 +142,28 @@ impl Pipe2 {
     // Loops to completion: a partial splice (short transfer under SPLICE_F_NONBLOCK)
     // is retried until all bytes are transferred, preventing pipe poisoning (issue #965).
     pub async fn read_io(&self, fd_out: &AsyncFd, len: usize) -> SysResult<()> {
+        self.read_io_inner(fd_out, len, None).await
+    }
+
+    /// Like [`Self::read_io`], but fails once the absolute deadline elapses.
+    ///
+    /// The deadline is checked only after `splice` returns `EAGAIN`, preserving
+    /// the no-timer fast path for successful transfers.
+    pub async fn read_io_with_deadline(
+        &self,
+        fd_out: &AsyncFd,
+        len: usize,
+        deadline: Instant,
+    ) -> SysResult<()> {
+        self.read_io_inner(fd_out, len, Some(deadline)).await
+    }
+
+    async fn read_io_inner(
+        &self,
+        fd_out: &AsyncFd,
+        len: usize,
+        deadline: Option<Instant>,
+    ) -> SysResult<()> {
         if len > self.buf_size {
             return sys_error!(
                 ErrorKind::InvalidInput,
@@ -158,8 +180,11 @@ impl Pipe2 {
             // edge never fires again and awaiting AsyncFd WRITABLE readiness
             // hangs forever (#1215). Retry the raw splice behind a bounded async
             // backoff rather than waiting on the tokio readiness.
-            let res =
-                Self::splice_retry(|| sys::splice(fd_in, None, fd_out, None, remaining)).await?;
+            let res = Self::splice_retry_until(
+                || sys::splice(fd_in, None, fd_out, None, remaining),
+                deadline,
+            )
+            .await?;
             if res == 0 {
                 return sys_error!(ErrorKind::UnexpectedEof, "splice returned 0");
             }
@@ -174,13 +199,20 @@ impl Pipe2 {
     // edge-triggered WRITABLE readiness never fires again after an EAGAIN and
     // awaiting it hangs forever (#1215). EINTR is retried immediately; any other
     // error propagates. The backoff sleeps on the tokio timer so it yields the
-    // worker instead of busy-spinning. Note: if the destination stays EAGAIN
-    // forever this retries indefinitely (bounded-rate, not a hang) by design;
-    // detecting a stuck sender and giving up is the watchdog's job (#1215 PR-B).
-    // While it keeps hitting EAGAIN it logs a warning every
-    // SPLICE_RETRY_WARN_INTERVAL so the otherwise-silent HOL-blocked sender is
-    // visible in the field before the watchdog lands.
+    // worker instead of busy-spinning. This generic pipe helper deliberately
+    // does not choose a deadline: only the protocol owner knows how to recover
+    // after a partially delivered frame. FUSE bounds this call at its sender and
+    // tears down the session on expiry instead of leaving a request unresolved.
+    // While it keeps hitting EAGAIN it logs every SPLICE_RETRY_WARN_INTERVAL.
+    #[cfg(test)]
     async fn splice_retry(mut f: impl FnMut() -> SysResult<CInt>) -> SysResult<CInt> {
+        Self::splice_retry_until(&mut f, None).await
+    }
+
+    async fn splice_retry_until(
+        mut f: impl FnMut() -> SysResult<CInt>,
+        deadline: Option<Instant>,
+    ) -> SysResult<CInt> {
         let mut delay = SPLICE_RETRY_MIN;
         // Set on the first EAGAIN; measures how long this call has been stalled
         // on continuous would-block. (Ok / real errors return, so there is no
@@ -196,13 +228,22 @@ impl Pipe2 {
                         continue;
                     }
                     if e.kind() == std::io::ErrorKind::WouldBlock {
+                        let now = Instant::now();
                         let stalled = match eagain_since {
-                            Some(start) => start.elapsed(),
+                            Some(start) => now.duration_since(start),
                             None => {
-                                eagain_since = Some(Instant::now());
+                                eagain_since = Some(now);
                                 Duration::ZERO
                             }
                         };
+                        let remaining =
+                            deadline.map(|deadline| deadline.saturating_duration_since(now));
+                        if remaining == Some(Duration::ZERO) {
+                            return sys_error!(
+                                ErrorKind::TimedOut,
+                                "splice delivery exceeded its deadline"
+                            );
+                        }
                         if stalled >= next_warn {
                             warn!(
                                 "splice to fuse fd stuck on EAGAIN for {:?}; still retrying \
@@ -211,7 +252,10 @@ impl Pipe2 {
                             );
                             next_warn += SPLICE_RETRY_WARN_INTERVAL;
                         }
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(
+                            remaining.map_or(delay, |remaining| delay.min(remaining)),
+                        )
+                        .await;
                         delay = (delay * 2).min(SPLICE_RETRY_MAX);
                         continue;
                     }
@@ -225,6 +269,21 @@ impl Pipe2 {
     pub async fn read_buf(&self, buf: &mut [u8]) -> SysResult<usize> {
         let res = self.reader.async_read(|fd| sys::read(fd.fd(), buf)).await?;
         Ok(res as usize)
+    }
+
+    /// Remove residual bytes after a failed transfer before this pipe handles
+    /// another frame.
+    pub fn drain(&self) {
+        let fd = self.reader.raw_fd();
+        let mut buf = [0u8; 8192];
+        loop {
+            match sys::read(fd, &mut buf) {
+                Ok(n) if n > 0 => continue,
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(_) => break,
+            }
+        }
     }
 
     pub fn deregister(&mut self) -> PipeFd {
@@ -256,6 +315,7 @@ mod tests {
     use crate::{CInt, SysResult};
     use std::cell::Cell;
     use std::io;
+    use std::time::{Duration, Instant};
 
     fn eagain() -> io::Error {
         io::Error::from_raw_os_error(libc::EAGAIN)
@@ -289,6 +349,28 @@ mod tests {
             .expect("must complete, not hang");
         assert_eq!(res, 4096);
         assert_eq!(calls.get(), 6, "5 EAGAIN retries + 1 success");
+    }
+
+    // A permanently non-writable destination is owned by the higher-level
+    // protocol timeout. This confirms the low-level retry yields to that
+    // owner instead of busy-spinning a runtime worker.
+    #[tokio::test]
+    async fn splice_retry_continuous_eagain_is_cancellable() {
+        let calls = Cell::new(0u32);
+        let f = || -> SysResult<CInt> {
+            calls.set(calls.get() + 1);
+            Err(eagain())
+        };
+
+        let error = Pipe2::splice_retry_until(f, Some(Instant::now() + Duration::from_millis(20)))
+            .await
+            .expect_err("continuous EAGAIN must stop at the caller deadline");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            calls.get() > 1,
+            "retry should make progress before the deadline"
+        );
     }
 
     // EINTR is retried immediately (no backoff), like the drain loop in #965.

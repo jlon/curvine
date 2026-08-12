@@ -15,7 +15,7 @@
 #![allow(unused)]
 
 use curvine_core_error::CommonResult;
-use curvine_raft::conf::JournalConf;
+use curvine_raft::conf::{JournalConf, JournalConfExt};
 use curvine_raft::proto::raft::{FsmState, SnapshotData};
 use curvine_raft::raft::storage::{
     AppStorage, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksLogStorage,

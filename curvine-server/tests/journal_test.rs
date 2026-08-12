@@ -25,7 +25,7 @@ use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFi
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
 use curvine_raft::raft::{NodeId, RaftPeer};
 use curvine_runtime::common::SerdeUtils;
-use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
+use curvine_runtime::common::{FileUtils, LocalTime, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
@@ -998,7 +998,7 @@ fn active_master_replays_ufs_after_metadata_commit() -> CommonResult<()> {
     let ufs_dir = std::env::temp_dir().join(format!(
         "curvine-ufs-replay-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        LocalTime::mills()
     ));
     std::fs::create_dir_all(&ufs_dir)?;
     let mount_options = MountOptions::builder()
@@ -1044,7 +1044,7 @@ fn active_mount_does_not_replay_its_namespace_directory_to_ufs() -> CommonResult
     let base = std::env::temp_dir().join(format!(
         "curvine-mount-ufs-barrier-{}-{}",
         std::process::id(),
-        orpc::common::LocalTime::mills()
+        LocalTime::mills()
     ));
     std::fs::create_dir_all(&base)?;
     let ufs_root = base.join("remote-root");

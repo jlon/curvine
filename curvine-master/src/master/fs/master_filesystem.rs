@@ -81,7 +81,7 @@ impl MetadataAdmissionScope {
     }
 
     fn normalize(path: &str) -> String {
-        curvine_common::fs::Path::from_str(path)
+        curvine_fs_api::Path::from_str(path)
             .map(|path| path.encode())
             .unwrap_or_else(|_| path.to_string())
     }

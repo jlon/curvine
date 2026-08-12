@@ -18,6 +18,7 @@ use std::{env, fs, str};
 
 fn main() {
     emit_git_rerun_if_changed();
+    println!("cargo:rerun-if-env-changed=CURVINE_GIT_VERSION");
 
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
     let ver_file = format!("{}/version.rs", base);
@@ -113,6 +114,12 @@ fn git_path(path: &str) -> Option<PathBuf> {
 }
 
 fn get_git_head_commit() -> String {
+    if let Ok(commit) = env::var("CURVINE_GIT_VERSION") {
+        let commit = commit.trim();
+        if !commit.is_empty() && commit != "unknown" {
+            return commit.to_owned();
+        }
+    }
     run_git_command(&["rev-parse", "--short", "HEAD"])
 }
 

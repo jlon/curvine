@@ -165,14 +165,14 @@ impl FsClient {
         Ok(rep_header.exists)
     }
 
-    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
         };
 
-        let _: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
-        Ok(())
+        let rep: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
+        Ok(ProtoUtils::delete_res_from_pb(rep.res.unwrap_or_default()))
     }
 
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {

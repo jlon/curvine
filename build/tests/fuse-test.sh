@@ -1319,7 +1319,12 @@ PYTHON_SCRIPT
 test_fuse_reload() {
     CURRENT_TEST_GROUP="Test 15: FUSE Hot Reload"
     print_header "$CURRENT_TEST_GROUP"
-    run_python_script_test "Testing FUSE hot reload functionality" "fuse_reload_test.py"
+    local curvine_home="${CURVINE_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+    local reload_args=(
+        --mnt-path "$(dirname "$TEST_DIR")"
+        --pid-file "$curvine_home/fuse.pid"
+    )
+    run_python_script_test "Testing FUSE hot reload functionality" "fuse_reload_test.py" "${reload_args[@]}"
 }
 
 # Test 16: Git clone operations
@@ -1440,16 +1445,20 @@ test_lookup_enametoolong() {
     run_python_script_test \
         "Testing lookup on overlong names returns ENAMETOOLONG" \
         "lookup_enametoolong_repro.py" --dir "$TEST_DIR"
+}
+
 # Test 25: files created in setgid directories inherit the parent group
 test_setgid_group_inherit() {
-    CURRENT_TEST_GROUP="Test 24: Setgid Group Inheritance"
+    CURRENT_TEST_GROUP="Test 25: Setgid Group Inheritance"
     print_header "$CURRENT_TEST_GROUP"
     run_python_script_test \
         "Testing file group inheritance in setgid directories" \
         "setgid_group_inherit_repro.py" --dir "$TEST_DIR"
+}
+
 # Test 26: symlink owner/group metadata
 test_symlink_owner() {
-    CURRENT_TEST_GROUP="Test 24: Symlink Owner"
+    CURRENT_TEST_GROUP="Test 26: Symlink Owner"
     print_header "$CURRENT_TEST_GROUP"
     run_python_script_test \
         "Testing symlink owner and group metadata" \

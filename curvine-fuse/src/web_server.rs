@@ -37,9 +37,8 @@ impl WebServer {
             .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        log::info!("FUSE metrics server listening on {}", addr);
-
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        log::info!("FUSE metrics server listening on {}", addr);
         axum::serve(listener, app).await?;
         Ok(())
     }

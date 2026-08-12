@@ -265,6 +265,40 @@ impl FuseResponse {
         }
     }
 
+    fn encode_reply<T: Debug, E: Into<FuseError> + Debug>(
+        &self,
+        res: Result<T, E>,
+        unsupported_reason: Option<&'static str>,
+        interrupted: bool,
+    ) -> IOResult<(ResponseData, FuseReqStatus, i32)> {
+        match res {
+            Ok(v) => {
+                if self.debug {
+                    info!("send_rep unique {}, res: {:?}", self.unique, v);
+                }
+
+                let data = if size_of::<T>() == 0 {
+                    vec![]
+                } else {
+                    vec![DataSlice::buffer(FuseUtils::struct_as_buf(&v))]
+                };
+                self.create_success_response(data)
+            }
+
+            Err(e) => {
+                let e = e.into();
+                self.rep_log(&e);
+                let errno = e.errno;
+                let status = Self::err_status(unsupported_reason, interrupted);
+                Ok((
+                    ResponseData::create(self.unique, errno, vec![])?,
+                    status,
+                    errno,
+                ))
+            }
+        }
+    }
+
     async fn finish_request(
         &self,
         data: ResponseData,
@@ -278,7 +312,7 @@ impl FuseResponse {
                     .sender
                     .send(FuseTask::Reply(data))
                     .await
-                    .map_err(Into::into);
+                    .map_err(Into::into)
             }
             Some(slot) => slot,
         };
@@ -482,32 +516,7 @@ impl FuseResponse {
         unsupported_reason: Option<&'static str>,
         interrupted: bool,
     ) -> IOResult<()> {
-        let (data, status, errno) = match res {
-            Ok(v) => {
-                if self.debug {
-                    info!("send_rep unique {}, res: {:?}", self.unique, v);
-                }
-
-                let data = if size_of::<T>() == 0 {
-                    vec![]
-                } else {
-                    vec![DataSlice::buffer(FuseUtils::struct_as_buf(&v))]
-                };
-                self.create_success_response(data)?
-            }
-
-            Err(e) => {
-                let e = e.into();
-                self.rep_log(&e);
-                let errno = e.errno;
-                let status = Self::err_status(unsupported_reason, interrupted);
-                (
-                    ResponseData::create(self.unique, errno, vec![])?,
-                    status,
-                    errno,
-                )
-            }
-        };
+        let (data, status, errno) = self.encode_reply(res, unsupported_reason, interrupted)?;
 
         self.finish_request(data, status, errno, unsupported_reason)
             .await

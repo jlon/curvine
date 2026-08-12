@@ -99,6 +99,7 @@ impl QpairPool {
     }
 
     /// Get (active, max_active) for a controller.
+    #[cfg(test)]
     pub(crate) fn controller_stats(&self, ctrlr_ptr: usize) -> (usize, usize) {
         let state = self.ctrl_state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = state.get(&ctrlr_ptr) {

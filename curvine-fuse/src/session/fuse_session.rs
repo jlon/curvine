@@ -28,7 +28,7 @@ use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
 use crate::{err_fuse, FuseResult};
 use curvine_config::{ClusterConf, FuseConf};
-use curvine_core_error::{err_box, err_msg, CommonResult};
+use curvine_core_error::{err_box, err_msg, CommonError, CommonResult};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_io::IOResult;
 use curvine_runtime::common::CommonUtils;
@@ -41,6 +41,7 @@ use futures::future::select_all;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -245,22 +246,26 @@ impl<T: FileSystem> FuseSession<T> {
             self.shutdown_tx.subscribe(),
         ));
 
-        tokio::select! {
+        let (release_shutdown_resources, run_error) = tokio::select! {
             res = &mut run_all_handle => {
-                match res {
+                let run_error: Option<CommonError> = match res {
                     Ok(Ok(())) => {
                         info!("run_all finished (likely due to umount or ENODEV); proceeding to unmount and exit");
                         shutdown_once.record_once(SHUTDOWN_COMPLETED);
+                        None
                     }
                     Ok(Err(err)) => {
                         error!("fatal error in run_all, cause = {:?}", err);
                         shutdown_once.record_once(SHUTDOWN_RUN_ALL_ERROR);
+                        Some(err)
                     }
                     Err(e) => {
                         error!("run_all task panicked: {:?}", e);
                         shutdown_once.record_once(SHUTDOWN_RUN_ALL_PANIC);
+                        Some(e.into())
                     }
-                }
+                };
+                (true, run_error)
             }
 
             signal_result = SignalWatch::wait_quit() => {
@@ -278,6 +283,7 @@ impl<T: FileSystem> FuseSession<T> {
                 if let Err(e) = flatten_run_all_result(run_all_handle.await) {
                     error!("run_all failed during termination shutdown: {:?}", e);
                 }
+                (true, None)
             }
 
             signal_result = SignalWatch::wait_one(SignalKind::User1) => {
@@ -303,11 +309,20 @@ impl<T: FileSystem> FuseSession<T> {
                     return Err(e);
                 }
                 self.persist(mnts).await?;
+                (false, None)
+            }
+        };
+
+        if release_shutdown_resources {
+            if let Err(e) = self.fs.shutdown().await {
+                warn!("failed to release FUSE shutdown resources: {}", e);
             }
         }
-
         info!("calling fs.unmount() and finishing fuse session");
         self.fs.unmount();
+        if let Some(error) = run_error {
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -533,6 +548,7 @@ impl<T: FileSystem> FuseSession<T> {
         }
 
         fs.restore(&mut reader).await?;
+        refresh_fuse_pid_file();
 
         info!(
             "restore: task completed, file_path={}, elapsed={}ms",
@@ -540,6 +556,29 @@ impl<T: FileSystem> FuseSession<T> {
             ts.used_ms()
         );
         Ok(mnts)
+    }
+}
+
+/// A reload child is the only process that can prove state restoration succeeded.
+/// Refresh the launcher PID file here instead of making the parent shell race the
+/// child process startup.
+fn refresh_fuse_pid_file() {
+    let Ok(curvine_home) = std::env::var("CURVINE_HOME") else {
+        return;
+    };
+
+    let pid_file = PathBuf::from(curvine_home).join("fuse.pid");
+    let temp_file = pid_file.with_file_name(format!("fuse.pid.tmp.{}", std::process::id()));
+    let result = fs::write(&temp_file, format!("{}\n", std::process::id()))
+        .and_then(|_| fs::rename(&temp_file, &pid_file));
+
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_file);
+        warn!(
+            "failed to refresh FUSE pid file {}: {}",
+            pid_file.display(),
+            error
+        );
     }
 }
 

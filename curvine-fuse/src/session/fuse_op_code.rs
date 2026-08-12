@@ -143,9 +143,7 @@ impl FuseOpCode {
         use DispatchStatus::*;
         match self {
             // No-reply ops (send_none).
-            FuseOpCode::FUSE_FORGET
-            | FuseOpCode::FUSE_BATCH_FORGET
-            | FuseOpCode::FUSE_INTERRUPT => NoReply,
+            FuseOpCode::FUSE_FORGET | FuseOpCode::FUSE_BATCH_FORGET => NoReply,
 
             // Intentionally unsupported (ENOSYS via wildcard):
             //   - FUSE_BMAP:  logical->physical block map, only for block-backed
@@ -194,6 +192,10 @@ impl FuseOpCode {
             | FuseOpCode::FUSE_SETLKW
             | FuseOpCode::FUSE_ACCESS
             | FuseOpCode::FUSE_CREATE
+            // FUSE_INTERRUPT is a reply-bearing control request. Its reply
+            // acknowledges the control unique; the original request replies
+            // separately after it observes cancellation.
+            | FuseOpCode::FUSE_INTERRUPT
             | FuseOpCode::FUSE_DESTROY
             | FuseOpCode::FUSE_FALLOCATE
             | FuseOpCode::FUSE_READDIRPLUS
@@ -301,7 +303,7 @@ mod tests {
             (FuseOpCode::FUSE_SETLKW, Handled),
             (FuseOpCode::FUSE_ACCESS, Handled),
             (FuseOpCode::FUSE_CREATE, Handled),
-            (FuseOpCode::FUSE_INTERRUPT, NoReply),
+            (FuseOpCode::FUSE_INTERRUPT, Handled),
             (FuseOpCode::FUSE_BMAP, Unsupported),
             (FuseOpCode::FUSE_DESTROY, Handled),
             (FuseOpCode::FUSE_IOCTL, Handled),

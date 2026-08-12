@@ -49,6 +49,7 @@ pub(crate) const STAGE_REPLY_WRITE: &str = "reply_write";
 pub(crate) const STAGE_META_SPAWN: &str = "meta_spawn";
 pub(crate) const STAGE_OPERATION: &str = "operation";
 pub(crate) const STAGE_STREAM_IO: &str = "stream_io";
+pub(crate) const STAGE_READER_POOL_WAIT: &str = "reader_pool_wait";
 
 pub(crate) const IO_TYPE_READ: &str = "read";
 pub(crate) const IO_TYPE_WRITE: &str = "write";
@@ -191,6 +192,10 @@ pub struct FuseMetrics {
     pub(crate) io_duration_us: HistogramVec,
     pub(crate) io_bytes_total: CounterVec,
     pub(crate) io_requests_total: CounterVec,
+    pub(crate) open_cache_total: CounterVec,
+    pub(crate) read_pattern_total: CounterVec,
+    pub(crate) reader_pool_expansion_total: CounterVec,
+    pub(crate) dirty_read_reopen_total: CounterVec,
     pub(crate) io_size_bytes: HistogramVec,
     pub(crate) io_dispatch_duration_us: HistogramVec,
     pub(crate) stream_io_inflight: GaugeVec,
@@ -290,7 +295,7 @@ impl FuseMetrics {
             )?,
             interrupted_total: m::new_counter_vec(
                 "curvine_fuse_interrupted_total",
-                "FUSE requests terminated via the SETLKW interrupt path",
+                "FUSE requests terminated by a kernel interrupt",
                 &["opcode"],
             )?,
             unsupported_total: m::new_counter_vec(
@@ -345,7 +350,7 @@ impl FuseMetrics {
 
             receive_loop_wait_duration_us: m::new_histogram_with_buckets(
                 "curvine_fuse_receive_loop_wait_duration_us",
-                "Receiver loop wait (splice + header parse) in microseconds. \
+                "Receiver loop wait and header parse in microseconds. \
                  SATURATION/health metric, NOT request latency: includes idle wait for \
                  the next kernel request, so long idle periods land in high/+Inf buckets. \
                  Do not use for request P99.",
@@ -353,7 +358,7 @@ impl FuseMetrics {
             )?,
             receive_errors_total: m::new_counter_vec(
                 "curvine_fuse_receive_errors_total",
-                "Splice/receive errors before a request is decoded. action=continue \
+                "Receive errors before a request is decoded. action=continue \
                  (loop retries) or exit (loop stops: graceful ENODEV break or unexpected \
                  error return; the original error is still returned/logged)",
                 &["errno", "action"],
@@ -435,6 +440,30 @@ impl FuseMetrics {
                 "Stream read/write backend attempts, incremented once per attempt including \
                  status=error. Excludes zero-length writes (they never enter the writer task body)",
                 &["io_type", "path_type", "status"],
+            )?,
+            open_cache_total: m::new_counter_vec(
+                "curvine_fuse_open_cache_total",
+                "FUSE file-open cache decisions. policy=keep_cache preserves clean file pages; \
+                 status_changed drops pages after an mtime or length change; direct_io_config \
+                 and direct_io_stale bypass the page cache.",
+                &["policy"],
+            )?,
+            read_pattern_total: m::new_counter_vec(
+                "curvine_fuse_read_pattern_total",
+                "FUSE read request ordering in FUSE dispatch order. pattern=initial has no \
+                 preceding dispatched request for the handle, sequential starts at the preceding \
+                 request end, and positioned starts elsewhere.",
+                &["pattern"],
+            )?,
+            reader_pool_expansion_total: m::new_counter_vec(
+                "curvine_fuse_reader_pool_expansion_total",
+                "Additional readers opened by a per-handle FUSE reader pool. outcome is success or error.",
+                &["outcome"],
+            )?,
+            dirty_read_reopen_total: m::new_counter_vec(
+                "curvine_fuse_dirty_read_reopen_total",
+                "Reader reopens required to publish a flushed dirty-write snapshot before a read. outcome is success or error.",
+                &["outcome"],
             )?,
             io_size_bytes: m::new_histogram_vec_with_buckets(
                 "curvine_fuse_io_size_bytes",
@@ -820,6 +849,37 @@ impl FuseMetrics {
                 .with_label_values(&[io_type, path_type, FuseReqStatus::Success.as_str()])
                 .inc_by(transferred_bytes as i64);
         }
+    }
+
+    pub(crate) fn record_open_cache(&self, policy: &'static str) {
+        self.open_cache_total.with_label_values(&[policy]).inc();
+    }
+
+    pub(crate) fn record_read_pattern(&self, pattern: &'static str) {
+        self.read_pattern_total.with_label_values(&[pattern]).inc();
+    }
+
+    pub(crate) fn record_reader_pool_expansion(&self, outcome: &'static str) {
+        self.reader_pool_expansion_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    pub(crate) fn record_dirty_read_reopen(&self, outcome: &'static str) {
+        self.dirty_read_reopen_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    pub(crate) fn record_stream_stage(&self, stage: &'static str, ok: bool, elapsed_us: u64) {
+        let status = if ok {
+            FuseReqStatus::Success
+        } else {
+            FuseReqStatus::Error
+        };
+        self.stage_duration_us
+            .with_label_values(&[stage, FuseReqKind::Stream.as_str(), status.as_str()])
+            .observe(elapsed_us as f64);
     }
 
     pub(crate) fn stream_io_guard(
@@ -2145,6 +2205,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn record_open_cache_counts_each_policy() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const POLICY: &str = "test_keep_cache";
+        let before = mx.open_cache_total.with_label_values(&[POLICY]).get();
+
+        mx.record_open_cache(POLICY);
+
+        assert_eq!(
+            mx.open_cache_total.with_label_values(&[POLICY]).get(),
+            before + 1,
+        );
+    }
+
+    #[test]
+    fn record_read_pattern_counts_each_pattern() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const PATTERN: &str = "test_positioned";
+        let before = mx.read_pattern_total.with_label_values(&[PATTERN]).get();
+
+        mx.record_read_pattern(PATTERN);
+
+        assert_eq!(
+            mx.read_pattern_total.with_label_values(&[PATTERN]).get(),
+            before + 1,
+        );
+    }
+
+    #[test]
+    fn reader_pool_and_dirty_reopen_counters_record_outcomes() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const EXPANSION: &str = "test_expansion_success";
+        const REOPEN: &str = "test_reopen_error";
+        let expansion_before = mx
+            .reader_pool_expansion_total
+            .with_label_values(&[EXPANSION])
+            .get();
+        let reopen_before = mx
+            .dirty_read_reopen_total
+            .with_label_values(&[REOPEN])
+            .get();
+
+        mx.record_reader_pool_expansion(EXPANSION);
+        mx.record_dirty_read_reopen(REOPEN);
+
+        assert_eq!(
+            mx.reader_pool_expansion_total
+                .with_label_values(&[EXPANSION])
+                .get(),
+            expansion_before + 1,
+        );
+        assert_eq!(
+            mx.dirty_read_reopen_total
+                .with_label_values(&[REOPEN])
+                .get(),
+            reopen_before + 1,
+        );
+    }
+
     // Disabled is None (never noop); enabled inc/dec balances the GaugeVec child for
     // the io_type. Uses the real write child with before/after deltas, so parallel-safe.
     #[test]
@@ -2328,13 +2450,12 @@ mod tests {
         assert_eq!(PATH_TYPE_UNKNOWN, "unknown");
     }
 
-    // Negative assertion: stage=stream_io is the only stream stage value; there is
-    // no STAGE_STREAM_ENQUEUE const.
+    // Stream stages are a bounded enum. Request-queue stages do not belong here:
+    // their backpressure is owned by the kernel/FUSE transport.
     #[test]
-    fn stage_stream_io_is_the_only_stream_stage() {
+    fn stream_stage_names_are_bounded() {
         assert_eq!(STAGE_STREAM_IO, "stream_io");
-        // No STAGE_STREAM_ENQUEUE exists; if one were added this test's neighbors
-        // (the no-enqueue rule) and the send_stream code review would catch it.
+        assert_eq!(STAGE_READER_POOL_WAIT, "reader_pool_wait");
     }
 
     // --- helper tests ---
@@ -2661,6 +2782,7 @@ mod tests {
             STAGE_META_SPAWN,
             STAGE_OPERATION,
             STAGE_STREAM_IO,
+            STAGE_READER_POOL_WAIT,
         ];
         let state_stages = [
             STATE_STAGE_NODE_MAP,

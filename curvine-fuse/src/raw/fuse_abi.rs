@@ -250,8 +250,9 @@ pub struct fuse_getxattr_in {
     pub padding: u32,
 }
 
-/// The 8-byte compatibility form used unless `FUSE_SETXATTR_EXT` is negotiated.
-/// Curvine's INIT capability allowlist does not advertise that extension.
+/// The common prefix of both the compatibility and extended setxattr requests.
+/// When `FUSE_SETXATTR_EXT` is used, the kernel appends an 8-byte extension
+/// before the xattr name.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct fuse_setxattr_in {

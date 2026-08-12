@@ -15,7 +15,7 @@
 use crate::fs::operator::*;
 use crate::raw::fuse_abi::{
     fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_init_in, fuse_init_in_ext_tail,
-    fuse_ioctl_in, fuse_write_in,
+    fuse_ioctl_in, fuse_setxattr_in, fuse_write_in,
 };
 use crate::session::fuse_decoder::FuseDecoder;
 use crate::session::FuseOpCode::{self, *};
@@ -23,6 +23,7 @@ use crate::FuseResult;
 use crate::{FUSE_INIT_EXT, FUSE_IN_HEADER_LEN};
 use bytes::Bytes;
 use curvine_core_error::{err_box, CommonResult};
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 
 // fuse request data
@@ -172,12 +173,14 @@ impl FuseRequest {
             }),
 
             FUSE_SETXATTR => {
-                let arg = decoder.get_struct()?;
+                let arg: &fuse_setxattr_in = decoder.get_struct()?;
+                let body = decoder.get_all()?;
+                let (name, value) = parse_setxattr_body(body, arg.size as usize)?;
                 FuseOperator::SetXAttr(SetXAttr {
                     header,
                     arg,
-                    name: decoder.get_os_str()?,
-                    value: decoder.get_bytes(arg.size as usize)?,
+                    name,
+                    value,
                 })
             }
 
@@ -365,6 +368,40 @@ impl FuseRequest {
 
         Ok(op)
     }
+}
+
+fn parse_setxattr_body(body: &[u8], value_len: usize) -> FuseResult<(&OsStr, &[u8])> {
+    // Linux 6.8 sends the extended header for the ACL copy performed by
+    // `sed -i`. Accept it only when the rest of the payload matches exactly;
+    // older kernels retain the 8-byte compatibility layout.
+    for extension_len in [8, 0] {
+        if extension_len != 0
+            && !body
+                .get(4..8)
+                .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
+        {
+            continue;
+        }
+        let Some(payload) = body.get(extension_len..) else {
+            continue;
+        };
+        let mut decoder = FuseDecoder::new(payload);
+        let Ok(name) = decoder.get_os_str() else {
+            continue;
+        };
+        let Ok(value) = decoder.get_bytes(value_len) else {
+            continue;
+        };
+        if decoder.ensure_empty().is_ok() {
+            return Ok((name, value));
+        }
+    }
+
+    err_box!(
+        "Invalid FUSE_SETXATTR payload: body={}, value={}",
+        body.len(),
+        value_len
+    )
 }
 
 impl Display for FuseRequest {
@@ -695,6 +732,48 @@ mod tests {
                 assert_eq!(op.name, OsStr::new("user.curvine.full-name"));
                 assert_eq!(op.value, value);
                 assert_eq!(op.arg.flags, libc::XATTR_CREATE as u32);
+            }
+            other => panic!("expected SetXAttr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setxattr_accepts_extended_header() {
+        let name = b"system.posix_acl_access\0";
+        let value = [
+            2, 0, 0, 0, 1, 0, 6, 0, 0xff, 0xff, 0xff, 0xff, 4, 0, 6, 0, 0xff, 0xff, 0xff, 0xff,
+            0x20, 0, 4, 0, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let arg = fuse_setxattr_in {
+            size: value.len() as u32,
+            flags: 0,
+        };
+        let extension = [0u8; 8];
+        let request_len = size_of::<fuse_in_header>()
+            + size_of::<fuse_setxattr_in>()
+            + extension.len()
+            + name.len()
+            + value.len();
+        let header = fuse_in_header {
+            len: request_len as u32,
+            opcode: FUSE_SETXATTR as u32,
+            unique: 42,
+            nodeid: 7,
+            ..Default::default()
+        };
+
+        let mut bytes = BytesMut::with_capacity(request_len);
+        bytes.extend_from_slice(FuseUtils::struct_as_bytes(&header));
+        bytes.extend_from_slice(FuseUtils::struct_as_bytes(&arg));
+        bytes.extend_from_slice(&extension);
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&value);
+
+        let request = FuseRequest::from_bytes(bytes.freeze()).unwrap();
+        match request.parse_operator().unwrap() {
+            FuseOperator::SetXAttr(op) => {
+                assert_eq!(op.name, OsStr::new("system.posix_acl_access"));
+                assert_eq!(op.value, value);
             }
             other => panic!("expected SetXAttr, got {other:?}"),
         }

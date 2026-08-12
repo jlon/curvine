@@ -118,6 +118,10 @@ pub(crate) fn errno_of(value: &FsError) -> i32 {
         FsError::InProgress(_) => Some(libc::EBUSY),
         FsError::UnsupportedUfsRead(_) => Some(libc::EOPNOTSUPP),
         FsError::ReadOnly(_) => Some(libc::EROFS),
+        // RPC timeouts cross the client boundary as `IOError`, which becomes
+        // `FsError::IO`. Preserve the underlying OS error kind rather than
+        // reporting a backend timeout to FUSE as a generic EIO.
+        FsError::IO(error) if error.kind() == std::io::ErrorKind::TimedOut => Some(libc::ETIMEDOUT),
         _ => None,
     };
 
@@ -183,7 +187,7 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
     }
 }
 
-pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
+pub(crate) fn receive_errno_label(errno: i32) -> &'static str {
     match errno {
         libc::ENOENT => "enoent",
         libc::EINTR => "eintr",
@@ -196,8 +200,18 @@ pub(crate) fn splice_errno_label(errno: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{errno_label, splice_errno_label, FuseError};
+    use super::{errno_label, receive_errno_label, FuseError};
     use curvine_error::FsError;
+
+    #[test]
+    fn io_timeout_maps_to_etimedout() {
+        let err = FsError::from(curvine_io::IOError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "worker read timed out",
+        )));
+
+        assert_eq!(super::errno_of(&err), libc::ETIMEDOUT);
+    }
 
     // Display prints the errno NUMBER first, then the message ("errno 2: ...").
     #[test]
@@ -283,16 +297,16 @@ mod tests {
     }
 
     #[test]
-    fn splice_errno_label_maps_the_lowercase_set() {
+    fn receive_errno_label_maps_the_lowercase_set() {
         // The 5 lowercase values the receiver loop actually matches on.
-        assert_eq!(splice_errno_label(libc::ENOENT), "enoent");
-        assert_eq!(splice_errno_label(libc::EINTR), "eintr");
-        assert_eq!(splice_errno_label(libc::EAGAIN), "eagain");
-        assert_eq!(splice_errno_label(libc::ENODEV), "enodev");
-        assert_eq!(splice_errno_label(libc::ECONNABORTED), "econnaborted");
+        assert_eq!(receive_errno_label(libc::ENOENT), "enoent");
+        assert_eq!(receive_errno_label(libc::EINTR), "eintr");
+        assert_eq!(receive_errno_label(libc::EAGAIN), "eagain");
+        assert_eq!(receive_errno_label(libc::ENODEV), "enodev");
+        assert_eq!(receive_errno_label(libc::ECONNABORTED), "econnaborted");
         // Anything else (incl. 0 / unknown) collapses to lowercase "other".
-        assert_eq!(splice_errno_label(libc::EIO), "other");
-        assert_eq!(splice_errno_label(0), "other");
-        assert_eq!(splice_errno_label(99999), "other");
+        assert_eq!(receive_errno_label(libc::EIO), "other");
+        assert_eq!(receive_errno_label(0), "other");
+        assert_eq!(receive_errno_label(99999), "other");
     }
 }

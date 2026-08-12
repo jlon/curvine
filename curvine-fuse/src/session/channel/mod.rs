@@ -20,6 +20,7 @@ use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::channel::AsyncChannel;
 use curvine_runtime::sync::FastDashMap;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 mod fuse_receiver;
 pub use self::fuse_receiver::FuseReceiver;
@@ -45,6 +46,11 @@ impl<T: FileSystem> FuseChannel<T> {
         let mut receivers = Vec::with_capacity(tasks_per_mnt);
         let mut senders = Vec::with_capacity(tasks_per_mnt);
         let pending_requests = Arc::new(FastDashMap::default());
+        // All cloned /dev/fuse receivers share both the pending map and its
+        // registration event stream. An Interrupt may be read by a different
+        // receiver than the request it targets.
+        let (pending_request_events, _) = watch::channel(0);
+        let pending_request_events = Arc::new(pending_request_events);
         let mnt_label = mnt.path.to_string_lossy().into_owned();
         for idx in 0..tasks_per_mnt {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
@@ -73,7 +79,7 @@ impl<T: FileSystem> FuseChannel<T> {
                 conf.audit_logging_enabled,
                 conf.metrics_enabled,
                 pending_requests.clone(),
-                conf.enable_splice,
+                pending_request_events.clone(),
             )?;
 
             senders.push(sender);

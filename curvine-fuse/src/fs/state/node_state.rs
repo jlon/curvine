@@ -63,7 +63,6 @@ impl NodeState {
         let conf = fs.conf().fuse.clone();
         let meta_cache_ttl = conf.meta_cache_ttl.as_millis() as u64;
         let enable_meta_cache = conf.enable_meta_cache;
-
         let state = Self {
             dir_tree: RwLock::new(DirTree::new(conf.clone())),
             writers: AsyncSharedMap::default(),
@@ -99,6 +98,10 @@ impl NodeState {
 
     pub fn cluster_conf(&self) -> &ClusterConf {
         self.fs.conf()
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.conf.metrics_enabled
     }
 
     pub fn invalid_cache(&self, ino: u64, name: Option<&str>, reason: &'static str) {

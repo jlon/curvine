@@ -33,10 +33,18 @@ import sys
 import time
 import signal
 import subprocess
+import tempfile
+import hashlib
+import mmap
+import argparse
+from concurrent.futures import ThreadPoolExecutor
 
 
 MNT_PATH = "/curvine-fuse"
+PID_FILE = None
 KB_SIZE = 1024
+POST_RELOAD_FILE_SIZE = 16 * 1024 * 1024
+POST_RELOAD_SAMPLE_OFFSETS = (0, 4096, 1024 * 1024, POST_RELOAD_FILE_SIZE - 4096)
 
 
 def check_mount_point(mount_path):
@@ -101,26 +109,17 @@ def check_mount_point(mount_path):
 
 
 def get_fuse_process_pid():
-    """Get the PID of curvine-fuse process.
-    
-    Returns:
-        int: Process PID, or None if not found
-    """
+    """Read and validate the exact FUSE daemon PID maintained by its launcher."""
     try:
-        result = subprocess.run(
-            ['pgrep', '-f', 'curvine-fuse'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            pids = [pid.strip() for pid in result.stdout.strip().split('\n') if pid.strip()]
-            # Return the last PID (newest process)
-            if pids:
-                return int(pids[-1])
+        with open(PID_FILE, "r", encoding="utf-8") as pid_handle:
+            pid = int(pid_handle.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as comm_handle:
+            if comm_handle.read().strip() != "curvine-fuse":
+                raise RuntimeError(f"{PID_FILE} points to a non-FUSE process: {pid}")
+        return pid
     except Exception as e:
-        print(f"Warning: Failed to get fuse process PID: {e}")
+        print(f"Warning: Failed to read FUSE PID file {PID_FILE}: {e}")
     return None
 
 
@@ -162,6 +161,91 @@ def generate_test_data(size):
     return pattern[:size]
 
 
+def wait_for_reload(previous_pid, timeout_seconds=15):
+    """Wait for the reload child to replace the original FUSE process."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current_pid = get_fuse_process_pid()
+        if current_pid is not None and current_pid != previous_pid:
+            return current_pid
+        time.sleep(0.2)
+    return None
+
+
+def read_direct(source_path, destination_path):
+    """Use dd O_DIRECT reads to bypass the caller's page cache."""
+    subprocess.run(
+        [
+            "dd",
+            f"if={source_path}",
+            f"of={destination_path}",
+            "bs=1M",
+            "iflag=direct",
+            "status=none",
+        ],
+        check=True,
+        timeout=30,
+    )
+    with open(destination_path, "rb") as output:
+        return hashlib.sha256(output.read()).digest()
+
+
+def verify_post_reload_data_path(skip_mmap=False):
+    """Exercise new page faults and direct reads after the replacement daemon starts."""
+    path = os.path.join(MNT_PATH, "curvine_fuse_reload_post_recovery.bin")
+    direct_copy = "/tmp/curvine_fuse_reload_direct_read.bin"
+    pattern = bytes(range(256))
+    payload = pattern * (POST_RELOAD_FILE_SIZE // len(pattern))
+    expected_digest = hashlib.sha256(payload).digest()
+
+    try:
+        with open(path, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+
+        # Evict this file from the caller's page cache before mapping it. A fresh
+        # open alone may still be satisfied by the pages populated during write.
+        with open(path, "rb") as input_file:
+            os.posix_fadvise(input_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            random_read_offset = 4 * 1024 * 1024
+            random_read_size = 512 * 1024
+            actual = os.pread(input_file.fileno(), random_read_size, random_read_offset)
+            expected = payload[random_read_offset:random_read_offset + random_read_size]
+            if actual != expected:
+                raise RuntimeError("random pread content mismatch after reload")
+            # Linux FUSE direct-IO mounts intentionally do not support mmap.
+            # Keep mmap coverage for cached mounts, while direct-IO callers can
+            # still verify the remote read, O_DIRECT, and concurrent-read paths.
+            if not skip_mmap:
+                with mmap.mmap(input_file.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                    for offset in POST_RELOAD_SAMPLE_OFFSETS:
+                        expected = payload[offset:offset + 4096]
+                        if mapped[offset:offset + 4096] != expected:
+                            raise RuntimeError(f"mmap content mismatch at offset {offset}")
+
+        direct_digest = read_direct(path, direct_copy)
+        if direct_digest != expected_digest:
+            raise RuntimeError("O_DIRECT digest mismatch after reload")
+
+        # Separate file descriptors make the kernel issue concurrent FUSE READs.
+        def read_sample(offset):
+            with open(path, "rb", buffering=0) as input_file:
+                input_file.seek(offset)
+                return offset, input_file.read(4096)
+
+        with ThreadPoolExecutor(max_workers=len(POST_RELOAD_SAMPLE_OFFSETS)) as executor:
+            for offset, actual in executor.map(read_sample, POST_RELOAD_SAMPLE_OFFSETS):
+                if actual != payload[offset:offset + 4096]:
+                    raise RuntimeError(f"concurrent read mismatch at offset {offset}")
+    finally:
+        for candidate in (path, direct_copy):
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                pass
+
+
 def verify_data(data, expected_size, file_path):
     """Verify data matches expected pattern.
     
@@ -192,6 +276,19 @@ def verify_data(data, expected_size, file_path):
 
 def main():
     """Main test function."""
+    global MNT_PATH, PID_FILE
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mnt-path", default=MNT_PATH)
+    parser.add_argument("--pid-file", required=True)
+    parser.add_argument(
+        "--skip-mmap",
+        action="store_true",
+        help="skip mmap validation for a Linux FUSE direct-IO mount",
+    )
+    args = parser.parse_args()
+    MNT_PATH = args.mnt_path
+    PID_FILE = args.pid_file
+
     print("=" * 60)
     print("FUSE Reload Test")
     print("=" * 60)
@@ -270,9 +367,12 @@ def main():
         print("ERROR: Failed to send reload signal")
         sys.exit(1)
 
-    print("Sleeping 3 seconds for hot reload to complete...")
-    time.sleep(3)
-    print("✓ Hot reload completed")
+    print("Waiting for reload child to take over the FUSE session...")
+    reloaded_pid = wait_for_reload(fuse_pid)
+    if reloaded_pid is None:
+        print("ERROR: FUSE reload child did not replace the original process")
+        sys.exit(1)
+    print(f"✓ Hot reload completed: PID {fuse_pid} -> {reloaded_pid}")
 
     # Verify file handles are still the same after reload
     file1_f_id_after = id(file1_f)
@@ -383,6 +483,17 @@ def main():
             file1_f.close()
         if file2_f:
             file2_f.close()
+
+    # This must run after the old descriptors have been proven usable. It covers
+    # fresh page faults and direct reads delivered to the replacement daemon.
+    data_path_checks = "O_DIRECT and concurrent reads" if args.skip_mmap else "mmap, O_DIRECT, and concurrent reads"
+    print(f"\n[Step 7] Verifying {data_path_checks} after reload...")
+    try:
+        verify_post_reload_data_path(args.skip_mmap)
+        print(f"✓ Post-reload {data_path_checks} verified")
+    except Exception as e:
+        print(f"ERROR: Post-reload data path verification failed: {e}")
+        sys.exit(1)
     
     # Cleanup
     print("\n[Cleanup] Removing test files...")
@@ -404,4 +515,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

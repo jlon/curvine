@@ -14,7 +14,7 @@
 
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
-use crate::fuse_error::splice_errno_label;
+use crate::fuse_error::receive_errno_label;
 use crate::fuse_metrics::{
     dispatch_io_type, lifecycle_io_type, mono_now, ActiveGuard, FuseMetrics, FuseReqCtx,
     FuseReqKind, FuseReqLabels, FuseReqStatus, RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
@@ -23,17 +23,23 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use bytes::BytesMut;
-use curvine_core_error::{err_box, try_option_ref};
+use curvine_core_error::err_box;
 use curvine_io::IOResult;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use curvine_runtime::sync::channel::AsyncSender;
 use curvine_runtime::sync::FastDashMap;
 use curvine_sys as sys;
-use curvine_sys::pipe::{AsyncFd, Pipe2, PipeFd};
+use curvine_sys::pipe::AsyncFd;
 use libc::{EAGAIN, ECONNABORTED, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{watch, Notify};
+
+// FUSE permits INTERRUPT to be delivered before the original request has been
+// read from /dev/fuse. Wait for a registration event before asking the kernel to
+// requeue the control request; the bound only applies to this exceptional path.
+const FUSE_INTERRUPT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Removes an interruptible-request registration when its dispatch future ends.
 /// `Drop` covers cancellation paths (e.g. task abort on shutdown) where neither
@@ -67,7 +73,7 @@ impl PendingRequestGuard {
 
         // Only remove our own registration: an older future's Drop must not
         // delete a same-unique replacement installed after it.
-        let _ = self.pending_requests.remove_if(&self.unique, |_, current| {
+        self.pending_requests.remove_if(&self.unique, |_, current| {
             Arc::ptr_eq(current, &self.notify)
         });
         self.registered = false;
@@ -87,13 +93,13 @@ pub struct FuseReceiver<T> {
     fs: Arc<T>,
     rt: Arc<Runtime>,
     sender: AsyncSender<FuseTask>,
-    pipe2: Option<Pipe2>,
     buf: BytesMut,
     fuse_len: usize,
     debug: bool,
     audit_logging_enabled: bool,
     metrics_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+    pending_request_events: Arc<watch::Sender<u64>>,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
@@ -108,13 +114,8 @@ impl<T: FileSystem> FuseReceiver<T> {
         audit_logging_enabled: bool,
         metrics_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
-        enable_splice: bool,
+        pending_request_events: Arc<watch::Sender<u64>>,
     ) -> IOResult<Self> {
-        let pipe2 = if enable_splice {
-            Some(Pipe2::new(PipeFd::new(buf_size, false, false)?)?)
-        } else {
-            None
-        };
         let buf = BytesMut::zeroed(buf_size);
 
         let client = Self {
@@ -122,24 +123,20 @@ impl<T: FileSystem> FuseReceiver<T> {
             fs,
             rt,
             sender,
-            pipe2,
             buf,
             fuse_len: buf_size,
             debug,
             audit_logging_enabled,
             metrics_enabled,
             pending_requests,
+            pending_request_events,
         };
 
         Ok(client)
     }
 
     pub async fn receive(&mut self) -> IOResult<BytesMut> {
-        if self.pipe2.is_some() {
-            self.splice().await
-        } else {
-            self.read().await
-        }
+        self.read().await
     }
 
     pub async fn read(&mut self) -> IOResult<BytesMut> {
@@ -160,62 +157,6 @@ impl<T: FileSystem> FuseReceiver<T> {
         }
 
         Ok(self.buf.split_to(len))
-    }
-
-    pub async fn splice(&mut self) -> IOResult<BytesMut> {
-        let pipe2 = try_option_ref!(self.pipe2);
-
-        let write_len = pipe2.write_io(&self.kernel_fd, None, self.fuse_len).await?;
-        if write_len < FUSE_IN_HEADER_LEN {
-            // No errno: this tears the receiver down, so there is no next frame to
-            // poison. Drain anyway in case a short splice ever becomes recoverable.
-            if write_len > 0 {
-                Self::drain_pipe(pipe2);
-            }
-            return err_box!(
-                "short splice on fuse device: spliced {} bytes, expected at least {} bytes",
-                write_len,
-                FUSE_IN_HEADER_LEN
-            );
-        }
-
-        Self::prepare_receive_buf(&mut self.buf, write_len);
-
-        let read_len = match pipe2.read_buf(&mut self.buf[..write_len]).await {
-            Ok(read_len) => read_len,
-            Err(err) => {
-                // Recoverable (real errno): the loop may `continue` to the next
-                // frame, so drain the stale bytes that would otherwise poison it.
-                Self::drain_pipe(pipe2);
-                return Err(err.into());
-            }
-        };
-        if write_len != read_len {
-            Self::drain_pipe(pipe2);
-            return err_box!(
-                "splice read and write lengths are inconsistent: write len {}, read len {}",
-                write_len,
-                read_len
-            );
-        }
-        Ok(self.buf.split_to(read_len))
-    }
-
-    fn drain_pipe(pipe2: &Pipe2) {
-        let fd = pipe2.read_raw_fd();
-        let mut buf = [0u8; 8192];
-        loop {
-            match sys::read(fd, &mut buf) {
-                Ok(n) if n > 0 => continue,
-                Ok(_) => break,
-                Err(err) => {
-                    if err.raw_os_error() == Some(EINTR) {
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
     }
 
     fn prepare_receive_buf(buf: &mut BytesMut, len: usize) {
@@ -276,12 +217,67 @@ impl<T: FileSystem> FuseReceiver<T> {
         );
     }
 
+    /// Registers an interruptible metadata request before handing it to the
+    /// runtime. The FUSE device can deliver an INTERRUPT as soon as the request
+    /// is decoded, while the dispatched task may not have been polled yet.
+    fn register_interruptible_meta_request(
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+        req: &FuseRequest,
+        pending_request_events: Option<&watch::Sender<u64>>,
+    ) -> Option<(PendingRequestGuard, Arc<Notify>)> {
+        if !req.is_interruptible_wait() {
+            return None;
+        }
+
+        let notify = Arc::new(Notify::new());
+        let pending = Self::register_pending_request(
+            pending_requests,
+            req.unique(),
+            notify.clone(),
+            pending_request_events,
+        );
+        Some((pending, notify))
+    }
+
+    fn register_pending_request(
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+        unique: u64,
+        notify: Arc<Notify>,
+        pending_request_events: Option<&watch::Sender<u64>>,
+    ) -> PendingRequestGuard {
+        let pending = PendingRequestGuard::register(pending_requests, unique, notify);
+        if let Some(events) = pending_request_events {
+            events.send_modify(|version| *version = version.wrapping_add(1));
+        }
+        pending
+    }
+
     pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
         // Build the ctx before parsing, so a later parse failure is a real
         // finish-state event (matching the metadata path).
         let labels = self.maybe_req_labels(&req);
         let rep = self.new_reply(req.unique(), labels);
-        Self::send_stream_dispatch(&self.fs, req, rep).await
+        if req.opcode() != FuseOpCode::FUSE_READ {
+            return Self::send_stream_dispatch(&self.fs, req, rep, None).await;
+        }
+
+        let notify = Arc::new(Notify::new());
+        let pending = Self::register_pending_request(
+            self.pending_requests.clone(),
+            req.unique(),
+            notify.clone(),
+            Some(self.pending_request_events.as_ref()),
+        );
+        let fs = self.fs.clone();
+        self.rt.spawn(async move {
+            // The guard remains alive until the reader has replied or cleaned
+            // up, so FUSE_INTERRUPT always targets the actual READ task.
+            let _pending = pending;
+            if let Err(e) = Self::send_stream_dispatch(&fs, req, rep, Some(notify)).await {
+                error!("failed to dispatch interruptible read request: {}", e);
+            }
+        });
+        Ok(())
     }
 
     /// Stream dispatch + IO attribution core, factored out of `send_stream` so tests
@@ -291,6 +287,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         fs: &Arc<T>,
         req: FuseRequest,
         rep: FuseResponse,
+        read_cancel: Option<Arc<Notify>>,
     ) -> FuseResult<()> {
         let metrics_enabled = rep.metrics.is_some();
         // Parse failure here is after the ctx exists: finish it early (no reply).
@@ -325,7 +322,10 @@ impl<T: FileSystem> FuseReceiver<T> {
         // fallback is unreachable today (entered only when `is_stream()`); it
         // guards against the two drifting apart.
         let res = match operator {
-            FuseOperator::Read(op) => fs.read(op, rep).await,
+            FuseOperator::Read(op) => match read_cancel {
+                Some(cancel) => fs.read_interruptible(op, rep, cancel).await,
+                None => fs.read(op, rep).await,
+            },
 
             FuseOperator::Write(op) => fs.write(op, rep).await,
 
@@ -447,8 +447,18 @@ impl<T: FileSystem> FuseReceiver<T> {
                             } else {
                                 let labels = self.maybe_req_labels(&req);
                                 let reply = self.new_reply(req.unique(), labels);
+                                // Register before spawn. Otherwise an INTERRUPT can
+                                // be decoded while this metadata task is queued but
+                                // has not run far enough to register itself.
+                                let interruptible_meta =
+                                    Self::register_interruptible_meta_request(
+                                        self.pending_requests.clone(),
+                                        &req,
+                                        Some(self.pending_request_events.as_ref()),
+                                    );
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
+                                let pending_request_events = self.pending_request_events.clone();
                                 // Guard + spawn timer built before spawn so they
                                 // cover the runtime queue wait (submit -> first poll).
                                 let meta_guard = FuseMetrics::meta_task_guard(self.metrics_enabled);
@@ -459,10 +469,30 @@ impl<T: FileSystem> FuseReceiver<T> {
                                         FuseMetrics::get()
                                             .record_meta_spawn(start.elapsed().as_micros() as u64);
                                     }
-                                    let dispatch_result = Self::dispatch_meta_interrupt(
-                                        fs, pending_requests, req, reply,
-                                    )
-                                    .await;
+                                    let dispatch_result = match interruptible_meta {
+                                        Some((pending, notify)) => {
+                                            Self::dispatch_registered_meta_interrupt(
+                                                fs,
+                                                pending_requests,
+                                                req,
+                                                reply,
+                                                pending,
+                                                notify,
+                                                pending_request_events.clone(),
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            Self::dispatch_meta_with_events(
+                                                &pending_requests,
+                                                &fs,
+                                                &req,
+                                                &reply,
+                                                Some(pending_request_events),
+                                            )
+                                            .await
+                                        }
+                                    };
                                     // Drop the guard before the error log, so the
                                     // inflight scope excludes log-formatting time.
                                     drop(meta_guard);
@@ -524,14 +554,33 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: FuseRequest,
         reply: FuseResponse,
     ) -> FuseResult<()> {
-        if !req.is_interruptible_wait() {
+        let Some((pending_request, notify)) =
+            Self::register_interruptible_meta_request(pending_requests.clone(), &req, None)
+        else {
             return Self::dispatch_meta(&pending_requests, &fs, &req, &reply).await;
-        }
+        };
 
-        let notify = Arc::new(Notify::new());
-        let mut pending_request =
-            PendingRequestGuard::register(pending_requests.clone(), req.unique(), notify.clone());
+        Self::dispatch_registered_meta_interrupt(
+            fs,
+            pending_requests,
+            req,
+            reply,
+            pending_request,
+            notify,
+            Arc::new(watch::channel(0).0),
+        )
+        .await
+    }
 
+    async fn dispatch_registered_meta_interrupt(
+        fs: Arc<T>,
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+        req: FuseRequest,
+        reply: FuseResponse,
+        mut pending_request: PendingRequestGuard,
+        notify: Arc<Notify>,
+        pending_request_events: Arc<watch::Sender<u64>>,
+    ) -> FuseResult<()> {
         // Built before the `select!` so they wrap the WHOLE interruptible scope: an
         // interrupt winning before `set_lkw()` is polled still records. Measures
         // request duration, NOT lock-acquisition time (backpressure inflates it).
@@ -539,7 +588,13 @@ impl<T: FileSystem> FuseReceiver<T> {
         let _setlkw_wait = FuseMetrics::setlkw_wait_timer(reply.metrics.is_some());
 
         let res = tokio::select! {
-            result = Self::dispatch_meta(&pending_requests, &fs, &req, &reply) => {
+            result = Self::dispatch_meta_with_events(
+                &pending_requests,
+                &fs,
+                &req,
+                &reply,
+                Some(pending_request_events),
+            ) => {
                 pending_request.remove();
                 result
             }
@@ -560,6 +615,16 @@ impl<T: FileSystem> FuseReceiver<T> {
         fs: &T,
         req: &FuseRequest,
         reply: &FuseResponse,
+    ) -> FuseResult<()> {
+        Self::dispatch_meta_with_events(pending_requests, fs, req, reply, None).await
+    }
+
+    async fn dispatch_meta_with_events(
+        pending_requests: &FastDashMap<u64, Arc<Notify>>,
+        fs: &T,
+        req: &FuseRequest,
+        reply: &FuseResponse,
+        pending_request_events: Option<Arc<watch::Sender<u64>>>,
     ) -> FuseResult<()> {
         // Parse failure here is after the ctx exists: finish it early (no reply).
         let operator = match req.parse_operator() {
@@ -638,13 +703,21 @@ impl<T: FileSystem> FuseReceiver<T> {
             FuseOperator::Destroy(op) => reply.send_rep(fs.destroy(op).await).await,
 
             FuseOperator::Interrupt(op) => {
-                let res = if let Some(notify) = pending_requests.get(&op.arg.unique) {
+                let pending = Self::wait_for_pending_interrupt(
+                    pending_requests,
+                    pending_request_events.as_deref(),
+                    op.arg.unique,
+                )
+                .await;
+                if let Some(notify) = pending {
+                    // FUSE_INTERRUPT has no reply when its target is pending. The
+                    // target request owns the EINTR reply, which the kernel matches
+                    // by the target request's unique id.
                     notify.notify_one();
-                    Ok(())
+                    reply.send_none(Ok(()))
                 } else {
-                    fs.interrupt(op).await
-                };
-                reply.send_none(res)
+                    reply.send_rep(fs.interrupt(op).await).await
+                }
             }
 
             FuseOperator::Symlink(op) => reply.send_rep(fs.symlink(op).await).await,
@@ -713,13 +786,43 @@ impl<T: FileSystem> FuseReceiver<T> {
         res?;
         Ok(())
     }
+
+    async fn wait_for_pending_interrupt(
+        pending_requests: &FastDashMap<u64, Arc<Notify>>,
+        pending_request_events: Option<&watch::Sender<u64>>,
+        unique: u64,
+    ) -> Option<Arc<Notify>> {
+        let pending = || pending_requests.get(&unique).map(|notify| notify.clone());
+        if let Some(notify) = pending() {
+            return Some(notify);
+        }
+
+        let events = pending_request_events?;
+        let mut events = events.subscribe();
+        let deadline = tokio::time::Instant::now() + FUSE_INTERRUPT_LOOKUP_TIMEOUT;
+        loop {
+            if let Some(notify) = pending() {
+                return Some(notify);
+            }
+            tokio::select! {
+                changed = events.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// Classify a receive errno into `receive_errors_total{errno,action}` labels,
 /// mirroring the `start()` loop: ENOENT/EINTR/EAGAIN continue, all else exits.
 /// A free fn (not a method) so it is testable without a `FuseReceiver`.
 fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
-    let errno = splice_errno_label(os_errno.unwrap_or(0));
+    let errno = receive_errno_label(os_errno.unwrap_or(0));
     let action = match os_errno {
         Some(ENOENT) | Some(EINTR) | Some(EAGAIN) => RECEIVE_ACTION_CONTINUE,
         _ => RECEIVE_ACTION_EXIT,
@@ -762,7 +865,7 @@ mod tests {
                 false,
                 false,
                 Arc::new(FastDashMap::default()),
-                false,
+                Arc::new(watch::channel(0).0),
             )
             .unwrap();
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -825,6 +928,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_interrupt_waits_for_later_request_registration() {
+        let pending: Arc<FastDashMap<u64, Arc<Notify>>> = Arc::new(FastDashMap::default());
+        let (events, _) = watch::channel(0);
+        let pending_for_wait = pending.clone();
+        let events_for_wait = events.clone();
+        let waiter = tokio::spawn(async move {
+            FuseReceiver::<TestFileSystem>::wait_for_pending_interrupt(
+                &pending_for_wait,
+                Some(&events_for_wait),
+                42,
+            )
+            .await
+        });
+
+        // The target request is deliberately registered after the control task
+        // starts, matching the FUSE ordering where INTERRUPT arrives first.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let expected = Arc::new(Notify::new());
+        let _guard = FuseReceiver::<TestFileSystem>::register_pending_request(
+            pending,
+            42,
+            expected.clone(),
+            Some(&events),
+        );
+
+        let resolved = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("registration event wakes the pending Interrupt")
+            .expect("waiter task succeeds")
+            .expect("the later request is found");
+        assert!(
+            Arc::ptr_eq(&resolved, &expected),
+            "Interrupt resolves to the notify registered after its initial lookup"
+        );
+    }
+
     #[test]
     fn prepare_receive_buf_does_not_return_stale_tail_bytes() {
         let first = b"first-request-with-a-tail";
@@ -869,12 +1009,13 @@ mod tests {
             fuse_rename2_in,
         };
         use crate::session::{FuseRequest, FuseResponse, FuseTask};
-        use crate::FuseUtils;
+        use crate::{err_fuse, FuseUtils};
         use bytes::{BufMut, BytesMut};
         use curvine_config::FuseConf;
         use curvine_metrics::Metrics as m;
         use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver};
         use curvine_runtime::sync::FastDashMap;
+        use tokio::sync::watch;
 
         // Each test uses a DISTINCT opcode: they run in parallel and assert deltas
         // on the shared process-global registry, so a shared opcode would make the
@@ -989,7 +1130,7 @@ mod tests {
         impl FileSystem for InterruptTrackingFileSystem {
             async fn interrupt(&self, _op: crate::fs::operator::Interrupt<'_>) -> FuseResult<()> {
                 self.called.store(true, Ordering::SeqCst);
-                Ok(())
+                err_fuse!(libc::EAGAIN, "interrupted request is not pending")
             }
         }
 
@@ -1062,32 +1203,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn interrupt_notifies_pending_request_and_enqueues_nothing() {
-            let interrupted_unique = 2001;
+        async fn interrupt_notifies_pending_request_without_control_reply() {
+            let interrupted_unique = 2000;
+            let control_unique = interrupted_unique | 1;
             let pending = FastDashMap::default();
             let notify = std::sync::Arc::new(tokio::sync::Notify::new());
             pending.insert(interrupted_unique, notify.clone());
-            let (reply, mut rx) = metrics_reply(1006, "Interrupt");
+            let (reply, mut rx) = metrics_reply(control_unique, "Interrupt");
             let fallback_called = Arc::new(AtomicBool::new(false));
             let fs = InterruptTrackingFileSystem {
                 called: fallback_called.clone(),
             };
+            let request = interrupt_request(control_unique, interrupted_unique);
 
-            super::super::FuseReceiver::dispatch_meta(
-                &pending,
-                &fs,
-                &interrupt_request(1006, interrupted_unique),
-                &reply,
-            )
-            .await
-            .unwrap();
-
+            super::super::FuseReceiver::dispatch_meta(&pending, &fs, &request, &reply)
+                .await
+                .unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
                 .await
-                .expect("pending request is notified");
+                .expect("pending request is notified immediately");
             assert!(
                 rx.try_recv().unwrap().is_none(),
-                "Interrupt is no-reply: no task enqueued"
+                "matched FUSE_INTERRUPT has no reply; the target owns the EINTR reply"
             );
             assert!(
                 !fallback_called.load(Ordering::SeqCst),
@@ -1096,30 +1233,46 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn late_interrupt_enqueues_nothing() {
+        async fn late_interrupt_requests_kernel_retry() {
+            let control_unique = 2003;
             let pending = FastDashMap::default();
-            let (reply, mut rx) = metrics_reply(1007, "Interrupt");
+            let (reply, mut rx) = metrics_reply(control_unique, "Interrupt");
             let fallback_called = Arc::new(AtomicBool::new(false));
             let fs = InterruptTrackingFileSystem {
                 called: fallback_called.clone(),
             };
+            let request = interrupt_request(control_unique, 2002);
 
-            super::super::FuseReceiver::dispatch_meta(
-                &pending,
-                &fs,
-                &interrupt_request(1007, 2002),
-                &reply,
-            )
-            .await
-            .unwrap();
-
+            super::super::FuseReceiver::dispatch_meta(&pending, &fs, &request, &reply)
+                .await
+                .unwrap();
+            let task = rx
+                .try_recv()
+                .unwrap()
+                .expect("late Interrupt replies with EAGAIN to request a kernel retry");
+            match task {
+                FuseTask::RequestReply {
+                    data,
+                    status,
+                    errno,
+                    ..
+                } => {
+                    assert_eq!(data.unique(), control_unique);
+                    assert_eq!(data.len() as usize, crate::FUSE_OUT_HEADER_LEN);
+                    assert_eq!(data.header().error, -libc::EAGAIN);
+                    assert_eq!(status, FuseReqStatus::Error);
+                    assert_eq!(errno, libc::EAGAIN);
+                }
+                FuseTask::NotifyReply { .. } => panic!("expected late Interrupt control reply"),
+                FuseTask::Reply(_) => panic!("expected late Interrupt control reply"),
+            }
             assert!(
-                rx.try_recv().unwrap().is_none(),
-                "late Interrupt is no-reply: no task enqueued"
+                fallback_called.load(Ordering::SeqCst),
+                "late Interrupt asks the filesystem fallback for the protocol retry error"
             );
             assert!(
                 fallback_called.load(Ordering::SeqCst),
-                "late Interrupt invokes the best-effort filesystem fallback"
+                "late Interrupt invokes the filesystem fallback"
             );
         }
 
@@ -1210,6 +1363,86 @@ mod tests {
         fn setlkw_request(unique: u64) -> FuseRequest {
             let arg = fuse_lk_in::default();
             make_request(OP_SETLKW, unique, 1, FuseUtils::struct_as_bytes(&arg))
+        }
+
+        #[tokio::test]
+        async fn pre_registered_setlkw_consumes_delivered_interrupt() {
+            let interrupted_unique = 2004;
+            let control_unique = 2005;
+            let polled = Arc::new(AtomicBool::new(false));
+            let fs = Arc::new(BlockingSetlkwFs {
+                polled: polled.clone(),
+            });
+            let pending: Arc<FastDashMap<u64, Arc<tokio::sync::Notify>>> =
+                Arc::new(FastDashMap::default());
+            let events = Arc::new(watch::channel(0).0);
+            let request = setlkw_request(interrupted_unique);
+            let (pending_request, notify) =
+                super::super::FuseReceiver::<BlockingSetlkwFs>::register_interruptible_meta_request(
+                    pending.clone(),
+                    &request,
+                    Some(events.as_ref()),
+                )
+                .expect("SETLKW is interruptible");
+
+            let registered = pending
+                .get(&interrupted_unique)
+                .expect("SETLKW is registered before it is spawned");
+            assert!(
+                Arc::ptr_eq(registered.value(), &notify),
+                "the pre-spawn registration owns the request's cancellation notify"
+            );
+            drop(registered);
+
+            let (control_reply, mut control_rx) = metrics_reply(control_unique, "Interrupt");
+            let control_request = interrupt_request(control_unique, interrupted_unique);
+            super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                fs.as_ref(),
+                &control_request,
+                &control_reply,
+            )
+            .await
+            .expect("Interrupt dispatch succeeds");
+            assert!(
+                control_rx.try_recv().unwrap().is_none(),
+                "a matched Interrupt does not enqueue a control reply"
+            );
+
+            let (setlkw_reply, mut setlkw_rx) = metrics_reply(interrupted_unique, "SetLkW");
+            super::super::FuseReceiver::dispatch_registered_meta_interrupt(
+                fs,
+                pending.clone(),
+                request,
+                setlkw_reply,
+                pending_request,
+                notify,
+                events,
+            )
+            .await
+            .expect("pre-registered SETLKW consumes the delivered interrupt");
+
+            match setlkw_rx
+                .try_recv()
+                .expect("SETLKW reply channel remains open")
+                .expect("interrupted SETLKW replies")
+            {
+                FuseTask::RequestReply {
+                    data,
+                    errno,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(data.header().error, -libc::EINTR);
+                    assert_eq!(errno, libc::EINTR);
+                    assert_eq!(status, FuseReqStatus::Interrupted);
+                }
+                _ => panic!("expected interrupted SETLKW reply"),
+            }
+            assert!(
+                pending.get(&interrupted_unique).is_none(),
+                "the pre-spawn registration is cleaned up after interruption"
+            );
         }
 
         fn setlkw_wait_count() -> u64 {
@@ -1580,7 +1813,7 @@ mod tests {
                 let rep = FuseResponse::new_reply(req.unique(), tx, false, ctx);
 
                 let _ = super::super::FuseReceiver::<TestFileSystem>::send_stream_dispatch(
-                    &fs, req, rep,
+                    &fs, req, rep, None,
                 )
                 .await;
 
@@ -1730,7 +1963,7 @@ mod tests {
                 let rep = FuseResponse::new_reply(7201, tx, false, Some(ctx));
 
                 let res = super::super::FuseReceiver::<TestFileSystem>::send_stream_dispatch(
-                    &fs, malformed, rep,
+                    &fs, malformed, rep, None,
                 )
                 .await;
 
@@ -1910,7 +2143,8 @@ mod tests {
                 let observer = rep.clone();
 
                 let res =
-                    super::super::FuseReceiver::<F>::send_stream_dispatch(&fs, req, rep).await;
+                    super::super::FuseReceiver::<F>::send_stream_dispatch(&fs, req, rep, None)
+                        .await;
 
                 let mut tasks = Vec::new();
                 while let Ok(Some(t)) = rx.try_recv() {

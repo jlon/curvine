@@ -157,32 +157,28 @@ reload() {
       # Old process will persist state and spawn new process before exiting
       waitPid $OLD_PID
       
-      # Wait a bit for new process to start
-      sleep 3
-
-      # Find new process - simple approach: find any running curvine-fuse process
-      # Since old process has exited, any found process should be the new one
-      # Take the last one as it's the newest process
+      # The reload child refreshes this pid file only after it restored the FUSE
+      # state. Do not scan all curvine-fuse processes: another mount can exist
+      # on the same host and must never become this launcher's process.
       local NEW_PID=""
-      if command -v pgrep > /dev/null 2>&1; then
-        # Get all curvine-fuse PIDs, exclude old PID, take the last one (newest)
-        NEW_PID=$(pgrep -f "curvine-fuse" 2>/dev/null | grep -v "^${OLD_PID}$" | tail -1)
-      else
-        NEW_PID=$(ps aux | grep "curvine-fuse" | awk '{print $2}' | grep -v "^${OLD_PID}$" | tail -1)
-      fi
-      
-      # Verify and update PID file
-      if [ -n "$NEW_PID" ] && kill -0 $NEW_PID > /dev/null 2>&1; then
-        # Verify it's actually curvine-fuse
-        if ps -p $NEW_PID -o comm= 2>/dev/null | grep -q "curvine-fuse"; then
-          echo $NEW_PID > ${PID_FILE}
+      local RELOAD_RETRIES=60
+      local RETRY=0
+      while [ "$RETRY" -lt "$RELOAD_RETRIES" ]; do
+        NEW_PID=""
+        if [ -f "${PID_FILE}" ]; then
+          NEW_PID=$(cat "${PID_FILE}" 2>/dev/null)
+        fi
+
+        if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] && kill -0 "$NEW_PID" > /dev/null 2>&1; then
           echo "${SERVICE_NAME} reloaded successfully, new pid=${NEW_PID}"
           exit 0
         fi
-      fi
 
-      # If we get here, failed to find new process
-      echo "error: could not find new ${SERVICE_NAME} process after ${max_retries} seconds"
+        RETRY=$((RETRY + 1))
+        sleep 1
+      done
+
+      echo "error: could not find new ${SERVICE_NAME} process after ${RELOAD_RETRIES} seconds"
       echo "please check ${SERVICE_NAME} status manually"
       exit 1
     else

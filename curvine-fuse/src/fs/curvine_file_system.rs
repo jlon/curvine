@@ -544,8 +544,17 @@ impl CurvineFileSystem {
         }
     }
 
-    fn traversal_cached_status(inode: &Inode, meta_ttl: u64) -> Option<FileStatus> {
-        inode.cache_valid(meta_ttl).then(|| inode.clone_status())
+    /// A traversal permission decision may reuse dcache metadata only when the
+    /// mount explicitly enables the userspace metadata cache.  In particular,
+    /// node lifetime is not an ACL cache: with `enable_meta_cache=false`, an
+    /// inode can remain present for kernel reference accounting while its local
+    /// status is stale or incomplete.
+    fn traversal_cached_status(
+        inode: &Inode,
+        enable_meta_cache: bool,
+        meta_ttl: u64,
+    ) -> Option<FileStatus> {
+        (enable_meta_cache && inode.cache_valid(meta_ttl)).then(|| inode.clone_status())
     }
 
     /// Linux root access(2) bypasses R_OK/W_OK but still validates X_OK against any
@@ -601,7 +610,11 @@ impl CurvineFileSystem {
                 match dir.get_inode(dir_ino, None) {
                     Some(inode) => {
                         let is_root = inode.is_root();
-                        let status = Self::traversal_cached_status(inode, meta_ttl);
+                        let status = Self::traversal_cached_status(
+                            inode,
+                            self.conf.enable_meta_cache,
+                            meta_ttl,
+                        );
                         (is_root, status)
                     }
                     None => (false, None),
@@ -969,9 +982,10 @@ impl CurvineFileSystem {
     ///    daemon implements AND the kernel offered — see `SUPPORTED_INIT_FLAGS` for
     ///    what that deliberately excludes).
     /// 2. Config-gated, forced on regardless of the kernel offer:
-    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and `FUSE_SPLICE_*` (when
-    ///    `enable_splice` — splice drives the fuse fd directly, so it is advertised
-    ///    on config alone).
+    ///    `FUSE_WRITEBACK_CACHE` (when `write_back_cache`) and the output-side
+    ///    `FUSE_SPLICE_WRITE|FUSE_SPLICE_MOVE` pair (when `enable_splice`).
+    ///    Requests are read directly into the daemon buffer for parsing, so do
+    ///    not advertise the unused input-side `FUSE_SPLICE_READ` capability.
     fn negotiate_out_flags(kernel_flags: u32, conf: &FuseConf) -> u32 {
         let mut out = SUPPORTED_INIT_FLAGS & kernel_flags;
         if conf.write_back_cache {
@@ -980,7 +994,8 @@ impl CurvineFileSystem {
             out &= !FUSE_WRITEBACK_CACHE;
         }
         if conf.enable_splice {
-            out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+            out |= FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE;
+            out &= !FUSE_SPLICE_READ;
         } else {
             out &= !(FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ);
         }
@@ -1004,6 +1019,28 @@ impl CurvineFileSystem {
 }
 
 impl fs::FileSystem for CurvineFileSystem {
+    async fn shutdown(&self) -> FuseResult<()> {
+        let mut result = Ok(());
+
+        for handle in self.state.all_handles() {
+            for flags in [LockFlags::Flock, LockFlags::Plock] {
+                let unlock_result = self.fs_unlock(&handle, flags).await;
+                if let Err(e) = &unlock_result {
+                    warn!(
+                        "failed to release {:?} during FUSE shutdown for ino={}, path={}: {}",
+                        flags,
+                        handle.ino(),
+                        handle.status().path,
+                        e
+                    );
+                }
+                Self::retain_first_error(&mut result, unlock_result);
+            }
+        }
+
+        result
+    }
+
     async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
         if !Self::abi_supported(op.arg.major, op.arg.minor) {
             return err_fuse!(
@@ -1615,13 +1652,24 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
-        let keep_cache = if self.conf.direct_io {
-            false
+        let (keep_cache, cache_policy) = if self.conf.direct_io {
+            (false, "direct_io_config")
         } else {
             // Page cache consistency is handled by open flags; explicit inode
             // invalidation can deadlock inside send_inode_out on some older kernels.
-            self.state.keep_cache(ino, &handle.status())
+            let keep_cache = self.state.keep_cache(ino, &handle.status());
+            let policy = if keep_cache {
+                "keep_cache"
+            } else if self.conf.open_direct_on_stale {
+                "direct_io_stale"
+            } else {
+                "status_changed"
+            };
+            (keep_cache, policy)
         };
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_open_cache(cache_policy));
+        }
         let open_flags = FuseUtils::file_open_flags(&self.conf, keep_cache);
 
         let entry = fuse_open_out {
@@ -2384,7 +2432,7 @@ mod tests {
 
         let mut root = Inode::new_root();
         let meta_ttl = 60_000;
-        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
+        assert!(CurvineFileSystem::traversal_cached_status(&root, true, meta_ttl).is_none());
 
         root.update_status(FileStatus {
             is_dir: true,
@@ -2392,11 +2440,13 @@ mod tests {
             ..Default::default()
         });
 
-        let status = CurvineFileSystem::traversal_cached_status(&root, meta_ttl).unwrap();
+        assert!(CurvineFileSystem::traversal_cached_status(&root, false, meta_ttl).is_none());
+
+        let status = CurvineFileSystem::traversal_cached_status(&root, true, meta_ttl).unwrap();
         assert_eq!(status.mode, 0o755);
 
         root.invalid_cache();
-        assert!(CurvineFileSystem::traversal_cached_status(&root, meta_ttl).is_none());
+        assert!(CurvineFileSystem::traversal_cached_status(&root, true, meta_ttl).is_none());
     }
 
     #[test]
@@ -3050,15 +3100,27 @@ mod tests {
 
     #[test]
     fn negotiate_out_flags_splice_is_config_gated() {
-        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE | FUSE_SPLICE_READ;
+        let splice = FUSE_SPLICE_MOVE | FUSE_SPLICE_WRITE;
         let on = CurvineFileSystem::negotiate_out_flags(0, &init_conf(false, true));
         assert_eq!(
             on & splice,
             splice,
             "splice advertised on config even if kernel omits it"
         );
-        let off = CurvineFileSystem::negotiate_out_flags(splice, &init_conf(false, false));
-        assert_eq!(off & splice, 0, "splice not advertised when disabled");
+        assert_eq!(
+            on & FUSE_SPLICE_READ,
+            0,
+            "the daemon does not use input-side FUSE splice reads"
+        );
+        let off = CurvineFileSystem::negotiate_out_flags(
+            splice | FUSE_SPLICE_READ,
+            &init_conf(false, false),
+        );
+        assert_eq!(
+            off & (splice | FUSE_SPLICE_READ),
+            0,
+            "splice not advertised when disabled"
+        );
     }
 
     #[test]

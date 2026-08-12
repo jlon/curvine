@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::Read;
-use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ};
+use crate::fuse_metrics::{mono_now, FuseMetrics, IO_TYPE_READ, STAGE_READER_POOL_WAIT};
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_client::unified::UnifiedReader;
@@ -22,17 +22,25 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path, Reader};
 use curvine_model::FileStatus;
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::Runtime;
 use curvine_runtime::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use curvine_runtime::sync::{AsyncMutex, FastMutex};
 use log::warn;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 type ReaderOpenFuture = Pin<Box<dyn Future<Output = FsResult<UnifiedReader>> + Send>>;
 type ReaderOpener = Arc<dyn Fn(Path) -> ReaderOpenFuture + Send + Sync>;
+
+#[derive(Clone)]
+struct ReadFutureContext {
+    path_type: &'static str,
+    metrics_enabled: bool,
+}
 
 struct ReaderPoolState {
     closing: bool,
@@ -56,6 +64,41 @@ struct ReaderPool {
 struct ReadLease {
     pool: Arc<ReaderPool>,
     _permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Owns a checked-out reader until it is explicitly returned to the pool.
+/// If an I/O future is cancelled or unwinds, dropping this guard discards the
+/// connection and balances `reader_count`; a partially consumed RPC stream is
+/// never returned to another FUSE request.
+struct CheckedOutReader {
+    pool: Arc<ReaderPool>,
+    reader: Option<UnifiedReader>,
+}
+
+impl CheckedOutReader {
+    fn new(pool: Arc<ReaderPool>, reader: UnifiedReader) -> Self {
+        Self {
+            pool,
+            reader: Some(reader),
+        }
+    }
+
+    fn reader_mut(&mut self) -> &mut UnifiedReader {
+        self.reader.as_mut().expect("checked-out reader is present")
+    }
+
+    fn release(mut self) -> FsResult<()> {
+        let reader = self.reader.take().expect("checked-out reader is present");
+        self.pool.release(reader)
+    }
+}
+
+impl Drop for CheckedOutReader {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            self.pool.discard_failed_reader(reader);
+        }
+    }
 }
 
 impl Drop for ReadLease {
@@ -143,9 +186,19 @@ impl ReaderPool {
         Ok(self.available_receiver.lock().await.try_recv()?)
     }
 
+    #[cfg(test)]
     async fn acquire(&self) -> FsResult<UnifiedReader> {
-        if let Some(reader) = self.try_take_available().await? {
-            return Ok(reader);
+        self.acquire_with_wait(false).await.0
+    }
+
+    async fn acquire_with_wait(
+        &self,
+        measure_wait: bool,
+    ) -> (FsResult<UnifiedReader>, Option<u64>) {
+        match self.try_take_available().await {
+            Ok(Some(reader)) => return (Ok(reader), None),
+            Ok(None) => {}
+            Err(e) => return (Err(e), None),
         }
 
         let open_reader = {
@@ -172,7 +225,10 @@ impl ReaderPool {
             match res {
                 Ok(reader) => {
                     state.reader_count += 1;
-                    return Ok(reader);
+                    if measure_wait {
+                        FuseMetrics::with(|m| m.record_reader_pool_expansion("success"));
+                    }
+                    return (Ok(reader), None);
                 }
                 Err(e) => {
                     // The original reader remains valid for this open handle.
@@ -181,17 +237,39 @@ impl ReaderPool {
                     // retrying a failing open for every concurrent request;
                     // the next FUSE handle starts with a fresh pool.
                     state.expansion_failed = true;
+                    if measure_wait {
+                        FuseMetrics::with(|m| m.record_reader_pool_expansion("error"));
+                    }
                     warn!("failed to expand FUSE reader pool for {}: {}", self.path, e);
                 }
             }
         }
 
-        Ok(self.available_receiver.lock().await.recv_check().await?)
+        let start = measure_wait.then(Instant::now);
+        let result = self.available_receiver.lock().await.recv_check().await;
+        let elapsed_us = start.map(|start| start.elapsed().as_micros() as u64);
+        match result {
+            Ok(reader) => (Ok(reader), elapsed_us),
+            Err(e) => (Err(e.into()), elapsed_us),
+        }
     }
 
-    async fn release(&self, reader: UnifiedReader) -> FsResult<()> {
-        self.available_sender.send(reader).await?;
-        Ok(())
+    fn release(&self, reader: UnifiedReader) -> FsResult<()> {
+        // The reader pool is intentionally unbounded. Returning a reader is a
+        // synchronous ownership transfer, so cancellation cannot strand it
+        // between checkout and the available queue.
+        Ok(self.available_sender.send_sync(reader)?)
+    }
+
+    fn discard_failed_reader(&self, failed: UnifiedReader) {
+        // Unlike replacement, a terminal backend timeout has no reader that
+        // will occupy this pool slot. Release the accounting before dropping
+        // it so later reads can open a fresh connection.
+        let mut state = self.state.lock();
+        debug_assert!(state.reader_count > 0);
+        state.reader_count = state.reader_count.saturating_sub(1);
+        drop(state);
+        drop(failed);
     }
 
     async fn close_and_take_all(&self) -> FsResult<Vec<UnifiedReader>> {
@@ -228,20 +306,20 @@ pub struct FuseReader {
     path: Path,
     len: i64,
     pool: Arc<ReaderPool>,
-    rt: Arc<Runtime>,
     status: FileStatus,
     path_type: &'static str,
     metrics_enabled: bool,
+    last_read_end: AtomicI64,
 }
 
 impl FuseReader {
-    pub fn new(conf: &FuseConf, rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
-        Self::new_inner(conf, rt, None, reader)
+    pub fn new(conf: &FuseConf, _rt: Arc<Runtime>, reader: UnifiedReader) -> Self {
+        Self::new_inner(conf, None, reader)
     }
 
     pub fn new_with_filesystem(
         conf: &FuseConf,
-        rt: Arc<Runtime>,
+        _rt: Arc<Runtime>,
         fs: UnifiedFileSystem,
         reader: UnifiedReader,
     ) -> Self {
@@ -249,15 +327,10 @@ impl FuseReader {
             let fs = fs.clone();
             Box::pin(async move { fs.open(&path).await })
         });
-        Self::new_inner(conf, rt, Some(opener), reader)
+        Self::new_inner(conf, Some(opener), reader)
     }
 
-    fn new_inner(
-        conf: &FuseConf,
-        rt: Arc<Runtime>,
-        opener: Option<ReaderOpener>,
-        reader: UnifiedReader,
-    ) -> Self {
+    fn new_inner(conf: &FuseConf, opener: Option<ReaderOpener>, reader: UnifiedReader) -> Self {
         let path = reader.path().clone();
         let len = reader.len();
         let status = reader.status().clone();
@@ -268,10 +341,10 @@ impl FuseReader {
             path,
             len,
             pool,
-            rt,
             status,
             path_type,
             metrics_enabled: conf.metrics_enabled,
+            last_read_end: AtomicI64::new(-1),
         }
     }
 
@@ -294,15 +367,30 @@ impl FuseReader {
     pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
         let lease = self.pool.begin_read().await?;
         let pool = self.pool.clone();
-        let path_type = self.path_type;
-        let metrics_enabled = self.metrics_enabled;
+        let context = ReadFutureContext {
+            path_type: self.path_type,
+            metrics_enabled: self.metrics_enabled,
+        };
         let off = op.arg.offset as i64;
         let len = op.arg.size as usize;
-        self.rt.spawn(async move {
-            Self::read_future(pool, off, len, reply, path_type, metrics_enabled).await;
-            drop(lease);
-        });
+        if context.metrics_enabled {
+            FuseMetrics::get().record_read_pattern(self.read_pattern(off, len));
+        }
+        // The receiver owns the READ task lifetime so FUSE_INTERRUPT can
+        // cancel the actual backend future. Keep the lease in this future;
+        // its Drop still balances the pool on every return path.
+        Self::read_future(pool, off, len, reply, context).await;
+        drop(lease);
         Ok(())
+    }
+
+    fn read_pattern(&self, off: i64, len: usize) -> &'static str {
+        let end = off.saturating_add(len as i64);
+        match self.last_read_end.swap(end, Ordering::Relaxed) {
+            previous if previous < 0 => "initial",
+            previous if previous == off => "sequential",
+            _ => "positioned",
+        }
     }
 
     pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
@@ -332,18 +420,29 @@ impl FuseReader {
         off: i64,
         len: usize,
         reply: FuseResponse,
-        path_type: &'static str,
-        metrics_enabled: bool,
+        context: ReadFutureContext,
     ) {
-        let data = match pool.acquire().await {
-            Ok(mut reader) => {
-                let io_start = if metrics_enabled {
+        let (reader_result, pool_wait_us) = pool.acquire_with_wait(context.metrics_enabled).await;
+        if context.metrics_enabled {
+            if let Some(pool_wait_us) = pool_wait_us {
+                FuseMetrics::get().record_stream_stage(
+                    STAGE_READER_POOL_WAIT,
+                    reader_result.is_ok(),
+                    pool_wait_us,
+                );
+            }
+        }
+
+        let data = match reader_result {
+            Ok(unified_reader) => {
+                let mut checked_reader = CheckedOutReader::new(pool.clone(), unified_reader);
+                let io_start = if context.metrics_enabled {
                     Some(mono_now())
                 } else {
                     None
                 };
-                let inflight = FuseMetrics::stream_io_guard(metrics_enabled, IO_TYPE_READ);
-                let data = reader.fuse_read(off, len).await;
+                let inflight = FuseMetrics::stream_io_guard(context.metrics_enabled, IO_TYPE_READ);
+                let data = checked_reader.reader_mut().fuse_read(off, len).await;
                 drop(inflight);
 
                 if let Some(start) = io_start {
@@ -356,7 +455,7 @@ impl FuseReader {
                         .unwrap_or(0);
                     FuseMetrics::get().record_stream_io(
                         IO_TYPE_READ,
-                        path_type,
+                        context.path_type,
                         ok,
                         bytes,
                         len as u64,
@@ -364,7 +463,7 @@ impl FuseReader {
                     );
                 }
 
-                match pool.release(reader).await {
+                match checked_reader.release() {
                     Ok(()) => data,
                     Err(e) => Err(e),
                 }
@@ -372,6 +471,15 @@ impl FuseReader {
             Err(e) => Err(e),
         };
 
+        if let Err(e) = &data {
+            warn!(
+                "FUSE read failed: path={}, offset={}, len={}: {}",
+                pool.path.path(),
+                off,
+                len,
+                e
+            );
+        }
         if let Err(e) = reply.send_data(data.map_err(Into::into)).await {
             // Losing this reply receiver must not terminate another request.
             warn!("failed to send FUSE read reply: {}", e);
@@ -391,7 +499,7 @@ mod tests {
     use curvine_client::unified::UnifiedReader;
     use curvine_fs_api::local::LocalReader;
     use curvine_metrics::Metrics as m;
-    use curvine_runtime::runtime::AsyncRuntime;
+    use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
     use curvine_runtime::sync::channel::AsyncChannel;
     use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -480,15 +588,51 @@ mod tests {
             "pool must wait instead of opening beyond per_handle_read_parallel"
         );
 
-        pool.release(first).await.unwrap();
+        pool.release(first).unwrap();
         let third = pool.acquire().await.unwrap();
         assert_eq!(
             open_count.load(Ordering::Relaxed),
             1,
             "an available reader is reused without another open"
         );
-        pool.release(second).await.unwrap();
-        pool.release(third).await.unwrap();
+        pool.release(second).unwrap();
+        pool.release(third).unwrap();
+        let _ = std::fs::remove_file(&path_buf);
+    }
+
+    #[tokio::test]
+    async fn reader_pool_discards_failed_reader_and_reopens_for_next_request() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_discard_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, b"reader-pool-discard").unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let factory_path = path.clone();
+        let factory_count = open_count.clone();
+        let opener: ReaderOpener = Arc::new(move |_| {
+            let path = factory_path.clone();
+            let open_count = factory_count.clone();
+            Box::pin(async move {
+                open_count.fetch_add(1, Ordering::Relaxed);
+                Ok(UnifiedReader::Local(LocalReader::new(&path, 4096)?))
+            })
+        });
+        let initial = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let pool = ReaderPool::new(&FuseConf::default(), Some(opener), initial);
+
+        let failed = pool.acquire().await.unwrap();
+        pool.discard_failed_reader(failed);
+        let replacement = pool.acquire().await.unwrap();
+        assert_eq!(
+            open_count.load(Ordering::Relaxed),
+            1,
+            "the next request must open one fresh reader after a failed direct read"
+        );
+        assert_eq!(pool.state.lock().reader_count, 1);
+        pool.release(replacement).unwrap();
         let _ = std::fs::remove_file(&path_buf);
     }
 
@@ -532,7 +676,7 @@ mod tests {
             "the waiting request first attempts one pool expansion"
         );
 
-        pool.release(first).await.unwrap();
+        pool.release(first).unwrap();
         let second = timeout(Duration::from_secs(1), waiting)
             .await
             .expect("waiting request should fall back to the initial reader")
@@ -542,7 +686,7 @@ mod tests {
             pool.state.lock().expansion_failed,
             "a failed expansion must disable retries for this handle"
         );
-        pool.release(second).await.unwrap();
+        pool.release(second).unwrap();
         let _ = std::fs::remove_file(&path_buf);
     }
 
@@ -585,6 +729,109 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
+        );
+        let _ = std::fs::remove_file(&path_buf);
+    }
+
+    #[tokio::test]
+    async fn reader_pool_reports_wait_when_no_reader_is_available() {
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_wait_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, b"reader-pool").unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let conf = FuseConf {
+            per_handle_read_parallel: 1,
+            ..Default::default()
+        };
+        let initial = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let pool = ReaderPool::new(&conf, None, initial);
+
+        let (first, first_wait) = pool.acquire_with_wait(true).await;
+        let first = first.unwrap();
+        assert!(
+            first_wait.is_none(),
+            "the initial reader is immediately available"
+        );
+        let waiting_pool = pool.clone();
+        let mut waiting = tokio::spawn(async move { waiting_pool.acquire_with_wait(true).await });
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "the second acquire must wait until the first reader is released"
+        );
+
+        pool.release(first).unwrap();
+        let (second, wait) = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting acquire should resume after release")
+            .unwrap();
+        let second = second.unwrap();
+        pool.release(second).unwrap();
+
+        assert!(
+            wait.is_some(),
+            "a queued acquire must report its wait duration"
+        );
+        let _ = std::fs::remove_file(&path_buf);
+    }
+
+    #[tokio::test]
+    async fn fuse_read_records_reader_pool_wait_after_the_reader_is_released() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx
+            .stage_duration_us
+            .with_label_values(&[STAGE_READER_POOL_WAIT, "stream", "success"])
+            .get_sample_count();
+
+        let path_buf = std::env::temp_dir().join(format!(
+            "fr_pool_wait_request_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&path_buf, vec![7u8; 4096]).unwrap();
+        let path = curvine_fs_api::Path::from_str(path_buf.to_str().unwrap()).unwrap();
+        let conf = FuseConf::default();
+        let reader = UnifiedReader::Local(LocalReader::new(&path, 4096).unwrap());
+        let pool = ReaderPool::new(&conf, None, reader);
+        let held_reader = pool.acquire().await.unwrap();
+
+        let (reply_sender, mut reply_receiver) = AsyncChannel::<FuseTask>::new(1).split();
+        tokio::spawn(async move { while reply_receiver.recv().await.is_some() {} });
+        let reply = FuseResponse::new_reply(99, reply_sender, false, None);
+        let mut waiting_read = tokio::spawn(FuseReader::read_future(
+            pool.clone(),
+            0,
+            4096,
+            reply,
+            ReadFutureContext {
+                path_type: "pool_wait_test",
+                metrics_enabled: true,
+            },
+        ));
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting_read)
+                .await
+                .is_err(),
+            "the request must wait while the only reader is held"
+        );
+
+        pool.release(held_reader).unwrap();
+        timeout(Duration::from_secs(1), waiting_read)
+            .await
+            .expect("the request should finish after the reader is released")
+            .unwrap();
+
+        assert_eq!(
+            mx.stage_duration_us
+                .with_label_values(&[STAGE_READER_POOL_WAIT, "stream", "success"])
+                .get_sample_count(),
+            before + 1,
+            "a FUSE read that waited for a reader emits exactly one pool-wait sample"
         );
         let _ = std::fs::remove_file(&path_buf);
     }

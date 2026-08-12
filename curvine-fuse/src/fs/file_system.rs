@@ -20,6 +20,8 @@ use crate::{err_fuse, FuseResult};
 use bytes::BytesMut;
 use curvine_fs_api::{StateReader, StateWriter};
 use std::future::Future;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 pub trait FileSystem: Send + Sync + 'static {
     fn init(&self, op: Init<'_>) -> impl Future<Output = FuseResult<fuse_init_out>> + Send {
@@ -101,6 +103,35 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
+    /// Interruptible READ variant. Implementations that own an asynchronous
+    /// backend reader override this to observe `cancel`; the default preserves
+    /// the existing read contract for metadata-only test filesystems.
+    fn read_interruptible(
+        &self,
+        op: Read<'_>,
+        reply: FuseResponse,
+        cancel: Arc<Notify>,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
+        async move {
+            let interrupted = {
+                let read = self.read(op, reply.clone());
+                tokio::pin!(read);
+                tokio::select! {
+                    result = &mut read => return result,
+                    _ = cancel.notified() => true,
+                }
+            };
+            debug_assert!(interrupted);
+            // The inner scope drops `read` before this reply. Curvine's reader
+            // then discards its checked-out connection through RAII.
+            let result: FuseResult<()> = err_fuse!(libc::EINTR, "read interrupted");
+            reply
+                .send_rep_tagged(result, None, true)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
     fn open(&self, op: Open<'_>) -> impl Future<Output = FuseResult<fuse_open_out>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
@@ -180,10 +211,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { Ok(()) }
     }
 
-    /// Best-effort fallback for an interrupt whose target is no longer present
-    /// in the dispatcher's pending-request map.
+    /// Ask the kernel to requeue an interrupt whose target is not yet present
+    /// in the dispatcher's pending-request map. It may be between kernel
+    /// dispatch and task registration, or it may have completed already.
     fn interrupt(&self, _op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
-        async move { Ok(()) }
+        async move { err_fuse!(libc::EAGAIN, "interrupted request is not pending") }
     }
 
     fn fsync(
@@ -203,6 +235,12 @@ pub trait FileSystem: Send + Sync + 'static {
     }
 
     fn unmount(&self) {}
+
+    /// Releases resources owned by this daemon before a normal session teardown.
+    /// A hot reload transfers the kernel session and must skip this hook.
+    fn shutdown(&self) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
+    }
 
     fn get_lk(&self, op: GetLk<'_>) -> impl Future<Output = FuseResult<fuse_lk_out>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }

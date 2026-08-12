@@ -17,7 +17,7 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
-use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
+use crate::{err_fuse, FuseError, FuseMetrics, FuseResult, FuseUtils};
 use curvine_core_error::err_box;
 use curvine_fs_api::Path;
 use curvine_fs_api::{StateReader, StateWriter};
@@ -147,7 +147,20 @@ impl BackendHandle {
                 .await?
             {
                 let path = reader.path().clone();
-                let new_reader = state.new_reader(&path).await?;
+                let new_reader = match state.new_reader(&path).await {
+                    Ok(reader) => {
+                        if state.metrics_enabled() {
+                            FuseMetrics::with(|m| m.record_dirty_read_reopen("success"));
+                        }
+                        reader
+                    }
+                    Err(e) => {
+                        if state.metrics_enabled() {
+                            FuseMetrics::with(|m| m.record_dirty_read_reopen("error"));
+                        }
+                        return Err(e);
+                    }
+                };
                 // Refresh status from the reopened reader before installing it.
                 self.refresh_status(new_reader.status().clone());
                 reader.replace(new_reader);

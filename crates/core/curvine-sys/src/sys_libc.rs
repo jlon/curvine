@@ -16,7 +16,7 @@
 
 use crate::*;
 use fs2::FileExt;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
 use std::fs::Metadata;
 use std::io::{ErrorKind, IoSlice};
@@ -475,23 +475,16 @@ pub fn get_device_id(path: &Path) -> u64 {
     }
 }
 
-/// Get UID by username using getpwnam system call
+/// Get UID by username with a reentrant libc lookup.
 pub fn get_uid_by_name(username: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_username = match CString::new(username) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+        use nix::unistd::User;
 
-        unsafe {
-            let passwd = libc::getpwnam(c_username.as_ptr());
-            if passwd.is_null() {
-                None
-            } else {
-                Some((*passwd).pw_uid)
-            }
-        }
+        User::from_name(username)
+            .ok()
+            .flatten()
+            .map(|user| user.uid.as_raw())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -500,19 +493,16 @@ pub fn get_uid_by_name(username: &str) -> Option<u32> {
     }
 }
 
-/// Get username by UID using getpwuid system call
+/// Get username by UID with a reentrant libc lookup.
 pub fn get_username_by_uid(uid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*passwd).pw_name);
-                c_str.to_string_lossy().into_owned().into()
-            }
-        }
+        use nix::unistd::{Uid, User};
+
+        User::from_uid(Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|user| user.name)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -521,23 +511,16 @@ pub fn get_username_by_uid(uid: u32) -> Option<String> {
     }
 }
 
-/// Get GID by group name using getgrnam system call
+/// Get GID by group name with a reentrant libc lookup.
 pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        let c_groupname = match CString::new(groupname) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
+        use nix::unistd::Group;
 
-        unsafe {
-            let group = libc::getgrnam(c_groupname.as_ptr());
-            if group.is_null() {
-                None
-            } else {
-                Some((*group).gr_gid)
-            }
-        }
+        Group::from_name(groupname)
+            .ok()
+            .flatten()
+            .map(|group| group.gid.as_raw())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -546,19 +529,16 @@ pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
     }
 }
 
-/// Get group name by GID using getgrgid system call
+/// Get group name by GID with a reentrant libc lookup.
 pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*group).gr_name);
-                c_str.to_string_lossy().into_owned().into()
-            }
-        }
+        use nix::unistd::{Gid, Group};
+
+        Group::from_gid(Gid::from_raw(gid))
+            .ok()
+            .flatten()
+            .map(|group| group.name)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -666,5 +646,56 @@ pub fn fcntl_set(fd: RawIO, flags: CInt) -> SysResult<CInt> {
     #[cfg(not(target_os = "linux"))]
     {
         sys_error!(ErrorKind::Unsupported, "unsupported operation")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_gid_by_name, get_groupname_by_gid, get_uid_by_name, get_username_by_uid};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_lookups_are_reentrant_under_concurrency() {
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let username = get_username_by_uid(uid).expect("current uid must resolve");
+        let groupname = get_groupname_by_gid(gid).expect("current gid must resolve");
+
+        let mut users = vec![(username, uid)];
+        if uid != 0 {
+            if let Some(root_name) = get_username_by_uid(0) {
+                users.push((root_name, 0));
+            }
+        }
+
+        let mut groups = vec![(groupname, gid)];
+        if gid != 0 {
+            if let Some(root_group) = get_groupname_by_gid(0) {
+                groups.push((root_group, 0));
+            }
+        }
+
+        let workers = (0..16)
+            .map(|_| {
+                let users = users.clone();
+                let groups = groups.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        for (name, id) in &users {
+                            assert_eq!(get_uid_by_name(name), Some(*id));
+                            assert_eq!(get_username_by_uid(*id).as_deref(), Some(name.as_str()));
+                        }
+                        for (name, id) in &groups {
+                            assert_eq!(get_gid_by_name(name), Some(*id));
+                            assert_eq!(get_groupname_by_gid(*id).as_deref(), Some(name.as_str()));
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("account lookup worker must not panic");
+        }
     }
 }

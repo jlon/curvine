@@ -38,6 +38,7 @@ pub struct TransferMetrics {
     lease_renew_total: CounterVec,
     stale_retry_total: CounterVec,
     terminal_total: CounterVec,
+    completed_bytes_total: CounterVec,
     store_operation_duration_us: HistogramVec,
     store_operation_total: CounterVec,
     store_unavailable: GaugeVec,
@@ -138,6 +139,12 @@ impl TransferMetrics {
                 "transfer_terminal_total",
                 "Transfer terminal state transitions by state and reason",
                 &["state", "reason"],
+            )
+            .map_err(|err| FsError::common(err.to_string()))?,
+            completed_bytes_total: m::new_counter_vec(
+                "transfer_completed_bytes_total",
+                "Bytes successfully completed by terminal transfer jobs",
+                &["state"],
             )
             .map_err(|err| FsError::common(err.to_string()))?,
             store_operation_duration_us: m::new_histogram_vec_with_buckets(
@@ -326,6 +333,14 @@ impl TransferMetrics {
         self.terminal_total
             .with_label_values(&[state, reason])
             .inc();
+    }
+
+    pub fn inc_completed_bytes(&self, state: &str, bytes: i64) {
+        if bytes > 0 {
+            self.completed_bytes_total
+                .with_label_values(&[state])
+                .inc_by(bytes);
+        }
     }
 
     pub fn observe_store_operation(

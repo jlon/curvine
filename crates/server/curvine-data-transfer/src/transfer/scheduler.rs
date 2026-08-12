@@ -286,17 +286,18 @@ where
                 "incremental transfer complete: skipped_files={} skipped_size={}",
                 planned.skipped_files, planned.skipped_size
             );
-            self.transition(
+            if self.transition(
                 &job,
                 &lease,
                 &[TransferState::Planning],
                 TransferState::Completed,
                 &message,
-            )?;
-            record_metric(|metrics| {
-                metrics.inc_planning(transfer_kind_label(job.kind), "empty");
-                metrics.inc_terminal("completed", "empty");
-            });
+            )? {
+                record_metric(|metrics| {
+                    metrics.inc_planning(transfer_kind_label(job.kind), "empty");
+                    metrics.inc_terminal("completed", "empty");
+                });
+            }
             info!(
                 "transfer {} completed with no file tasks: skipped_files={} skipped_size={}",
                 job.job_id, planned.skipped_files, planned.skipped_size
@@ -581,14 +582,33 @@ where
                 metrics.inc_lease_renew(if renewed { "success" } else { "stale" })
             });
         } else {
-            let _ = self.transition(
+            let completed_size = self
+                .store
+                .list_transfer_tasks(&job.job_id, job.run_id)
+                .map(|tasks| {
+                    summarize_transfer_tasks(&tasks, now_ms())
+                        .counts
+                        .completed_size
+                })
+                .unwrap_or_else(|err| {
+                    warn!(
+                        "cannot collect completed bytes for transfer {}: {}",
+                        job.job_id, err
+                    );
+                    0
+                });
+            if self.transition(
                 &job,
                 &lease,
                 &[TransferState::Running],
                 TransferState::Completed,
                 "all tasks completed",
-            )?;
-            record_metric(|metrics| metrics.inc_terminal("completed", "all_tasks_completed"));
+            )? {
+                record_metric(|metrics| {
+                    metrics.inc_terminal("completed", "all_tasks_completed");
+                    metrics.inc_completed_bytes("completed", completed_size);
+                });
+            }
         }
         Ok(())
     }
@@ -796,7 +816,10 @@ where
                         "failed"
                     },
                     "task_failed",
-                )
+                );
+                if state == TransferState::PartialSuccess {
+                    metrics.inc_completed_bytes("partial_success", summary.counts.completed_size);
+                }
             });
         }
         Ok(())
@@ -917,8 +940,9 @@ where
     ) -> FsResult<()> {
         let message = message.into();
         error!("transfer {} failed: {}", job.job_id, message);
-        let _ = self.transition(job, lease, from_states, TransferState::Failed, message)?;
-        record_metric(|metrics| metrics.inc_terminal("failed", "error"));
+        if self.transition(job, lease, from_states, TransferState::Failed, message)? {
+            record_metric(|metrics| metrics.inc_terminal("failed", "error"));
+        }
         Ok(())
     }
 }

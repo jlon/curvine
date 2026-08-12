@@ -219,11 +219,12 @@ pub struct FuseConf {
 
     pub list_limit: usize,
 
-    /// Whether to use splice (zero-copy) for FUSE data transfer.
-    /// When enabled, the receiver uses splice(/dev/fuse → pipe → buf) and the
-    /// sender uses vmsplice + splice (pipe → /dev/fuse) for large responses.
-    /// When disabled, both use plain read/writev (extra memory copy but no
-    /// pipe management overhead). Default: true.
+    /// Whether to use splice for large FUSE replies.
+    /// FUSE requests are always read directly into the daemon buffer because
+    /// they must be parsed in userspace; routing them through a pipe adds a
+    /// syscall and a copy without removing that parse-buffer copy. When this
+    /// option is enabled, large replies still use vmsplice + splice
+    /// (pipe → /dev/fuse). Default: true.
     pub enable_splice: bool,
 
     pub path_lock_stripes: usize,

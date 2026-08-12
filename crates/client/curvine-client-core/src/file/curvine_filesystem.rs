@@ -140,7 +140,7 @@ impl CurvineFileSystem {
     }
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
-        let file_blocks = self.fs_client.get_block_locations(path).await?;
+        let file_blocks = self.get_block_locations(path).await?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
         Ok(reader)
@@ -283,7 +283,11 @@ impl CurvineFileSystem {
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
-        self.fs_client.get_block_locations(path).await
+        FsContext::metrics_track(
+            "GetBlockLocations",
+            self.fs_client.get_block_locations(path),
+        )
+        .await
     }
 
     pub async fn get_master_info(&self) -> FsResult<MasterInfo> {

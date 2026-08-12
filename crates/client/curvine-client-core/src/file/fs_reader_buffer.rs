@@ -29,8 +29,6 @@ use log::error;
 use std::sync::Arc;
 use tokio::sync::mpsc::Permit;
 
-const RANDOM_READ_CHUNK_SIZE_MAX: usize = 128 * 1024;
-
 // Control task type
 enum ReadTask {
     Seek(i64, CallSender<i8>),
@@ -147,10 +145,17 @@ enum ReaderAdapter {
 }
 
 impl ReaderAdapter {
-    async fn read(&mut self) -> FsResult<FileChunk> {
+    async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<FileChunk> {
         match self {
             ReaderAdapter::Buffer(r) => r.read().await,
-            ReaderAdapter::Base(r) => r.read().await,
+            ReaderAdapter::Base(r) => r.read_with_len(max_len).await,
+        }
+    }
+
+    async fn supports_read_len(&mut self) -> FsResult<bool> {
+        match self {
+            ReaderAdapter::Buffer(_) => Ok(false),
+            ReaderAdapter::Base(reader) => reader.supports_read_len().await,
         }
     }
 
@@ -211,6 +216,7 @@ pub struct FsReaderBuffer {
     len: i64,
 
     slice_size: i64,
+    random_read_chunk_size: usize,
 
     read_detector: ReadDetector,
 }
@@ -228,18 +234,26 @@ impl FsReaderBuffer {
         let conf = &fs_context.conf.client;
         let chunk_num = conf.read_chunk_num;
         let chunk_size = conf.read_chunk_size;
+        let random_chunk_size_max = conf.random_read_chunk_size_max;
         let slice_size = conf.read_slice_size;
 
         let pos = 0;
         let len = file_blocks.status.len;
 
         let random_context = if read_detector.enabled
-            && (chunk_size > RANDOM_READ_CHUNK_SIZE_MAX || conf.enable_read_ahead)
+            && ((random_chunk_size_max > 0 && chunk_size > random_chunk_size_max)
+                || conf.enable_read_ahead)
         {
-            fs_context.with_random_read_options(chunk_size.min(RANDOM_READ_CHUNK_SIZE_MAX))
+            let random_chunk_size = if random_chunk_size_max == 0 {
+                chunk_size
+            } else {
+                chunk_size.min(random_chunk_size_max)
+            };
+            fs_context.with_random_read_options(random_chunk_size)
         } else {
             fs_context.clone()
         };
+        let random_read_chunk_size = random_context.read_chunk_size();
 
         let base = FsReaderParallel::from_base(
             FsReaderBase::new(path.clone(), random_context, file_blocks.clone()),
@@ -291,6 +305,7 @@ impl FsReaderBuffer {
             pos,
             len,
             slice_size,
+            random_read_chunk_size,
             read_detector,
         };
         Ok(reader)
@@ -318,6 +333,24 @@ impl FsReaderBuffer {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn is_random(&self) -> bool {
+        self.read_detector.is_random()
+    }
+
+    pub(crate) fn fuse_read_pattern(&self) -> &'static str {
+        if !self.read_detector.enabled {
+            "detector_disabled"
+        } else if self.read_detector.is_random() {
+            "random"
+        } else {
+            "sequential"
+        }
+    }
+
+    pub(crate) fn random_read_chunk_size(&self) -> usize {
+        self.random_read_chunk_size
     }
 
     fn select_reader_index(
@@ -362,12 +395,20 @@ impl FsReaderBuffer {
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_with_len(None).await
+    }
+
+    pub(crate) async fn supports_read_len(&mut self) -> FsResult<bool> {
+        self.get_reader()?.supports_read_len().await
+    }
+
+    pub(crate) async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             return Ok(DataSlice::Empty);
         }
 
         let reader = self.get_reader()?;
-        let mut chunk = reader.read().await?;
+        let mut chunk = reader.read_with_len(max_len).await?;
 
         // Handle data alignment issues.
         // The chunk read by the underlying reader may be aligned according to chunk_size,
@@ -604,6 +645,7 @@ mod tests {
         rt.block_on(reader.seek(seek_pos)).unwrap();
 
         assert!(reader.read_detector.is_random());
+        assert_eq!(reader.fuse_read_pattern(), "random");
         for sequential_reader in &reader.readers[..reader.base_reader_index] {
             assert_eq!(sequential_reader.pos(), 0);
         }
@@ -628,6 +670,7 @@ mod tests {
         conf.client.enable_smart_prefetch = true;
         conf.client.read_parallel = 1;
         conf.client.read_chunk_size_str = "512KB".to_string();
+        conf.client.random_read_chunk_size_max_str = "256KB".to_string();
         conf.client.read_slice_size_str = "4MB".to_string();
         conf.client.large_file_size_str = "1GB".to_string();
         conf.client.init().unwrap();
@@ -650,7 +693,8 @@ mod tests {
             panic!("sequential reader must keep its prefetch buffer")
         };
 
-        assert_eq!(random_reader.read_chunk_size(), RANDOM_READ_CHUNK_SIZE_MAX);
+        assert_eq!(random_reader.read_chunk_size(), 256 * 1024);
+        assert_eq!(reader.random_read_chunk_size(), 256 * 1024);
         assert!(!random_reader.read_ahead_enabled());
         assert_eq!(
             sequential_reader
@@ -670,6 +714,37 @@ mod tests {
     }
 
     #[test]
+    fn random_base_reader_can_disable_chunk_cap_without_prefetch() {
+        let mut conf = ClusterConf::default();
+        conf.client.enable_smart_prefetch = true;
+        conf.client.read_parallel = 1;
+        conf.client.read_chunk_size_str = "512KB".to_string();
+        conf.client.random_read_chunk_size_max_str = "0".to_string();
+        conf.client.read_slice_size_str = "4MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.init().unwrap();
+
+        let len = conf.client.read_slice_size;
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let read_detector = ReadDetector::with_conf(&fs_context.conf().client, len);
+        let reader = FsReaderBuffer::new(
+            Path::from_str("/random-reader").unwrap(),
+            fs_context,
+            file_blocks(len),
+            read_detector,
+        )
+        .unwrap();
+
+        let ReaderAdapter::Base(random_reader) = &reader.readers[reader.base_reader_index] else {
+            panic!("random reader must be unbuffered")
+        };
+
+        assert_eq!(random_reader.read_chunk_size(), 512 * 1024);
+        assert_eq!(reader.random_read_chunk_size(), 512 * 1024);
+        assert!(!random_reader.read_ahead_enabled());
+    }
+
+    #[test]
     fn seek_keeps_all_readers_aligned_without_smart_prefetch() {
         let (rt, mut reader) = reader_for_seek(false, 1);
 
@@ -677,6 +752,7 @@ mod tests {
         rt.block_on(reader.seek(seek_pos)).unwrap();
 
         assert!(reader.read_detector.is_sequential());
+        assert_eq!(reader.fuse_read_pattern(), "detector_disabled");
         for (index, sequential_reader) in reader.readers.iter().enumerate() {
             let expected = if index == reader.base_reader_index {
                 seek_pos

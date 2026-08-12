@@ -31,6 +31,8 @@ pub struct WorkerMetrics {
     pub(crate) read_time_us: Counter,
     pub(crate) read_count: Counter,
     pub(crate) read_blocks: CounterVec,
+    pub(crate) read_response_send_bytes: CounterVec,
+    pub(crate) read_response_send_duration_us: HistogramVec,
 
     pub(crate) block_store_stripe_lock_wait_us: HistogramVec,
     pub(crate) block_dataset_write_lock_wait_us: HistogramVec,
@@ -62,6 +64,16 @@ impl WorkerMetrics {
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
+            read_response_send_bytes: m::new_counter_vec(
+                "read_response_send_bytes",
+                "Worker ReadBlock response bytes handed to the TCP transport",
+                &["data_type", "outcome"],
+            )?,
+            read_response_send_duration_us: m::new_histogram_vec(
+                "read_response_send_duration_us",
+                "Worker ReadBlock response send duration in microseconds",
+                &["data_type", "outcome"],
+            )?,
 
             block_store_stripe_lock_wait_us: m::new_histogram_vec(
                 "block_store_stripe_lock_wait_us",
@@ -99,6 +111,25 @@ impl WorkerMetrics {
         };
 
         Ok(wm)
+    }
+
+    pub(crate) fn record_read_response_send(
+        &self,
+        data_type: &'static str,
+        data_len: usize,
+        elapsed_us: u64,
+        sent: bool,
+    ) {
+        let outcome = if sent { "success" } else { "error" };
+        let labels = &[data_type, outcome];
+        if sent {
+            self.read_response_send_bytes
+                .with_label_values(labels)
+                .inc_by(data_len as i64);
+        }
+        self.read_response_send_duration_us
+            .with_label_values(labels)
+            .observe(elapsed_us as f64);
     }
 
     pub fn text_output(&self) -> CommonResult<String> {

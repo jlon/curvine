@@ -24,6 +24,15 @@ use std::sync::Arc;
 
 type Inner = FsReaderBuffer;
 
+fn should_use_exact_fuse_read_len(
+    is_random: bool,
+    chunk_is_empty: bool,
+    remaining: usize,
+    random_chunk_size: usize,
+) -> bool {
+    is_random && chunk_is_empty && remaining > random_chunk_size
+}
+
 pub struct FsReader {
     inner: Inner,
     chunk: DataSlice,
@@ -107,6 +116,53 @@ impl Reader for FsReader {
         self.metrics.track_read(self.inner.read()).await
     }
 
+    async fn fuse_read(&mut self, pos: i64, len: usize) -> FsResult<Vec<DataSlice>> {
+        if pos >= self.len() {
+            return Ok(Vec::new());
+        }
+
+        self.seek(pos).await?;
+        self.metrics
+            .record_fuse_read_pattern(self.inner.fuse_read_pattern());
+        let mut chunks = Vec::with_capacity(len / self.chunk_size() + 1);
+        let mut remaining = len;
+        while remaining > 0 {
+            // A random FUSE request larger than the session chunk would
+            // otherwise require several stateful ReadBlock RPCs. The
+            // negotiated read_len capability returns exactly the requested
+            // bytes without changing sequential prefetch behavior.
+            let use_exact_len = should_use_exact_fuse_read_len(
+                self.inner.is_random(),
+                self.chunk.is_empty(),
+                remaining,
+                self.inner.random_read_chunk_size(),
+            );
+            let chunk = if use_exact_len && self.inner.supports_read_len().await? {
+                self.metrics
+                    .track_read(self.inner.read_with_len(Some(remaining)))
+                    .await?
+            } else {
+                self.read_chunk(Some(remaining)).await?
+            };
+            let read_len = chunk.len();
+            if read_len == 0 {
+                break;
+            }
+            if read_len > remaining {
+                return err_box!(
+                    "FUSE read response {} exceeds requested remaining {}",
+                    read_len,
+                    remaining
+                );
+            }
+            chunks.push(chunk);
+            remaining -= read_len;
+            self.pos += read_len as i64;
+        }
+
+        Ok(chunks)
+    }
+
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!("Cannot seek to negative offset");
@@ -134,5 +190,63 @@ impl Reader for FsReader {
 impl Drop for FsReader {
     fn drop(&mut self) {
         debug!("Close reader, path={}", self.path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_config::ClusterConf;
+    use curvine_model::{ExtendedBlock, FileAllocOpts, LocatedBlock};
+    use curvine_runtime::runtime::RpcRuntime;
+
+    #[test]
+    fn random_fuse_read_keeps_hole_overread_buffered() {
+        let mut conf = ClusterConf::default();
+        conf.client.enable_smart_prefetch = true;
+        conf.client.read_chunk_size_str = "4KB".to_owned();
+        conf.client.init().unwrap();
+
+        let context = Arc::new(FsContext::new(conf).unwrap());
+        let file_blocks = FileBlocks::new(
+            FileStatus {
+                id: 1,
+                len: 4096,
+                is_complete: true,
+                ..Default::default()
+            },
+            vec![LocatedBlock {
+                block: ExtendedBlock {
+                    id: 1,
+                    len: 4096,
+                    alloc_opts: Some(FileAllocOpts::with_truncate(4096)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        );
+        let mut reader = FsReader::new(
+            Path::from_str("/sparse").unwrap(),
+            context.clone(),
+            file_blocks,
+        )
+        .unwrap();
+        let rt = context.clone_runtime();
+
+        assert!(!should_use_exact_fuse_read_len(true, true, 4096, 4096));
+        assert!(should_use_exact_fuse_read_len(true, true, 4097, 4096));
+        assert!(!should_use_exact_fuse_read_len(false, true, 8192, 4096));
+        assert!(!should_use_exact_fuse_read_len(true, false, 8192, 4096));
+
+        let first = rt.block_on(reader.fuse_read(512, 7)).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].len(), 7);
+        assert!(first[0].as_slice().iter().all(|byte| *byte == 0));
+        assert_eq!(reader.pos(), 519);
+
+        let second = rt.block_on(reader.fuse_read(519, 5)).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].len(), 5);
+        assert_eq!(reader.pos(), 524);
     }
 }

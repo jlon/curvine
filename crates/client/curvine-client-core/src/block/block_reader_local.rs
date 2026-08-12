@@ -129,6 +129,7 @@ impl BlockReaderLocal {
                 true,
             )
             .await?;
+        let supports_read_len = read_context.supports_read_len;
 
         let opened = adopt_opened_session(
             client,
@@ -147,6 +148,7 @@ impl BlockReaderLocal {
                     req_id,
                     seq_id,
                 )
+                .with_read_len_capability(supports_read_len)
             },
         )
         .await?;

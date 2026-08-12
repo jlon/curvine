@@ -34,12 +34,16 @@ enum ReaderAdapter {
 }
 
 impl ReaderAdapter {
-    async fn read(&mut self) -> FsResult<DataSlice> {
+    async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<DataSlice> {
         match self {
             Local(r) => r.read().await,
-            Remote(r) => r.read().await,
+            Remote(r) => r.read_with_len(max_len).await,
             Hole(r) => r.read(),
         }
+    }
+
+    fn supports_read_len(&self) -> bool {
+        matches!(self, Remote(reader) if reader.supports_read_len())
     }
 
     #[allow(unused)]
@@ -234,13 +238,21 @@ impl BlockReader {
 
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_with_len(None).await
+    }
+
+    pub(crate) fn supports_read_len(&self) -> bool {
+        self.inner.supports_read_len()
+    }
+
+    pub(crate) async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             // end of block file
             return Ok(DataSlice::empty());
         }
 
         loop {
-            match self.inner.read().await {
+            match self.inner.read_with_len(max_len).await {
                 Ok(v) => return Ok(v),
 
                 Err(e) => {

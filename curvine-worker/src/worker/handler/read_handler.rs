@@ -22,7 +22,7 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_io::{CacheManager, ReadAheadTask};
 use curvine_proto::{BlockReadResponse, DataHeaderProto};
-use curvine_rpc::message::{Builder, Message, RequestStatus};
+use curvine_rpc::message::{Builder, Message, RequestStatus, HEAD_SIZE, MAX_DATE_SIZE};
 use curvine_runtime::common::{ByteUnit, TimeSpent};
 use log::{info, warn};
 use std::mem;
@@ -39,7 +39,9 @@ pub struct ReadHandler {
 }
 
 impl ReadHandler {
-    pub const MAX_READ_AHEAD: i64 = 16 * 1024 * 1024;
+    // LengthDelimitedCodec limits the frame after its length field, so a
+    // ReadBlock payload must reserve the fixed Curvine protocol header.
+    pub const MAX_READ_AHEAD: i64 = (MAX_DATE_SIZE - HEAD_SIZE) as i64;
 
     pub fn new(store: BlockStore) -> CommonResult<Self> {
         let metrics = Worker::get_metrics()?;
@@ -158,6 +160,7 @@ impl ReadHandler {
             len: logical_len,
             path: ternary!(is_short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
+            supports_read_len: Some(true),
         };
 
         let _ = mem::replace(&mut self.file, file);
@@ -180,14 +183,30 @@ impl ReadHandler {
         Ok(())
     }
 
+    fn resolve_read_len(chunk_size: i32, requested_len: Option<i32>) -> FsResult<i32> {
+        match requested_len {
+            Some(read_len) if read_len < 0 => {
+                err_box!("read length cannot be negative: {}", read_len)
+            }
+            // A negotiated read_len is an exact response limit, not a
+            // session-chunk hint. Keep the worker's existing read-ahead cap
+            // as the protocol safety boundary.
+            Some(read_len) if read_len > 0 => Ok(read_len.min(Self::MAX_READ_AHEAD as i32)),
+            Some(_) | None => Ok(chunk_size),
+        }
+    }
+
     pub fn read(&mut self, msg: &Message) -> FsResult<Message> {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
 
-        if msg.header_len() > 0 {
+        let read_len = if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
             file.seek_to(header.offset)?;
-        }
+            Self::resolve_read_len(context.chunk_size, header.read_len)?
+        } else {
+            context.chunk_size
+        };
 
         let spend = TimeSpent::new();
         if let Some(local) = file.as_local_mut() {
@@ -195,7 +214,7 @@ impl ReadHandler {
         }
 
         let enable_send_file = self.enable_send_file && file.supports_send_file();
-        let region = file.read_region(enable_send_file, context.chunk_size)?;
+        let region = file.read_region(enable_send_file, read_len)?;
 
         let used = spend.used_us();
         if used >= self.io_slow_us {
@@ -240,5 +259,33 @@ impl ReadHandler {
 
             _ => err_box!("Unsupported request type"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_read_len_can_exceed_session_chunk_within_worker_limit() {
+        let chunk_size = 256 * 1024;
+
+        assert_eq!(
+            ReadHandler::resolve_read_len(chunk_size, Some(1024 * 1024)).unwrap(),
+            1024 * 1024
+        );
+        assert_eq!(
+            ReadHandler::resolve_read_len(chunk_size, Some(32 * 1024 * 1024)).unwrap(),
+            ReadHandler::MAX_READ_AHEAD as i32
+        );
+        assert_eq!(
+            ReadHandler::resolve_read_len(chunk_size, Some(MAX_DATE_SIZE)).unwrap(),
+            MAX_DATE_SIZE - HEAD_SIZE
+        );
+        assert_eq!(
+            ReadHandler::resolve_read_len(chunk_size, None).unwrap(),
+            chunk_size
+        );
+        assert!(ReadHandler::resolve_read_len(chunk_size, Some(-1)).is_err());
     }
 }

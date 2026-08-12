@@ -30,6 +30,7 @@ pub struct BlockReaderRemote {
     req_id: i64,
     seq_id: i32,
     header: Option<DataHeaderProto>,
+    supports_read_len: bool,
 }
 
 impl BlockReaderRemote {
@@ -44,7 +45,7 @@ impl BlockReaderRemote {
         let seq_id = 0;
 
         let client = fs_context.acquire_read(&worker_address).await?;
-        let _ = client
+        let context = client
             .open_block(
                 &fs_context.conf.client,
                 &block,
@@ -56,15 +57,10 @@ impl BlockReaderRemote {
             )
             .await?;
 
-        Ok(Self::from_opened(
-            client,
-            block,
-            worker_address,
-            off,
-            len,
-            req_id,
-            seq_id,
-        ))
+        Ok(
+            Self::from_opened(client, block, worker_address, off, len, req_id, seq_id)
+                .with_read_len_capability(context.supports_read_len),
+        )
     }
 
     pub(crate) fn from_opened(
@@ -85,7 +81,17 @@ impl BlockReaderRemote {
             req_id,
             seq_id,
             header: None,
+            supports_read_len: false,
         }
+    }
+
+    pub(crate) fn with_read_len_capability(mut self, supports_read_len: bool) -> Self {
+        self.supports_read_len = supports_read_len;
+        self
+    }
+
+    pub(crate) fn supports_read_len(&self) -> bool {
+        self.supports_read_len
     }
 
     fn next_seq_id(&mut self) -> i32 {
@@ -115,17 +121,39 @@ impl BlockReaderRemote {
             offset: pos,
             flush: false,
             is_last: false,
+            read_len: None,
         });
         Ok(self.pos)
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_with_len(None).await
+    }
+
+    /// Keep the stateful worker cursor, but cap this response to the FUSE
+    /// request when random reads do not need the rest of the session chunk.
+    pub(crate) async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<DataSlice> {
         if self.remaining() <= 0 {
             return err_box!("No readable data");
         }
 
         let seq_id = self.next_seq_id();
-        let header = self.header.take();
+        let header = match max_len.filter(|_| self.supports_read_len) {
+            None => self.header.take(),
+            Some(max_len) => {
+                let read_len = max_len.min(self.remaining() as usize);
+                let read_len = i32::try_from(read_len)
+                    .map_err(|_| curvine_error::FsError::common("read length exceeds i32::MAX"))?;
+                let mut header = self.header.take().unwrap_or(DataHeaderProto {
+                    offset: self.pos,
+                    flush: false,
+                    is_last: false,
+                    read_len: None,
+                });
+                header.read_len = Some(read_len);
+                Some(header)
+            }
+        };
         let chunk = self.client.read_data(self.req_id, seq_id, header).await?;
 
         self.pos += chunk.len() as i64;

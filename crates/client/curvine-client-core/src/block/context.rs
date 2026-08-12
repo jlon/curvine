@@ -28,6 +28,7 @@ pub struct BlockReadContext {
     pub len: i64,
     pub path: Option<String>,
     pub storage_type: StorageType,
+    pub supports_read_len: bool,
 }
 
 impl BlockReadContext {
@@ -37,6 +38,7 @@ impl BlockReadContext {
             len: req.len,
             path: req.path,
             storage_type: StorageType::from(req.storage_type),
+            supports_read_len: req.supports_read_len.unwrap_or(false),
         }
     }
 }
@@ -64,5 +66,37 @@ impl CreateBatchBlockContext {
 
     pub fn is_empty(&self) -> bool {
         self.contexts.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockReadContext;
+    use curvine_proto::{BlockReadResponse, StorageTypeProto};
+
+    #[test]
+    fn old_worker_response_disables_read_len() {
+        let context = BlockReadContext::from_req(BlockReadResponse {
+            id: 1,
+            len: 1,
+            path: None,
+            storage_type: StorageTypeProto::Disk.into(),
+            supports_read_len: None,
+        });
+
+        assert!(!context.supports_read_len);
+    }
+
+    #[test]
+    fn capable_worker_response_enables_read_len() {
+        let context = BlockReadContext::from_req(BlockReadResponse {
+            id: 1,
+            len: 1,
+            path: None,
+            storage_type: StorageTypeProto::Disk.into(),
+            supports_read_len: Some(true),
+        });
+
+        assert!(context.supports_read_len);
     }
 }

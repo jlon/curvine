@@ -23,8 +23,7 @@ use curvine_core_error::ErrorExt;
 use curvine_core_error::{try_option_ref, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
-use curvine_fs_api::Path;
-use curvine_fs_api::RpcCode;
+use curvine_fs_api::{Path, RpcCode};
 use curvine_io::DataSlice;
 use curvine_model::ProtoUtils;
 use curvine_model::{ExtendedBlock, StorageType, WorkerAddress};
@@ -34,10 +33,30 @@ use curvine_proto::{
     FileWriteData, FilesBatchWriteRequest,
 };
 use curvine_rpc::client::RpcClient;
+use curvine_rpc::handler::RpcReceiveStats;
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::LocalTime;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A request remains in flight until its complete response has been received.
+/// Dropping the request future before that point leaves the flag set so the
+/// connection cannot be returned to the block-client pool.
+struct RequestGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl RequestGuard {
+    fn new(in_flight: Arc<AtomicUsize>) -> Self {
+        in_flight.fetch_add(1, Ordering::AcqRel);
+        Self { in_flight }
+    }
+
+    fn complete(self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub struct BlockClient {
     client: Option<RpcClient>,
@@ -46,6 +65,7 @@ pub struct BlockClient {
     pool: Option<Arc<BlockClientPool>>,
     worker_addr: WorkerAddress,
     uptime: u64,
+    in_flight: Arc<AtomicUsize>,
 }
 
 impl BlockClient {
@@ -57,7 +77,12 @@ impl BlockClient {
             pool: None,
             worker_addr,
             uptime: LocalTime::mills(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn begin_request(&self) -> RequestGuard {
+        RequestGuard::new(self.in_flight.clone())
     }
 
     pub fn set_pool(&mut self, pool: Arc<BlockClientPool>) {
@@ -92,6 +117,7 @@ impl BlockClient {
     }
 
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
+        let request = self.begin_request();
         let client = try_option_ref!(self.client);
         let rep_msg = match client.timeout_rpc(self.timeout, msg).await {
             Ok(rep_msg) => rep_msg,
@@ -100,10 +126,36 @@ impl BlockClient {
                 return Err(FsError::from(err));
             }
         };
-        match rep_msg.check_error_ext::<FsError>() {
+        let result = match rep_msg.check_error_ext::<FsError>() {
             Ok(_) => Ok(rep_msg),
             Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
-        }
+        };
+        request.complete();
+        result
+    }
+
+    async fn rpc_with_receive_stats(
+        &self,
+        msg: Message,
+    ) -> FsResult<(Message, Option<RpcReceiveStats>)> {
+        let request = self.begin_request();
+        let client = try_option_ref!(self.client);
+        let (rep_msg, receive_stats) = match client
+            .timeout_rpc_with_receive_stats(self.timeout, msg)
+            .await
+        {
+            Ok(rep_msg) => rep_msg,
+            Err(err) => {
+                client.set_closed();
+                return Err(FsError::from(err));
+            }
+        };
+        let result = match rep_msg.check_error_ext::<FsError>() {
+            Ok(_) => Ok((rep_msg, receive_stats)),
+            Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
+        };
+        request.complete();
+        result
     }
 
     pub async fn write_block(
@@ -181,6 +233,7 @@ impl BlockClient {
             offset: pos,
             flush: true,
             is_last: false,
+            read_len: None,
         };
 
         let msg = Builder::new()
@@ -307,9 +360,14 @@ impl BlockClient {
             builder.build()
         };
 
-        let rep = self.rpc(msg).await?;
+        let (rep, receive_stats) =
+            FsContext::metrics_track("ReadBlock", self.rpc_with_receive_stats(msg)).await?;
+        if let Some(stats) = receive_stats {
+            FsContext::get_metrics().record_read_block_receive(stats);
+        }
         Ok(rep.data)
     }
+
     pub async fn write_blocks_batch(
         &self,
         blocks: &[ExtendedBlock],
@@ -439,6 +497,13 @@ impl BlockClient {
 
 impl Drop for BlockClient {
     fn drop(&mut self) {
+        if self.in_flight.load(Ordering::Acquire) != 0 {
+            // A cancelled receive may leave the old response in this socket.
+            // Marking it closed makes `BlockClientPool::release` discard it.
+            if let Some(client) = &self.client {
+                client.set_closed();
+            }
+        }
         if let Some(pool) = self.pool.take() {
             if let Some(moved_client) = self.client.take() {
                 let client = BlockClient {
@@ -448,10 +513,46 @@ impl Drop for BlockClient {
                     pool: Some(pool.clone()),
                     worker_addr: std::mem::take(&mut self.worker_addr),
                     uptime: self.uptime,
+                    in_flight: self.in_flight.clone(),
                 };
 
                 pool.release(client);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_request_keeps_connection_tainted() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let request = RequestGuard::new(in_flight.clone());
+        drop(request);
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn completed_request_clears_connection_taint() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        RequestGuard::new(in_flight.clone()).complete();
+
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn completed_request_does_not_clear_another_in_flight_request() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let first = RequestGuard::new(in_flight.clone());
+        let second = RequestGuard::new(in_flight.clone());
+
+        first.complete();
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
+
+        drop(second);
+        assert_eq!(in_flight.load(Ordering::Acquire), 1);
     }
 }

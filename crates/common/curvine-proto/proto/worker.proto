@@ -51,12 +51,18 @@ message BlockReadResponse {
     required int64 len = 2;
     optional string path = 3;
     required StorageTypeProto storage_type = 4;
+    // Absent on older Workers. Clients must not send DataHeaderProto.read_len
+    // unless this capability is explicitly enabled by the opened session.
+    optional bool supports_read_len = 5 [default = false];
 }
 
 message DataHeaderProto {
     required int64 offset = 1;
     required bool flush = 2;
     required bool is_last = 3;
+    // Optional maximum bytes for one stateful ReadBlock Running response.
+    // Zero retains the session chunk_size for backward compatibility.
+    optional int32 read_len = 4;
 }
 
 message DeleteBlockCmdProto {

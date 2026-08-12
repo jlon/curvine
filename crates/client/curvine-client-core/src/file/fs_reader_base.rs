@@ -99,12 +99,20 @@ impl FsReaderBase {
     }
 
     pub async fn read(&mut self) -> FsResult<DataSlice> {
+        self.read_with_len(None).await
+    }
+
+    pub(crate) async fn supports_read_len(&mut self) -> FsResult<bool> {
+        Ok(self.get_reader().await?.supports_read_len())
+    }
+
+    pub(crate) async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             return Ok(DataSlice::empty());
         }
 
         let cur_reader = self.get_reader().await?;
-        let chunk = cur_reader.read().await?;
+        let chunk = cur_reader.read_with_len(max_len).await?;
         self.pos += chunk.len() as i64;
         Ok(chunk)
     }

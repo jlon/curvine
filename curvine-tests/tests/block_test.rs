@@ -15,7 +15,7 @@
 #![allow(clippy::useless_vec)]
 
 use bytes::BytesMut;
-use curvine_client::file::{CurvineFileSystem, FsWriter};
+use curvine_client::file::{CurvineFileSystem, FsContext, FsWriter};
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_error::FsError;
@@ -46,6 +46,44 @@ fn test_remote_network_file_read_write() -> CommonResult<()> {
     conf.client.short_circuit = false;
     let path = Path::from_str("/file_remote.data")?;
     run(testing, conf, path)
+}
+
+#[test]
+fn test_remote_read_records_read_block_rpc_duration() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.read_chunk_num = 1;
+    conf.client.read_chunk_size = 4096;
+    let path = Path::from_str("/file_remote_read_block_metric.data")?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move {
+        fs.write_string(&path, "read-block-metric").await?;
+        let before = FsContext::get_metrics()
+            .metadata_operation_duration
+            .with_label_values(&["ReadBlock"])
+            .get_sample_count();
+
+        let mut reader = fs.open(&path).await?;
+        let mut buf = BytesMut::zeroed(64);
+        let len = reader.read(&mut buf).await?;
+        reader.complete().await?;
+
+        assert_eq!(&buf[..len], b"read-block-metric");
+        assert!(
+            FsContext::get_metrics()
+                .metadata_operation_duration
+                .with_label_values(&["ReadBlock"])
+                .get_sample_count()
+                > before,
+            "a remote data read must record ReadBlock RPC latency"
+        );
+        Ok::<(), FsError>(())
+    })?;
+
+    Ok(())
 }
 
 #[test]

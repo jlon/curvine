@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use curvine_client_core::file::{FsContext, FsReader};
 use curvine_config::ClusterConf;
 use curvine_core_error::CommonResult;
-use curvine_fs_api::RpcCode;
+use curvine_fs_api::{Path, Reader, RpcCode};
 use curvine_io::DataSlice::Buffer;
 use curvine_model::ProtoUtils;
-use curvine_model::{ExtendedBlock, FileAllocOpts, FileType, StorageType};
+use curvine_model::{
+    ExtendedBlock, FileAllocOpts, FileBlocks, FileStatus, FileType, LocatedBlock, StorageType,
+    WorkerAddress,
+};
 use curvine_net::net::NetUtils;
 use curvine_proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
@@ -26,9 +30,12 @@ use curvine_proto::{
 };
 use curvine_rpc::message::{Builder, Message, RequestStatus};
 use curvine_runtime::common::Utils;
+use curvine_runtime::runtime::RpcRuntime;
 use curvine_server::worker::Worker;
 use prost::bytes::BytesMut;
+use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "fault-injection")]
 use curvine_fault::{
@@ -117,6 +124,127 @@ fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<(
 }
 
 #[test]
+fn test_worker_stream_read_honors_requested_length() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_id = Utils::req_id().abs();
+    let block_len = (CHUNK_SIZE * LOOP_NUM) as i64;
+    block_write(block_id, &conf)?;
+    let expected = block_read_bytes(block_id, block_len, &conf)?;
+    let client = conf.worker_sync_client()?;
+    let req_id = Utils::req_id();
+    let open = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(BlockReadRequest {
+            id: block_id,
+            off: 0,
+            len: block_len,
+            chunk_size: CHUNK_SIZE,
+            short_circuit: false,
+            ..Default::default()
+        })
+        .build();
+    let _: BlockReadResponse = client.rpc_check(open)?.parse_header()?;
+
+    let exact_len = 513;
+    let exact = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(DataHeaderProto {
+            offset: 0,
+            flush: false,
+            is_last: false,
+            read_len: Some(exact_len),
+        })
+        .build();
+    let exact_response = client.rpc_check(exact)?;
+    assert_eq!(exact_response.data.len(), exact_len as usize);
+    assert_eq!(
+        exact_response.data.as_slice(),
+        &expected[..exact_len as usize]
+    );
+
+    // A client that does not send the new optional field keeps the old chunk
+    // behavior, which allows a new Worker to serve old clients unchanged.
+    let legacy = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Running)
+        .req_id(req_id)
+        .seq_id(2)
+        .build();
+    let legacy_response = client.rpc_check(legacy)?;
+    assert_eq!(legacy_response.data.len(), CHUNK_SIZE as usize);
+    assert_eq!(
+        legacy_response.data.as_slice(),
+        &expected[exact_len as usize..exact_len as usize + CHUNK_SIZE as usize]
+    );
+
+    let complete = Builder::new()
+        .code(RpcCode::ReadBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(3)
+        .build();
+    let _: Message = client.rpc_check(complete)?;
+    Ok(())
+}
+
+#[test]
+fn test_client_stream_read_propagates_requested_length() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_id = Utils::req_id().abs();
+    let block_len = (CHUNK_SIZE * LOOP_NUM) as i64;
+    block_write(block_id, &conf)?;
+    let expected = block_read_bytes(block_id, block_len, &conf)?;
+
+    let mut client_conf = conf.clone();
+    client_conf.client.short_circuit = false;
+    client_conf.client.enable_smart_prefetch = true;
+    client_conf.client.read_chunk_size_str = "4KB".to_owned();
+    client_conf.client.init()?;
+    let context = Arc::new(FsContext::new(client_conf)?);
+    let worker = WorkerAddress {
+        worker_id: 1,
+        hostname: "worker-test".to_owned(),
+        ip_addr: "127.0.0.1".to_owned(),
+        rpc_port: conf.worker.rpc_port as u32,
+        web_port: conf.worker.web_port as u32,
+    };
+    let located = LocatedBlock {
+        block: ExtendedBlock::new(block_id, block_len, StorageType::Disk, FileType::File),
+        locs: vec![worker],
+        ..Default::default()
+    };
+
+    let file_blocks = FileBlocks::new(
+        FileStatus {
+            id: block_id,
+            len: block_len,
+            is_complete: true,
+            ..Default::default()
+        },
+        vec![located],
+    );
+    let runtime = context.clone_runtime();
+    let mut reader = FsReader::new(Path::from_str("/stream-read-len")?, context, file_blocks)?;
+
+    let first = runtime.block_on(reader.fuse_read(1023, 513))?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].as_slice(), &expected[1023..1536]);
+    assert_eq!(reader.pos(), 1536);
+
+    let second = runtime.block_on(reader.fuse_read(1536, 256))?;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].as_slice(), &expected[1536..1792]);
+    runtime.block_on(reader.complete())?;
+    Ok(())
+}
+
+#[test]
 fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<()> {
     let conf = start_worker();
     let client = conf.worker_sync_client()?;
@@ -177,6 +305,217 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
     );
 
     Ok(())
+}
+
+fn assert_block_unreadable(block_id: i64, conf: &ClusterConf) -> CommonResult<()> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let client = conf.worker_sync_client()?;
+        let read = BlockReadRequest {
+            id: block_id,
+            off: 0,
+            len: 1,
+            chunk_size: CHUNK_SIZE,
+            short_circuit: false,
+            ..Default::default()
+        };
+        let read_open = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .request(RequestStatus::Open)
+            .req_id(Utils::req_id())
+            .seq_id(0)
+            .proto_header(read)
+            .build();
+
+        match client.rpc_check(read_open) {
+            Err(error)
+                if error
+                    .to_string()
+                    .contains(&format!("Block {} not found", block_id)) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(_) => {
+                return Err(curvine_core_error::err_msg!(format!(
+                    "unfinished block {} remained readable after its write stream ended",
+                    block_id
+                ))
+                .into());
+            }
+        }
+    }
+}
+
+#[test]
+fn test_worker_disconnect_aborts_unfinished_write() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_id = Utils::req_id().abs();
+    let block_size = CHUNK_SIZE as i64;
+    let block = ExtendedBlock::new(block_id, block_size, StorageType::Disk, FileType::File);
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(block),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let req_id = Utils::req_id();
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+
+    {
+        let client = conf.worker_sync_client()?;
+        let _: BlockWriteResponse = client.rpc_check(open)?.parse_header()?;
+    }
+
+    assert_block_unreadable(block_id, &conf)
+}
+
+#[test]
+fn test_worker_new_open_aborts_previous_unfinished_write() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_size = CHUNK_SIZE as i64;
+    let first_block_id = Utils::req_id().abs();
+    let first_request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+            first_block_id,
+            block_size,
+            StorageType::Disk,
+            FileType::File,
+        )),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let second_request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+            Utils::req_id().abs(),
+            block_size,
+            StorageType::Disk,
+            FileType::File,
+        )),
+        ..first_request.clone()
+    };
+    let client = conf.worker_sync_client()?;
+
+    let first_open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(Utils::req_id())
+        .seq_id(0)
+        .proto_header(first_request)
+        .build();
+    let _: BlockWriteResponse = client.rpc_check(first_open)?.parse_header()?;
+
+    let second_open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(Utils::req_id())
+        .seq_id(1)
+        .proto_header(second_request)
+        .build();
+    let _: BlockWriteResponse = client.rpc_check(second_open)?.parse_header()?;
+
+    assert_block_unreadable(first_block_id, &conf)
+}
+
+#[test]
+fn test_worker_disconnect_aborts_unfinished_batch_write() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_size = CHUNK_SIZE as i64;
+    let blocks = [
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+        ExtendedBlock::new(Utils::req_id().abs(), 0, StorageType::Disk, FileType::File),
+    ];
+    let req_id = Utils::req_id();
+    let request = BlocksBatchWriteRequest {
+        blocks: blocks
+            .iter()
+            .cloned()
+            .map(ProtoUtils::extend_block_to_pb)
+            .collect(),
+        off: 0,
+        block_size,
+        req_id,
+        seq_id: 0,
+        chunk_size: CHUNK_SIZE,
+        short_circuit: false,
+        client_name: "test".to_string(),
+    };
+    let open = Builder::new()
+        .code(RpcCode::WriteBlocksBatch)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request)
+        .build();
+
+    {
+        let client = conf.worker_sync_client()?;
+        let _: BlocksBatchWriteResponse = client.rpc_check(open)?.parse_header()?;
+    }
+
+    for block in blocks {
+        assert_block_unreadable(block.id, &conf)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_worker_finalize_failure_aborts_block_after_disconnect() -> CommonResult<()> {
+    let conf = start_worker();
+    let block_id = Utils::req_id().abs();
+    let block_size = CHUNK_SIZE as i64;
+    let request = BlockWriteRequest {
+        block: ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
+            block_id,
+            1,
+            StorageType::Disk,
+            FileType::File,
+        )),
+        off: 0,
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
+    };
+    let req_id = Utils::req_id();
+
+    let open = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Open)
+        .req_id(req_id)
+        .seq_id(0)
+        .proto_header(request.clone())
+        .build();
+    let complete = Builder::new()
+        .code(RpcCode::WriteBlock)
+        .request(RequestStatus::Complete)
+        .req_id(req_id)
+        .seq_id(1)
+        .proto_header(request)
+        .build();
+
+    {
+        let client = conf.worker_sync_client()?;
+        let _: BlockWriteResponse = client.rpc_check(open)?.parse_header()?;
+        assert!(client.rpc_check(complete).is_err());
+    }
+
+    assert_block_unreadable(block_id, &conf)
 }
 
 #[test]
@@ -361,6 +700,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         offset: 0,
         flush: false,
         is_last: false,
+        read_len: None,
     };
     let non_flush_msg = Builder::new()
         .code(RpcCode::WriteBlock)
@@ -375,6 +715,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
         offset: 0,
         flush: true,
         is_last: false,
+        read_len: None,
     };
     let flush_msg = Builder::new()
         .code(RpcCode::WriteBlock)
@@ -555,7 +896,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .request(RequestStatus::Open)
         .req_id(req_id)
         .seq_id(seq_id)
-        .proto_header(request)
+        .proto_header(request.clone())
         .build();
 
     let client = conf.worker_sync_client()?;
@@ -588,6 +929,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         .request(RequestStatus::Complete)
         .req_id(req_id)
         .seq_id(seq_id)
+        .proto_header(request)
         .build();
 
     let _: Message = client.rpc(msg)?;
@@ -736,20 +1078,28 @@ fn block_read_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u
         .build();
     let _: BlockReadResponse = client.rpc_check(open)?.parse_header()?;
 
-    let read = Builder::new()
-        .code(RpcCode::ReadBlock)
-        .req_id(req_id)
-        .seq_id(1)
-        .request(RequestStatus::Running)
-        .build();
-    let response = client.rpc_check(read)?;
-    let data = response.data.as_slice().to_vec();
+    let mut data = Vec::with_capacity(len as usize);
+    let mut seq_id = 1;
+    while data.len() < len as usize {
+        let read = Builder::new()
+            .code(RpcCode::ReadBlock)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .request(RequestStatus::Running)
+            .build();
+        seq_id += 1;
+        let response = client.rpc_check(read)?;
+        if response.data.is_empty() {
+            break;
+        }
+        data.extend_from_slice(response.data.as_slice());
+    }
 
     let complete = Builder::new()
         .code(RpcCode::ReadBlock)
         .request(RequestStatus::Complete)
         .req_id(req_id)
-        .seq_id(2)
+        .seq_id(seq_id)
         .build();
     let _: Message = client.rpc_check(complete)?;
 

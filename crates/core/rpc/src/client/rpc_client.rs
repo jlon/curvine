@@ -15,7 +15,7 @@
 use crate::client::client_state::InnerState;
 use crate::client::dispatch::Envelope;
 use crate::client::{BufferClient, ClientConf, ClientState, RawClient};
-use crate::handler::{Frame, RpcFrame};
+use crate::handler::{Frame, RpcFrame, RpcReceiveStats};
 use crate::message::{Message, RefMessage};
 use curvine_io::{IOError, IOResult};
 use curvine_net::net::InetAddr;
@@ -52,6 +52,16 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
+    fn check_response(&self, req_id: i64, seq_id: i32, response: &Message) -> IOResult<()> {
+        if let Err(error) = RawClient::check_response(req_id, seq_id, response) {
+            // A response for another logical request means this transport is no
+            // longer frame-safe. It must not be returned to any client pool.
+            self.set_closed();
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn new(
         buffer: bool,
         rt: Arc<Runtime>,
@@ -122,12 +132,63 @@ impl RpcClient {
             }
         };
 
-        RawClient::check_response(req_id, seq_id, &rep_msg)?;
+        self.check_response(req_id, seq_id, &rep_msg)?;
         Ok(rep_msg)
+    }
+
+    /// Returns raw-frame receive timing when the client uses a non-buffered connection.
+    pub async fn rpc_with_receive_stats(
+        &self,
+        msg: impl RefMessage,
+    ) -> IOResult<(Message, Option<RpcReceiveStats>)> {
+        let req_id = msg.req_id();
+        let seq_id = msg.seq_id();
+
+        let (rep_msg, receive_stats) = match &self.sender {
+            BoxSender::Frame(f) => {
+                let frame = f.as_mut();
+                if let Err(e) = frame.send(msg).await {
+                    self.set_closed();
+                    return Err(e);
+                }
+
+                let (msg, receive_stats) = match frame.receive_with_stats().await {
+                    Ok(value) => value,
+                    Err(e) => {
+                        self.set_closed();
+                        return Err(e);
+                    }
+                };
+
+                if msg.is_empty() {
+                    self.set_closed();
+                    return err_box!("Connection {} is closed", self.state.conn_info());
+                } else {
+                    (msg, Some(receive_stats))
+                }
+            }
+
+            BoxSender::Channel(c) => {
+                let (tx, rx) = oneshot::channel();
+                try_err!(c.send(Envelope::new(msg.into_box(), tx)).await);
+                (try_err!(rx.await)?, None)
+            }
+        };
+
+        self.check_response(req_id, seq_id, &rep_msg)?;
+        Ok((rep_msg, receive_stats))
     }
 
     pub async fn timeout_rpc(&self, dur: Duration, msg: impl RefMessage) -> IOResult<Message> {
         timeout(dur, self.rpc(msg)).await?
+    }
+
+    pub async fn timeout_rpc_with_receive_stats(
+        &self,
+        dur: Duration,
+        msg: impl RefMessage,
+    ) -> IOResult<(Message, Option<RpcReceiveStats>)> {
+        timeout(dur, self.rpc_with_receive_stats(msg)).await?
     }
 
     // @todo Next consider using unsafe instead of arc.

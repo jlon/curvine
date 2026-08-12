@@ -16,12 +16,14 @@ use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
+use crate::worker::Worker;
 use curvine_core_error::err_box;
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_fs_api::RpcCode;
 use curvine_model::LoadTaskInfo;
 use curvine_proto::*;
-use curvine_rpc::handler::MessageHandler;
+use curvine_rpc::handler::{MessageHandler, ResponseSendInfo};
 use curvine_rpc::message::{Builder, Message, RequestStatus, ResponseStatus};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::runtime::Runtime;
@@ -89,6 +91,15 @@ impl MessageHandler for WorkerHandler {
 
                 res
             }
+        }
+    }
+
+    fn on_response_sent(&self, info: ResponseSendInfo, elapsed_us: u64, sent: bool) {
+        if RpcCode::from(info.code) != RpcCode::ReadBlock {
+            return;
+        }
+        if let Ok(metrics) = Worker::get_metrics() {
+            metrics.record_read_response_send(info.data_type, info.data_len, elapsed_us, sent);
         }
     }
 }

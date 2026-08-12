@@ -23,12 +23,12 @@ use curvine_sys as sys;
 use curvine_sys::RawIOSlice;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
-
-#[cfg(target_os = "linux")]
-use std::os::unix::io::{AsRawFd, RawFd};
 
 pub enum FrameSate {
     Head,
@@ -40,6 +40,18 @@ pub struct RpcFrame {
     io: TcpStream,
     buf: FrameBuf,
     enable_splice: bool,
+}
+
+/// Time spent reading one RPC response from a raw TCP client connection.
+///
+/// The values include socket readiness waiting and kernel-to-user copies. They
+/// intentionally do not claim to measure CPU copy cost in isolation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RpcReceiveStats {
+    pub protocol_read_us: u64,
+    pub header_read_us: u64,
+    pub payload_read_us: u64,
+    pub payload_len: usize,
 }
 
 impl RpcFrame {
@@ -211,6 +223,61 @@ impl RpcFrame {
     pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
         Framed::with_capacity(self.io, RpcCodec::new(), self.buf.buf_size())
     }
+
+    pub async fn receive_with_stats(&mut self) -> IOResult<(Message, RpcReceiveStats)> {
+        let mut state = FrameSate::Head;
+        let mut stats = RpcReceiveStats::default();
+        loop {
+            match state {
+                FrameSate::Head => {
+                    let start = Instant::now();
+                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
+                        Ok(v) => v,
+                        Err(_) => return Ok((Message::empty(), stats)),
+                    };
+                    stats.protocol_read_us += start.elapsed().as_micros() as u64;
+
+                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
+                    let _ = mem::replace(
+                        &mut state,
+                        FrameSate::Data(protocol, header_size, data_size),
+                    );
+                }
+
+                FrameSate::Data(protocol, header_size, data_size) => {
+                    let header = if header_size > 0 {
+                        let start = Instant::now();
+                        let buf = self.read_full(header_size).await?;
+                        stats.header_read_us += start.elapsed().as_micros() as u64;
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                    let data = if data_size <= 0 {
+                        DataSlice::Empty
+                    } else {
+                        let start = Instant::now();
+                        let data = self.read_data(data_size).await?;
+                        stats.payload_read_us += start.elapsed().as_micros() as u64;
+                        stats.payload_len += data.len();
+                        data
+                    };
+                    let msg = Message {
+                        protocol,
+                        header,
+                        data,
+                    };
+
+                    let _ = mem::replace(&mut state, FrameSate::Head);
+                    if msg.is_heartbeat() {
+                        continue;
+                    } else {
+                        return Ok((msg, stats));
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -270,8 +337,6 @@ impl Frame for RpcFrame {
                     };
 
                     let _ = mem::replace(&mut state, FrameSate::Head);
-
-                    // Heartbeat message.
                     if msg.is_heartbeat() {
                         continue;
                     } else {

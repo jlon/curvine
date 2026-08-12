@@ -180,6 +180,7 @@ impl BlockWriterRemote {
             offset: pos,
             flush: false,
             is_last: false,
+            read_len: None,
         });
 
         Ok(())

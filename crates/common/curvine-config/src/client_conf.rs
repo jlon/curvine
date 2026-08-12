@@ -59,6 +59,14 @@ pub struct ClientConf {
     #[serde(alias = "read_chunk_size")]
     #[client_cli]
     pub read_chunk_size_str: String,
+    /// Upper bound for a random-read block request. A zero value keeps the
+    /// regular read chunk size while still disabling random-read prefetch.
+    #[serde(skip)]
+    pub random_read_chunk_size_max: usize,
+    #[serde(alias = "random_read_chunk_size_max")]
+    #[client_cli]
+    pub random_read_chunk_size_max_str: String,
+
     #[client_cli]
     pub read_chunk_num: usize,
 
@@ -290,6 +298,8 @@ impl ClientConf {
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
         self.read_chunk_size = ByteUnit::from_str(&self.read_chunk_size_str)?.as_byte() as usize;
+        self.random_read_chunk_size_max =
+            ByteUnit::from_str(&self.random_read_chunk_size_max_str)?.as_byte() as usize;
 
         // Handle read_slice
         let read_slice_size = ByteUnit::from_str(&self.read_slice_size_str)?.as_byte() as i64;
@@ -373,6 +383,8 @@ impl Default for ClientConf {
 
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
+            random_read_chunk_size_max: 0,
+            random_read_chunk_size_max_str: "128KB".to_owned(),
             read_chunk_num: 8,
             read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,

@@ -15,10 +15,33 @@
 use crate::message::Message;
 use bytes::BytesMut;
 use curvine_core_error::{CommonErrorExt, ErrorExt};
-use curvine_io::DataSlice;
+use curvine_io::{DataSlice, DataSlice::*};
 use curvine_runtime::runtime::Runtime;
 use log::info;
 use std::future::Future;
+
+pub struct ResponseSendInfo {
+    pub code: i8,
+    pub data_len: usize,
+    pub data_type: &'static str,
+}
+
+impl From<&Message> for ResponseSendInfo {
+    fn from(message: &Message) -> Self {
+        let data_type = match &message.data {
+            Empty => "empty",
+            Buffer(_) => "buffer",
+            IOSlice(_) => "ioslice",
+            MemSlice(_) => "memslice",
+            Bytes(_) => "bytes",
+        };
+        Self {
+            code: message.code(),
+            data_len: message.data_len(),
+            data_type,
+        }
+    }
+}
 
 /// Message Processors.
 pub trait MessageHandler: Send + Sync + 'static {
@@ -47,6 +70,9 @@ pub trait MessageHandler: Send + Sync + 'static {
     fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {
         None
     }
+
+    /// Called after a non-empty response has been handed to the transport.
+    fn on_response_sent(&self, _info: ResponseSendInfo, _elapsed_us: u64, _sent: bool) {}
 }
 
 // A message processor for testing, converting strings into capitalization.

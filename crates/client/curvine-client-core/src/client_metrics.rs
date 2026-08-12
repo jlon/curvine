@@ -20,6 +20,7 @@ use curvine_metrics::{
     Counter, CounterVec, Gauge, HistogramVec, MetricFamilyType, Metrics, Metrics as m,
 };
 use curvine_model::{MetricType, MetricValue};
+use curvine_rpc::handler::RpcReceiveStats;
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::sync::FastDashMap;
 use std::collections::HashMap;
@@ -36,6 +37,9 @@ pub struct ClientMetrics {
     pub write_time_us: Counter,
     pub read_bytes: Counter,
     pub read_time_us: Counter,
+    pub read_block_receive_bytes: Counter,
+    pub read_block_receive_duration_us: HistogramVec,
+    pub fuse_read_pattern_total: CounterVec,
     pub block_idle_conn: Gauge,
 }
 
@@ -67,6 +71,21 @@ impl ClientMetrics {
             write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
             read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
             read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
+            read_block_receive_bytes: m::new_counter(
+                "client_read_block_receive_bytes",
+                "ReadBlock response payload bytes received by raw RPC clients",
+            )?,
+            read_block_receive_duration_us: m::new_histogram_vec(
+                "client_read_block_receive_duration_us",
+                "ReadBlock raw RPC receive duration by frame segment in microseconds",
+                &["stage"],
+            )?,
+            fuse_read_pattern_total: m::new_counter_vec(
+                "client_fuse_read_pattern_total",
+                "Curvine reader mode selected for FUSE reads after applying the offset; \
+                 pattern=detector_disabled means smart-prefetch pattern detection is disabled",
+                &["pattern"],
+            )?,
             block_idle_conn: m::new_gauge("client_block_idle_conn", "block idle conn total")?,
         };
 
@@ -99,6 +118,26 @@ impl ClientMetrics {
         let slice = res?;
         self.read_bytes.inc_by(slice.len() as i64);
         Ok(slice)
+    }
+
+    pub fn record_fuse_read_pattern(&self, pattern: &'static str) {
+        self.fuse_read_pattern_total
+            .with_label_values(&[pattern])
+            .inc();
+    }
+
+    pub fn record_read_block_receive(&self, stats: RpcReceiveStats) {
+        self.read_block_receive_bytes
+            .inc_by(stats.payload_len as i64);
+        for (stage, elapsed_us) in [
+            ("protocol", stats.protocol_read_us),
+            ("header", stats.header_read_us),
+            ("payload", stats.payload_read_us),
+        ] {
+            self.read_block_receive_duration_us
+                .with_label_values(&[stage])
+                .observe(elapsed_us as f64);
+        }
     }
 
     pub fn text_output(&self) -> CommonResult<String> {

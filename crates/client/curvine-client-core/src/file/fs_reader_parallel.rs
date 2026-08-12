@@ -143,7 +143,7 @@ impl FsReaderParallel {
         self.inner.pos()
     }
 
-    pub async fn read(&mut self) -> FsResult<FileChunk> {
+    async fn prepare_read(&mut self) -> FsResult<bool> {
         match self.cur_idx {
             None => {
                 // To read the first slice, you need to seek to start position.
@@ -155,7 +155,7 @@ impl FsReaderParallel {
                 // Switch to the next slice
                 let next_idx = idx + 1;
                 if next_idx >= self.alloc_slices.len() {
-                    return Ok(FileChunk::default());
+                    return Ok(false);
                 } else {
                     let idx = *self.cur_idx.insert(next_idx);
                     self.inner.seek(self.alloc_slices[idx].start).await?;
@@ -165,8 +165,27 @@ impl FsReaderParallel {
             _ => (),
         }
 
+        Ok(true)
+    }
+
+    pub async fn read(&mut self) -> FsResult<FileChunk> {
+        self.read_with_len(None).await
+    }
+
+    pub(crate) async fn supports_read_len(&mut self) -> FsResult<bool> {
+        if !self.prepare_read().await? {
+            return Ok(false);
+        }
+        self.inner.supports_read_len().await
+    }
+
+    pub(crate) async fn read_with_len(&mut self, max_len: Option<usize>) -> FsResult<FileChunk> {
+        if !self.prepare_read().await? {
+            return Ok(FileChunk::default());
+        }
+
         let pos = self.inner.pos();
-        let bytes = self.inner.read().await?;
+        let bytes = self.inner.read_with_len(max_len).await?;
         let chunk = FileChunk::new(pos, bytes);
 
         Ok(chunk)

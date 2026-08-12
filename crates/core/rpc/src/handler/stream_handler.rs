@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, MessageHandler};
+use crate::handler::{Frame, MessageHandler, ResponseSendInfo};
 use crate::message::{Builder, Message};
 use crate::ServerConf;
 use curvine_io::IOResult;
@@ -20,6 +20,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::time::timeout;
 
 // Network channel message processor. It associates network connection and message processing logic.
@@ -96,7 +97,12 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
         };
 
         if response.not_empty() {
-            self.frame.send(response).await
+            let info = ResponseSendInfo::from(&response);
+            let start = Instant::now();
+            let sent = self.frame.send(response).await;
+            self.handler
+                .on_response_sent(info, start.elapsed().as_micros() as u64, sent.is_ok());
+            sent
         } else {
             Ok(())
         }

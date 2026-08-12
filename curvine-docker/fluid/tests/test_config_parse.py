@@ -72,6 +72,8 @@ class ConfigParseTest(unittest.TestCase):
                 "options": {
                     "master-endpoints": "master-0:8995",
                     "client.enable_unified_fs": "false",
+                    "client.random_read_chunk_size_max": "256KB",
+                    "client.enable_positioned_read": "true",
                     "fuse.enable_write_back": "true",
                     "fuse.entry_timeout_ms": "300000",
                     "fuse.attr_timeout_ms": "300000",
@@ -83,7 +85,11 @@ class ConfigParseTest(unittest.TestCase):
             "targetPath": "/runtime-mnt/thin/default/curvine-dataset/thin-fuse",
         })
 
-        self.assertIn("[client]\nenable_unified_fs = false", rendered)
+        self.assertIn("[client]", rendered)
+        self.assertIn("enable_unified_fs = false", rendered)
+        self.assertNotIn('hostname = "localhost"', rendered)
+        self.assertIn('random_read_chunk_size_max = "256KB"', rendered)
+        self.assertIn("enable_positioned_read = true", rendered)
         self.assertIn("write_back_cache = true", rendered)
         self.assertIn("entry_timeout_ms = 300000", rendered)
         self.assertIn("attr_timeout_ms = 300000", rendered)
@@ -95,6 +101,8 @@ class ConfigParseTest(unittest.TestCase):
         if tomllib is not None:
             parsed = tomllib.loads(rendered)
             self.assertFalse(parsed["client"]["enable_unified_fs"])
+            self.assertEqual(parsed["client"]["random_read_chunk_size_max"], "256KB")
+            self.assertTrue(parsed["client"]["enable_positioned_read"])
             self.assertTrue(parsed["fuse"]["write_back_cache"])
             self.assertEqual(parsed["fuse"]["entry_timeout_ms"], 300000)
             self.assertEqual(parsed["fuse"]["attr_timeout_ms"], 300000)

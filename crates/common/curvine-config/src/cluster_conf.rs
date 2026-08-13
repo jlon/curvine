@@ -588,8 +588,10 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let loopback = "lo";
 
-        let mut conf = ClusterConf::default();
-        conf.net_interface = loopback.to_string();
+        let mut conf = ClusterConf {
+            net_interface: loopback.to_string(),
+            ..Default::default()
+        };
         conf.master.hostname = "cv-master".to_string();
         conf.journal.journal_addrs.clear();
 

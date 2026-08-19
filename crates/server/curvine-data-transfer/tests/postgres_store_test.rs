@@ -58,6 +58,33 @@ fn test_store_url() -> Option<(String, TestSchema)> {
     Some((store_url, TestSchema { url, name }))
 }
 
+#[test]
+fn postgres_store_rejects_an_unreadable_root_certificate() {
+    let err = match PostgresTransferStore::open(
+        "postgresql://transfer@localhost:5432/curvine_transfer?sslmode=require&sslrootcert=/curvine-missing-root-ca.pem",
+    ) {
+        Ok(_) => panic!("missing root certificate must reject the store URL"),
+        Err(err) => err,
+    };
+
+    assert!(err
+        .to_string()
+        .contains("Unable to read PostgreSQL root certificate"));
+}
+
+#[test]
+fn postgres_store_connects_with_a_private_ca() {
+    let Some(url) = std::env::var("CURVINE_TRANSFER_POSTGRES_TLS_URL").ok() else {
+        eprintln!("CURVINE_TRANSFER_POSTGRES_TLS_URL is not set; skipping PostgreSQL TLS test");
+        return;
+    };
+
+    PostgresTransferStore::open(&url)
+        .unwrap()
+        .check_available()
+        .unwrap();
+}
+
 fn transfer_job(id: &str, target_path: &str) -> TransferJobRecord {
     TransferJobRecord {
         job_key: format!("key-{id}"),

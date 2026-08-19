@@ -18,13 +18,17 @@ use curvine_model::{
     TransferState, TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
     TransferTenantSummary,
 };
-use native_tls::TlsConnector;
+use native_tls::{Certificate, TlsConnector};
+use percent_encoding::percent_decode_str;
 use postgres::{error::SqlState, GenericClient, Row, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use std::error::Error as _;
+use std::fs;
+use std::path::PathBuf;
 use std::str::FromStr;
+use url::Url;
 
 use crate::transfer::{
     apply_task_report_progress, TransferPlannedTasks, TransferRequeueUpdate, TransferStore,
@@ -43,10 +47,8 @@ pub struct PostgresTransferStore {
 
 impl PostgresTransferStore {
     pub fn open(url: &str) -> FsResult<Self> {
-        let config = postgres::Config::from_str(url)
-            .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
-        let tls = TlsConnector::new()
-            .map_err(|_| FsError::common("Unable to initialize PostgreSQL TLS support"))?;
+        let (config, root_cert_path) = postgres_config(url)?;
+        let tls = postgres_tls_connector(root_cert_path)?;
         let manager = PostgresConnectionManager::new(config, MakeTlsConnector::new(tls));
         let pool = Pool::builder().build(manager).map_err(postgres_pool_err)?;
         let mut conn = pool.get().map_err(postgres_pool_err)?;
@@ -65,6 +67,86 @@ impl PostgresTransferStore {
         tx.commit().map_err(postgres_err)?;
         Ok(result)
     }
+}
+
+fn postgres_config(url: &str) -> FsResult<(postgres::Config, Option<PathBuf>)> {
+    let parsed_url =
+        Url::parse(url).map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+    if parsed_url.fragment().is_some() {
+        return Err(FsError::common(
+            "PostgreSQL transfer store URL must not contain a fragment",
+        ));
+    }
+    let Some(query) = parsed_url.query() else {
+        let config = postgres::Config::from_str(url)
+            .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+        return Ok((config, None));
+    };
+    let mut root_cert_path = None;
+    let mut query_pairs = Vec::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode_str(key)
+            .decode_utf8()
+            .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+        if key == "sslrootcert" {
+            let value = percent_decode_str(value)
+                .decode_utf8()
+                .map_err(|_| FsError::common("Invalid PostgreSQL sslrootcert path"))?;
+            if root_cert_path.replace(value.into_owned()).is_some() {
+                return Err(FsError::common(
+                    "PostgreSQL transfer store URL contains multiple sslrootcert values",
+                ));
+            }
+        } else {
+            query_pairs.push(pair);
+        }
+    }
+    let Some(root_cert_path) = root_cert_path else {
+        let config = postgres::Config::from_str(url)
+            .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+        return Ok((config, None));
+    };
+    if root_cert_path.is_empty() {
+        return Err(FsError::common(
+            "PostgreSQL sslrootcert must name a PEM certificate file",
+        ));
+    }
+    // tokio-postgres percent-decodes query values but treats `+` literally.
+    // Preserve unrelated parameters instead of form-encoding them through Url.
+    let (base_url, _) = url
+        .split_once('?')
+        .expect("a parsed PostgreSQL URL with a query contains '?'");
+    let store_url = if query_pairs.is_empty() {
+        base_url.to_string()
+    } else {
+        format!("{}?{}", base_url, query_pairs.join("&"))
+    };
+    let config = postgres::Config::from_str(&store_url)
+        .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+    Ok((config, Some(PathBuf::from(root_cert_path))))
+}
+
+fn postgres_tls_connector(root_cert_path: Option<PathBuf>) -> FsResult<TlsConnector> {
+    let mut builder = TlsConnector::builder();
+    if let Some(path) = root_cert_path {
+        let pem = fs::read(&path).map_err(|_| {
+            FsError::common(format!(
+                "Unable to read PostgreSQL root certificate at '{}'",
+                path.display()
+            ))
+        })?;
+        let certificate = Certificate::from_pem(&pem).map_err(|_| {
+            FsError::common(format!(
+                "PostgreSQL root certificate at '{}' is not valid PEM",
+                path.display()
+            ))
+        })?;
+        builder.add_root_certificate(certificate);
+    }
+    builder
+        .build()
+        .map_err(|_| FsError::common("Unable to initialize PostgreSQL TLS support"))
 }
 
 fn init_schema(conn: &mut PgConnection) -> FsResult<()> {

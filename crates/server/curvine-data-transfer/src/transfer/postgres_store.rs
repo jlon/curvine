@@ -19,10 +19,11 @@ use curvine_model::{
     TransferTenantSummary,
 };
 use native_tls::TlsConnector;
-use postgres::{GenericClient, Row, Transaction};
+use postgres::{error::SqlState, GenericClient, Row, Transaction};
 use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use std::error::Error as _;
 use std::str::FromStr;
 
 use crate::transfer::{
@@ -634,9 +635,39 @@ fn json_err(_: serde_json::Error) -> FsError {
 
 fn postgres_err(err: postgres::Error) -> FsError {
     log::warn!("transfer PostgreSQL store operation failed: {}", err);
-    FsError::transfer_store_unavailable(
-        "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity",
-    )
+    if postgres_error_is_unavailable(&err) {
+        FsError::transfer_store_unavailable(
+            "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity",
+        )
+    } else {
+        let message = err.as_db_error().map_or_else(
+            || err.to_string(),
+            |db_error| db_error.message().to_string(),
+        );
+        FsError::common(format!(
+            "PostgreSQL transfer store operation failed: {message}"
+        ))
+    }
+}
+
+fn postgres_error_is_unavailable(err: &postgres::Error) -> bool {
+    err.is_closed()
+        || err.code().is_some_and(is_postgres_connectivity_error)
+        || err
+            .source()
+            .is_some_and(|source| source.is::<std::io::Error>() || source.is::<native_tls::Error>())
+}
+
+fn is_postgres_connectivity_error(code: &SqlState) -> bool {
+    code == &SqlState::CONNECTION_EXCEPTION
+        || code == &SqlState::CONNECTION_DOES_NOT_EXIST
+        || code == &SqlState::CONNECTION_FAILURE
+        || code == &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
+        || code == &SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION
+        || code == &SqlState::TOO_MANY_CONNECTIONS
+        || code == &SqlState::ADMIN_SHUTDOWN
+        || code == &SqlState::CRASH_SHUTDOWN
+        || code == &SqlState::CANNOT_CONNECT_NOW
 }
 
 fn postgres_pool_err(err: r2d2::Error) -> FsError {

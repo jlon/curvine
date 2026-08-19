@@ -17,7 +17,10 @@ use curvine_model::{
     TaskAttemptStart, TransferJobRecord, TransferKind, TransferProgress, TransferState,
     TransferTaskRecord, TransferTaskReport, TransferTaskState,
 };
-use postgres::{Client, NoTls};
+use native_tls::TlsConnector;
+use postgres::{Client, Config};
+use postgres_native_tls::MakeTlsConnector;
+use std::str::FromStr;
 use std::sync::Arc;
 
 struct TestSchema {
@@ -27,10 +30,16 @@ struct TestSchema {
 
 impl Drop for TestSchema {
     fn drop(&mut self) {
-        if let Ok(mut client) = Client::connect(&self.url, NoTls) {
+        if let Ok(mut client) = admin_client(&self.url) {
             let _ = client.batch_execute(&format!("drop schema if exists {} cascade", self.name));
         }
     }
+}
+
+fn admin_client(url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+    let config = Config::from_str(url)?;
+    let tls = TlsConnector::new()?;
+    Ok(config.connect(MakeTlsConnector::new(tls))?)
 }
 
 fn test_store_url() -> Option<(String, TestSchema)> {
@@ -40,7 +49,7 @@ fn test_store_url() -> Option<(String, TestSchema)> {
         std::process::id(),
         curvine_runtime::common::LocalTime::mills()
     );
-    let mut client = Client::connect(&url, NoTls).unwrap();
+    let mut client = admin_client(&url).unwrap();
     client
         .batch_execute(&format!("create schema {name}"))
         .unwrap();

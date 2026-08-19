@@ -251,7 +251,7 @@ impl TransferMetrics {
             )
             .map_err(|err| FsError::common(err.to_string()))?,
         };
-        for backend in ["memory", "sqlite", "mysql"] {
+        for backend in ["memory", "sqlite", "mysql", "postgres"] {
             metrics
                 .store_unavailable
                 .with_label_values(&[backend])

@@ -107,11 +107,6 @@ fn postgres_config(url: &str) -> FsResult<(postgres::Config, Option<PathBuf>)> {
             .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
         return Ok((config, None));
     };
-    if root_cert_path.is_empty() {
-        return Err(FsError::common(
-            "PostgreSQL sslrootcert must name a PEM certificate file",
-        ));
-    }
     // tokio-postgres percent-decodes query values but treats `+` literally.
     // Preserve unrelated parameters instead of form-encoding them through Url.
     let (base_url, _) = url
@@ -124,6 +119,15 @@ fn postgres_config(url: &str) -> FsResult<(postgres::Config, Option<PathBuf>)> {
     };
     let config = postgres::Config::from_str(&store_url)
         .map_err(|_| FsError::common("Invalid PostgreSQL transfer store URL"))?;
+    if config.get_ssl_mode() == postgres::config::SslMode::Disable {
+        // No TLS handshake occurs, so a root CA is irrelevant on this path.
+        return Ok((config, None));
+    }
+    if root_cert_path.is_empty() {
+        return Err(FsError::common(
+            "PostgreSQL sslrootcert must name a PEM certificate file",
+        ));
+    }
     Ok((config, Some(PathBuf::from(root_cert_path))))
 }
 
@@ -717,6 +721,14 @@ fn json_err(_: serde_json::Error) -> FsError {
 
 fn postgres_err(err: postgres::Error) -> FsError {
     log::warn!("transfer PostgreSQL store operation failed: {}", err);
+    if let Some(tls_error) = err
+        .source()
+        .and_then(|source| source.downcast_ref::<native_tls::Error>())
+    {
+        return FsError::transfer_store_unavailable(format!(
+            "PostgreSQL TLS handshake failed: {tls_error}; verify the server certificate, hostname, and transfer.store_url sslrootcert"
+        ));
+    }
     if postgres_error_is_unavailable(&err) {
         FsError::transfer_store_unavailable(
             "Transfer metadata store is unavailable; verify transfer.store_url and PostgreSQL connectivity",
@@ -737,7 +749,7 @@ fn postgres_error_is_unavailable(err: &postgres::Error) -> bool {
         || err.code().is_some_and(is_postgres_connectivity_error)
         || err
             .source()
-            .is_some_and(|source| source.is::<std::io::Error>() || source.is::<native_tls::Error>())
+            .is_some_and(|source| source.is::<std::io::Error>())
 }
 
 fn is_postgres_connectivity_error(code: &SqlState) -> bool {

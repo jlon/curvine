@@ -73,6 +73,31 @@ fn postgres_store_rejects_an_unreadable_root_certificate() {
 }
 
 #[test]
+fn postgres_store_ignores_root_certificate_when_tls_is_disabled() {
+    let Some(url) = std::env::var("CURVINE_TRANSFER_POSTGRES_URL").ok() else {
+        eprintln!(
+            "CURVINE_TRANSFER_POSTGRES_URL is not set; skipping PostgreSQL sslmode=disable test"
+        );
+        return;
+    };
+    let config = Config::from_str(&url).unwrap();
+    if config.get_ssl_mode() != postgres::config::SslMode::Disable {
+        eprintln!("PostgreSQL URL does not use sslmode=disable; skipping test");
+        return;
+    }
+    if url.contains("sslrootcert=") {
+        eprintln!("PostgreSQL URL already contains sslrootcert; skipping test");
+        return;
+    }
+    let url = format!("{url}&sslrootcert=/curvine-missing-root-ca.pem");
+
+    PostgresTransferStore::open(&url)
+        .unwrap()
+        .check_available()
+        .unwrap();
+}
+
+#[test]
 fn postgres_store_connects_with_a_private_ca() {
     let Some(url) = std::env::var("CURVINE_TRANSFER_POSTGRES_TLS_URL").ok() else {
         eprintln!("CURVINE_TRANSFER_POSTGRES_TLS_URL is not set; skipping PostgreSQL TLS test");

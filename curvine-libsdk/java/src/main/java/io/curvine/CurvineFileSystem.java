@@ -118,13 +118,13 @@ public class CurvineFileSystem extends FileSystem {
         return filesystemConf;
     }
 
-    private String getMasterAddrs(String name) throws IOException {
+    String getMasterAddrs(String name) throws IOException {
         String key = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, name);
         String addrs = getConf().get(key);
         if (StringUtils.isEmpty(addrs)) {
             throw new IOException(key + " not set");
         } else {
-            return addrs;
+            return FilesystemConf.normalizeCsv(addrs);
         }
     }
     @Override

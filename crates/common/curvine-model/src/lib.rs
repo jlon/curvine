@@ -68,10 +68,10 @@ pub use self::block_info::*;
 mod file_status;
 pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 
-mod master_info;
 mod filesystem_info;
-pub use self::master_info::MasterInfo;
+mod master_info;
 pub use self::filesystem_info::FilesystemInfo;
+pub use self::master_info::MasterInfo;
 
 mod worker_command;
 pub use self::worker_command::*;

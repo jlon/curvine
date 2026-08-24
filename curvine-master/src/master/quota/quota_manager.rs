@@ -44,8 +44,10 @@ impl QuotaManager {
         rt: Arc<Runtime>,
         testing: bool,
     ) -> Arc<Self> {
-        let (tx, mut rx): (Sender<Option<FilesystemInfo>>, Receiver<Option<FilesystemInfo>>) =
-            mpsc::channel(1024);
+        let (tx, mut rx): (
+            Sender<Option<FilesystemInfo>>,
+            Receiver<Option<FilesystemInfo>>,
+        ) = mpsc::channel(1024);
 
         let manager = Arc::new(QuotaManager {
             evictor,

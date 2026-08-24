@@ -24,7 +24,6 @@ use crate::master::meta::inode::{
 use crate::master::meta::{FsDir, SameParentRename};
 
 use crate::master::fs::DeleteResult as FsDeleteResult;
-use curvine_model::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::meta::store::{
     RocksInodeStore, RocksInodeStoreSnapshot, RocksStoreHandle, RocksStoreReadGuard,
@@ -41,6 +40,7 @@ use curvine_config::{ClusterConf, MasterConf};
 use curvine_core_error::{err_box, err_ext, try_option, CommonError, CommonResult};
 use curvine_error::FsError;
 use curvine_error::FsResult;
+use curvine_model::DeleteResult;
 use curvine_model::*;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::runtime::GroupExecutor;
@@ -528,7 +528,9 @@ impl MasterFilesystem {
                 let inp = Self::resolve_path(&fs_dir, path)?;
                 fs_dir.delete(&inp, true)?
             };
-            self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
+            self.worker_manager
+                .write()
+                .remove_blocks(&Self::to_model_delete_result(&delete_result));
             return Ok(Self::to_model_delete_result(delete_result));
         }
 
@@ -541,7 +543,9 @@ impl MasterFilesystem {
         let _block_locks = self.block_location_locks.write_blocks(&block_ids);
         let delete_result = fs_dir.delete(&inp, false)?;
         drop(fs_dir);
-        self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
+        self.worker_manager
+            .write()
+            .remove_blocks(&Self::to_model_delete_result(&delete_result));
 
         Ok(Self::to_model_delete_result(delete_result))
     }
@@ -563,7 +567,9 @@ impl MasterFilesystem {
             let _block_locks = self.block_location_locks.write_blocks(&block_ids);
             let delete_result = fs_dir.delete_uncontended(&inp, false)?;
             drop(fs_dir);
-            self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
+            self.worker_manager
+                .write()
+                .remove_blocks(&Self::to_model_delete_result(&delete_result));
             Ok(Some(Self::to_model_delete_result(delete_result)))
         })
     }
@@ -991,8 +997,8 @@ impl MasterFilesystem {
                     let clean_result = self.truncate(&fs_dir, &inp, opts.clone())?;
                     if !clean_result.blocks.is_empty() {
                         self.worker_manager
-                        .write()
-                        .remove_blocks(&Self::to_model_delete_result(&clean_result));
+                            .write()
+                            .remove_blocks(&Self::to_model_delete_result(&clean_result));
                     }
                     let status = fs_dir.file_status(&inp)?;
                     (
@@ -4209,9 +4215,7 @@ impl MasterFilesystem {
         if !invalidated.delete_result.blocks.is_empty() {
             self.worker_manager
                 .write()
-                .remove_blocks(&Self::to_model_delete_result(
-                            &invalidated.delete_result,
-                        ));
+                .remove_blocks(&Self::to_model_delete_result(&invalidated.delete_result));
         }
 
         Ok(LostWorkerLocationCleanup {

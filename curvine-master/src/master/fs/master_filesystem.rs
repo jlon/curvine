@@ -978,7 +978,7 @@ impl MasterFilesystem {
                 Vec::new()
             };
             let _block_locks = self.block_location_locks.write_blocks(&truncate_block_ids);
-            let (blocks, clean_result): (Option<FileBlocks>, Option<DeleteResult>) = {
+            let (blocks, _clean_result): (Option<FileBlocks>, Option<DeleteResult>) = {
                 let fs_dir = self.fs_dir.read();
                 let inp = Self::resolve_path(&fs_dir, path)?;
 
@@ -4454,6 +4454,28 @@ impl MasterFilesystem {
     }
 }
 
+/// Bridge between the namespace-internal delete summary and the wire-level
+/// model type, accepting both owned and borrowed values.
+trait AsModelDelete {
+    fn as_model_delete(&self) -> DeleteResult;
+}
+
+impl AsModelDelete for FsDeleteResult {
+    fn as_model_delete(&self) -> DeleteResult {
+        DeleteResult {
+            inodes: self.inodes,
+            bytes: 0,
+            blocks: self.blocks.clone(),
+        }
+    }
+}
+
+impl AsModelDelete for &FsDeleteResult {
+    fn as_model_delete(&self) -> DeleteResult {
+        (*self).as_model_delete()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4475,27 +4497,5 @@ mod tests {
     fn truncate_growth_does_not_require_physical_capacity() {
         let opts = FileAllocOpts::with_truncate(200);
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
-    }
-}
-
-/// Bridge between the namespace-internal delete summary and the wire-level
-/// model type, accepting both owned and borrowed values.
-trait AsModelDelete {
-    fn as_model_delete(&self) -> DeleteResult;
-}
-
-impl AsModelDelete for FsDeleteResult {
-    fn as_model_delete(&self) -> DeleteResult {
-        DeleteResult {
-            inodes: self.inodes,
-            bytes: 0,
-            blocks: self.blocks.clone(),
-        }
-    }
-}
-
-impl AsModelDelete for &FsDeleteResult {
-    fn as_model_delete(&self) -> DeleteResult {
-        (*self).as_model_delete()
     }
 }

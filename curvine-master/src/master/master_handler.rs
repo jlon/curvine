@@ -26,29 +26,16 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CompatibilityMode,
-    CompatibilityPolicy,
-    CompatibilityVerdict,
-    CreateFileOpts,
-    DeleteBlockCmd,
-    DeleteResult, FileBlocks,
-    FileLock,
-    FileStatus,
-    FilesystemInfo,
-    FreeResult,
-    HeartbeatStatus,
-    ListOptions,
-    OpenFlags,
-    RenameFlags,
-    WorkerCommand,
-    WorkerInfo,
+    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
+    DeleteResult, FileBlocks, FileLock, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus,
+    ListOptions, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
-use dashmap::DashMap;
 use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use dashmap::DashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -825,7 +812,6 @@ impl MasterHandler {
             CompatibilityVerdict::VersionUnknown { .. } => "version_unknown",
         }
     }
-
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;

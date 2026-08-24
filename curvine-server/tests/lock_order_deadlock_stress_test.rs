@@ -1097,12 +1097,11 @@ fn concurrent_sharded_directory_edge_mutations_replay_from_journal() {
         handles.push(thread::spawn(move || {
             start.wait();
             for index in 0..OPERATIONS_PER_WRITER {
-                assert!(fs
-                    .delete(
-                        format!("/edges/hot/delete-{writer_id:02}-{index:02}"),
-                        false,
-                    )
-                    .unwrap());
+                fs.delete(
+                    format!("/edges/hot/delete-{writer_id:02}-{index:02}"),
+                    false,
+                )
+                .unwrap();
             }
         }));
     }

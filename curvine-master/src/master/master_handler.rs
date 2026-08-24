@@ -34,8 +34,9 @@ use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
-use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use dashmap::DashMap;
+use tokio::sync::Semaphore;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -48,21 +49,23 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
-    pub(crate) control_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) control_rpc_rt: Arc<Runtime>,
+    pub(crate) control_rpc_admission: Arc<Semaphore>,
+    pub(crate) client_request_admission: Arc<Semaphore>,
+    pub(crate) client_blocking_admission: Option<Arc<Semaphore>>,
+    pub(crate) control_request_admission: Arc<Semaphore>,
+    pub(crate) metadata_read_rt: Arc<Runtime>,
+    pub(crate) metadata_read_admission: Arc<Semaphore>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
     // Master's own version + compatibility contract, built once at startup.
-    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
-    // this instead of recomputing component_version() on every call.
     master_compatibility: ServerCompatibilityInfoProto,
     // Compatibility policy derived from the master configuration. Used to
-    // evaluate worker heartbeats and client handshakes with diagnose/enforce
-    // semantics (lenient diagnose by default).
+    // evaluate worker heartbeats and client GetFilesystemInfo requests.
     compatibility_policy: CompatibilityPolicy,
     // Last compatibility verdict warned about per peer (worker id / client
-    // address). Diagnose-mode warnings are deduped so a persistently
-    // incompatible or legacy peer does not spam identical warnings on every
-    // heartbeat or statfs call.
+    // address), so diagnose-mode warnings are not repeated for identical
+    // verdicts.
     compat_warned: DashMap<String, CompatibilityVerdict>,
 }
 
@@ -482,18 +485,26 @@ impl MasterHandler {
         fs.get_block_locations(path)
     }
 
-    async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
+    async fn run_master_rpc_task<T, F>(
+        rt: Arc<Runtime>,
+        admission: Arc<Semaphore>,
+        task: F,
+    ) -> FsResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> FsResult<T> + Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        executor.try_spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(task))
-                .unwrap_or_else(|_| err_box!("master control RPC task panicked"));
-            let _ = tx.send(result);
-        })?;
-        rx.await?
+        let permit = admission
+            .acquire_owned()
+            .await
+            .map_err(|_| FsError::common("master RPC executor has stopped"))?;
+        rt.spawn_blocking(move || {
+            let _permit = permit;
+            panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| err_box!("master RPC task panicked"))
+        })
+        .await
+        .map_err(|error| FsError::common(format!("master RPC executor stopped: {error}")))?
     }
 
     async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -518,7 +529,10 @@ impl MasterHandler {
             )?;
         }
         let fs = self.fs.clone();
-        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+        let info = Self::run_master_rpc_task(
+            self.control_rpc_rt.clone(),
+            self.control_rpc_admission.clone(),
+            move || {
             Self::process_get_filesystem_info(fs)
         })
         .await?;
@@ -547,7 +561,10 @@ impl MasterHandler {
         let req: GetCvMetadataSnapshotPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-snapshot".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+        let response = Self::run_master_rpc_task(
+            self.control_rpc_rt.clone(),
+            self.control_rpc_admission.clone(),
+            move || {
             let page = fs.cv_metadata_snapshot_page(
                 req.page_token,
                 req.page_size.unwrap_or(10_000) as usize,
@@ -576,7 +593,10 @@ impl MasterHandler {
         let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+        let response = Self::run_master_rpc_task(
+            self.control_rpc_rt.clone(),
+            self.control_rpc_admission.clone(),
+            move || {
             let page = fs.cv_metadata_delta_page(
                 req.from_epoch,
                 req.target_epoch,

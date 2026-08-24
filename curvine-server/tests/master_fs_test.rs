@@ -1028,7 +1028,7 @@ fn metadata_replica_reader_tracks_namespace_updates_and_restore() -> CommonResul
     assert!(fs.exists("/target/file")?);
     assert_eq!(fs.file_status("/target/file")?.id, created.id);
 
-    assert!(fs.delete("/target/file", false)?);
+    fs.delete("/target/file", false)?;
     assert!(!fs.exists("/target/file")?);
     assert!(fs.list_status("/target")?.is_empty());
     Ok(())
@@ -1059,7 +1059,7 @@ fn metadata_status_cache_tracks_file_mutations_and_hard_links() -> CommonResult<
     assert_eq!(alias.nlink, 2);
     assert_eq!(alias.name, "alias");
 
-    assert!(fs.delete("/links/alias", false)?);
+    fs.delete("/links/alias", false)?;
     assert_eq!(fs.file_status("/source/file")?.nlink, 1);
 
     fs.mkdir("/target", false)?;
@@ -1088,7 +1088,7 @@ fn metadata_status_cache_tracks_file_mutations_and_hard_links() -> CommonResult<
     fs.mkdir("/cached-tree", false)?;
     fs.link("/cached-source", "/cached-tree/alias")?;
     assert_eq!(fs.file_status("/cached-source")?.nlink, 2);
-    assert!(fs.delete("/cached-tree", true)?);
+    fs.delete("/cached-tree", true)?;
     assert_eq!(fs.file_status("/cached-source")?.nlink, 1);
 
     fs.restore_from_rocksdb()?;
@@ -1166,7 +1166,7 @@ fn metadata_replica_reader_preserves_large_directory_order_after_updates() -> Co
         ["file-0000", "file-0001", "file-0002"]
     );
 
-    assert!(fs.delete("/directory/file-1024", false)?);
+    fs.delete("/directory/file-1024", false)?;
     let page_after_delete = fs.list_options(
         "/directory",
         ListOptions {
@@ -1212,7 +1212,7 @@ fn metadata_replica_reader_invalidates_cached_deleted_directory() -> CommonResul
 
     fs.create("/cached/directory/file", true)?;
     let first = fs.file_status("/cached/directory/file")?;
-    assert!(fs.delete("/cached/directory", true)?);
+    fs.delete("/cached/directory", true)?;
     assert!(!fs.exists("/cached/directory/file")?);
 
     let recreated = fs.create("/cached/directory/file", true)?;
@@ -2192,10 +2192,10 @@ fn delete_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     };
 
     let f1 = handler.delete0(id, req.clone())?;
-    assert!(f1);
+    assert_eq!(f1.inodes, 1);
 
     let f2 = handler.delete0(id, req.clone())?;
-    assert!(f2);
+    assert_eq!(f2.inodes, 0);
 
     Ok(())
 }

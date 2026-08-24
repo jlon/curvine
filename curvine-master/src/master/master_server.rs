@@ -23,9 +23,10 @@ use curvine_net::net::ConnState;
 use curvine_rpc::handler::{HandlerService, LimitConf};
 use curvine_rpc::server::{RpcServer, ServerStateListener};
 use curvine_runtime::common::{LocalTime, Logger};
-use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime, Runtime};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::{error, info};
+use tokio::sync::Semaphore;
 
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
@@ -46,7 +47,13 @@ pub struct MasterService {
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     actor_rt: Arc<Runtime>,
-    control_rpc_executor: Arc<GroupExecutor>,
+    control_rpc_rt: Arc<Runtime>,
+    control_rpc_admission: Arc<Semaphore>,
+    client_request_admission: Arc<Semaphore>,
+    client_blocking_admission: Option<Arc<Semaphore>>,
+    control_request_admission: Arc<Semaphore>,
+    metadata_read_rt: Arc<Runtime>,
+    metadata_read_admission: Arc<Semaphore>,
     replication_manager: Arc<MasterReplicationManager>,
     limit: LimitConf,
     metrics: &'static MasterMetrics,
@@ -71,7 +78,23 @@ impl MasterService {
             1,
             conf.master.actor_threads,
         ));
-        let control_rpc_executor = Arc::new(GroupExecutor::new("master-control-rpc", 2, 1024));
+        const CONTROL_RPC_THREADS: usize = 2;
+        let control_rpc_rt = Arc::new(AsyncRuntime::new(
+            "master-control-rpc",
+            1,
+            CONTROL_RPC_THREADS,
+        ));
+        let control_rpc_admission = Arc::new(Semaphore::new(CONTROL_RPC_THREADS));
+        let client_request_admission = Arc::new(Semaphore::new(conf.master.global_limit));
+        let client_blocking_admission = (conf.master.worker_threads > 0)
+            .then(|| Arc::new(Semaphore::new(conf.master.worker_threads)));
+        let control_request_admission = Arc::new(Semaphore::new(conf.master.actor_threads));
+        let metadata_read_rt = Arc::new(AsyncRuntime::new(
+            "master-metadata-read",
+            1,
+            conf.master.executor_threads,
+        ));
+        let metadata_read_admission = Arc::new(Semaphore::new(conf.master.executor_threads));
         let limit = LimitConf::new(conf.master.conn_limit, conf.master.global_limit);
         Self {
             conf,
@@ -81,7 +104,13 @@ impl MasterService {
             job_manager,
             rt,
             actor_rt,
-            control_rpc_executor,
+            control_rpc_rt,
+            control_rpc_admission,
+            client_request_admission,
+            client_blocking_admission,
+            control_request_admission,
+            metadata_read_rt,
+            metadata_read_admission,
             replication_manager,
             limit,
             metrics,
@@ -121,7 +150,13 @@ impl HandlerService for MasterService {
             client_state,
             self.mount_manager.clone(),
             JobHandler::new(self.job_manager.clone()),
-            self.control_rpc_executor.clone(),
+            self.control_rpc_rt.clone(),
+            self.control_rpc_admission.clone(),
+            self.client_request_admission.clone(),
+            self.client_blocking_admission.clone(),
+            self.control_request_admission.clone(),
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
             self.replication_manager.clone(),
             self.actor_rt.clone(),
             self.metrics,
@@ -241,7 +276,10 @@ impl Master {
         let mut listener = journal_system.start().await?;
         listener.wait_role().await?;
 
-        // step 2: Start rpc server
+        // step 2: Restore mount table before serving RPCs.
+        self.mount_manager.restore()?;
+
+        // step 3: Start rpc server
         let rpc_server = match self.rpc_server.take() {
             Some(rpc_server) => rpc_server,
             None => return err_box!("master rpc server is not initialized"),
@@ -249,7 +287,7 @@ impl Master {
         let mut rpc_status = rpc_server.start();
         rpc_status.wait_running().await?;
 
-        // step3: Start the web server
+        // step4: Start the web server
         let web_server = match self.web_server.take() {
             Some(web_server) => web_server,
             None => return err_box!("master web server is not initialized"),
@@ -259,16 +297,13 @@ impl Master {
         let mut web_status = web_server.start();
         WebServer::<MasterService>::wait_bind(&mut web_status, &web_name, &bind_addr).await?;
 
-        // step4: Start master actor
+        // step5: Start master actor
         self.actor.start()?;
 
-        // reload mount info
-        self.mount_manager.restore_best_effort();
-
-        // step5: Start job manager
+        // step6: Start job manager
         self.job_manager.start()?;
 
-        // step6: Start TTL scheduler (requires mount_manager and job_manager)
+        // step7: Start TTL scheduler (requires mount_manager and job_manager)
         if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
         }

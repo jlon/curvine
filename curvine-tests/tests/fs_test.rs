@@ -139,8 +139,8 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         list_files(&fs).await?;
         println!("list_files done");
 
-        get_master_info(&fs).await?;
-        println!("get_master_info done");
+        get_filesystem_info(&fs).await?;
+        println!("get_filesystem_info done");
 
         add_block(&fs).await?;
         println!("add_block done");
@@ -556,8 +556,8 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
     Ok(())
 }
 
-async fn get_master_info(fs: &CurvineFileSystem) -> CommonResult<()> {
-    let res = fs.get_master_info().await?;
+async fn get_filesystem_info(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let res = fs.get_filesystem_info().await?;
     info!("master info {:#?}", res);
     Ok(())
 }
@@ -653,7 +653,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     info!("=== Testing FS Used - Creating files with data ===");
 
     // Get initial state
-    let initial_master_info = fs.get_master_info().await?;
+    let initial_master_info = fs.get_filesystem_info().await?;
     info!(
         "Initial FS Used: {} bytes ({:.2} MB)",
         initial_master_info.fs_used,
@@ -678,7 +678,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
         );
 
         // Check status after creating each file
-        let current_info = fs.get_master_info().await?;
+        let current_info = fs.get_filesystem_info().await?;
         info!("After file {}: FS Used = {} bytes", i, current_info.fs_used);
     }
 
@@ -686,7 +686,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Get master info to check fs_used
-    let after_small_files_info = fs.get_master_info().await?;
+    let after_small_files_info = fs.get_filesystem_info().await?;
     info!(
         "After creating small files - FS Used: {} bytes ({:.2} MB)",
         after_small_files_info.fs_used,
@@ -714,7 +714,7 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     // Get master info again
-    let final_master_info = fs.get_master_info().await?;
+    let final_master_info = fs.get_filesystem_info().await?;
     info!(
         "Final FS Used: {} bytes ({:.2} MB)",
         final_master_info.fs_used,

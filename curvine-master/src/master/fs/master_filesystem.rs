@@ -23,7 +23,8 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::{FsDir, SameParentRename};
 
-use crate::master::fs::DeleteResult;
+use crate::master::fs::DeleteResult as FsDeleteResult;
+use curvine_model::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::meta::store::{
     RocksInodeStore, RocksInodeStoreSnapshot, RocksStoreHandle, RocksStoreReadGuard,
@@ -507,7 +508,7 @@ impl MasterFilesystem {
         self.mkdir_with_opts(path, opts)
     }
 
-    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
+    pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<DeleteResult> {
         let path = path.as_ref();
         if !recursive {
             if let Some(result) = self.try_fast_delete(path)? {
@@ -517,7 +518,7 @@ impl MasterFilesystem {
         self.run_namespace_topology_write(|| self.delete_with_locks(path, recursive))
     }
 
-    fn delete_with_locks(&self, path: &str, recursive: bool) -> FsResult<bool> {
+    fn delete_with_locks(&self, path: &str, recursive: bool) -> FsResult<DeleteResult> {
         let _journal_scope = self.reserve_journal_scope(1)?;
         if recursive {
             let (_inode_locks, block_ids) = self.lock_delete_path(path, true)?;
@@ -527,8 +528,8 @@ impl MasterFilesystem {
                 let inp = Self::resolve_path(&fs_dir, path)?;
                 fs_dir.delete(&inp, true)?
             };
-            self.worker_manager.write().remove_blocks(&delete_result);
-            return Ok(true);
+            self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
+            return Ok(Self::to_model_delete_result(delete_result));
         }
 
         let LockedPath {
@@ -540,12 +541,18 @@ impl MasterFilesystem {
         let _block_locks = self.block_location_locks.write_blocks(&block_ids);
         let delete_result = fs_dir.delete(&inp, false)?;
         drop(fs_dir);
-        self.worker_manager.write().remove_blocks(&delete_result);
+        self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
 
-        Ok(true)
+        Ok(Self::to_model_delete_result(delete_result))
     }
 
-    fn try_fast_delete(&self, path: &str) -> FsResult<Option<bool>> {
+    /// Convert the namespace-internal delete summary into the wire-level
+    /// model type (block locations keyed by worker id).
+    fn to_model_delete_result(res: impl AsModelDelete) -> DeleteResult {
+        res.as_model_delete()
+    }
+
+    fn try_fast_delete(&self, path: &str) -> FsResult<Option<DeleteResult>> {
         self.try_fast_namespace_write(|| {
             let Ok(fs_dir) = self.fs_dir.try_write() else {
                 return Ok(None);
@@ -556,8 +563,8 @@ impl MasterFilesystem {
             let _block_locks = self.block_location_locks.write_blocks(&block_ids);
             let delete_result = fs_dir.delete_uncontended(&inp, false)?;
             drop(fs_dir);
-            self.worker_manager.write().remove_blocks(&delete_result);
-            Ok(Some(true))
+            self.worker_manager.write().remove_blocks(&Self::to_model_delete_result(&delete_result));
+            Ok(Some(Self::to_model_delete_result(delete_result)))
         })
     }
 
@@ -576,8 +583,8 @@ impl MasterFilesystem {
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&DeleteResult {
                 inodes: 0,
+                bytes: 0,
                 blocks: std::mem::take(&mut free_res.blocks),
-                file_ids: vec![],
             });
 
             Ok(free_res)
@@ -737,7 +744,7 @@ impl MasterFilesystem {
         fs_dir: &FsDir,
         inp: &InodePath,
         opts: CreateFileOpts,
-    ) -> FsResult<DeleteResult> {
+    ) -> FsResult<FsDeleteResult> {
         fs_dir.overwrite_file(inp, opts)
     }
 
@@ -980,8 +987,14 @@ impl MasterFilesystem {
 
                 if flags.truncate() {
                     let clean_result = self.truncate(&fs_dir, &inp, opts.clone())?;
+                    if !clean_result.blocks.is_empty() {
+                        self.worker_manager.write().remove_blocks(&clean_result);
+                    }
                     let status = fs_dir.file_status(&inp)?;
-                    (Some(FileBlocks::new(status, vec![])), Some(clean_result))
+                    (
+                        Some(FileBlocks::new(status, vec![])),
+                        Some(Self::to_model_delete_result(clean_result)),
+                    )
                 } else {
                     let status = fs_dir.reopen_file(&inp, opts.client_name.clone())?;
                     let file = inode.as_file_ref()?;
@@ -995,12 +1008,6 @@ impl MasterFilesystem {
                     (Some(FileBlocks::new(status, blocks)), None)
                 }
             };
-
-            if let Some(clean_result) = clean_result {
-                if !clean_result.blocks.is_empty() {
-                    self.worker_manager.write().remove_blocks(&clean_result);
-                }
-            }
 
             Ok(blocks)
         })?;

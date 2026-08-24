@@ -22,7 +22,7 @@ use crate::master::quota::eviction::types::EvictPlan;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::quota::eviction::EvictionMode;
 use crate::master::Master;
-use curvine_model::MasterInfo;
+use curvine_model::FilesystemInfo;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -33,7 +33,7 @@ pub struct QuotaManager {
     fs: MasterFilesystem,
     evictor: Arc<dyn Evictor>,
     ttl_executor: RwLock<Option<InodeTtlExecutor>>,
-    tx: Sender<Option<MasterInfo>>,
+    tx: Sender<Option<FilesystemInfo>>,
 }
 
 impl QuotaManager {
@@ -44,7 +44,7 @@ impl QuotaManager {
         rt: Arc<Runtime>,
         testing: bool,
     ) -> Arc<Self> {
-        let (tx, mut rx): (Sender<Option<MasterInfo>>, Receiver<Option<MasterInfo>>) =
+        let (tx, mut rx): (Sender<Option<FilesystemInfo>>, Receiver<Option<FilesystemInfo>>) =
             mpsc::channel(1024);
 
         let manager = Arc::new(QuotaManager {
@@ -78,11 +78,11 @@ impl QuotaManager {
         self.eviction_conf.enable_quota_eviction
     }
 
-    pub fn detector(&self, info: Option<MasterInfo>) {
+    pub fn detector(&self, info: Option<FilesystemInfo>) {
         let _ = self.tx.try_send(info);
     }
 
-    fn handle_trigger(&self, cluster_info: Option<MasterInfo>) {
+    fn handle_trigger(&self, cluster_info: Option<FilesystemInfo>) {
         if !self.is_eviction_enabled() {
             return;
         }

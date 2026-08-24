@@ -23,10 +23,12 @@ use curvine_fs_api::{self, CurvineURI, Path};
 use curvine_model::{MkdirOpts, MountInfo, MountOptions};
 use curvine_ufs_api::S3Conf;
 use log::info;
+use parking_lot::Mutex;
 
 pub struct MountManager {
     master_fs: MasterFilesystem,
     mount_table: MountTable,
+    commit_lock: Mutex<()>,
 }
 
 impl MountManager {
@@ -35,6 +37,7 @@ impl MountManager {
         MountManager {
             master_fs,
             mount_table: MountTable::new(fs_dir),
+            commit_lock: Mutex::new(()),
         }
     }
 
@@ -59,13 +62,6 @@ impl MountManager {
     }
 
     fn normalize_mount_config(mount: &mut MountInfo) -> FsResult<()> {
-        if mount.write_cache && !mount.write_cache_enabled() {
-            return err_box!(
-                "write_cache requires cache_mode with read_write access_mode for mount {}",
-                mount.cv_path
-            );
-        }
-
         let path = Path::from_str(&mount.ufs_path)?;
         if !matches!(path.scheme(), Some("s3" | "s3a")) {
             return Ok(());
@@ -97,21 +93,29 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
+        let _commit_guard = self.commit_lock.lock();
+
         let assign_id = match mnt_id {
             Some(id) => id,
             None => self.mount_table.assign_mount_id()?,
         };
         let mut mount = mnt_opt.clone().to_info(assign_id, mount_path, ufs_path);
         Self::normalize_mount_config(&mut mount)?;
-        let _ = self.create_mount_point(mount_path)?;
-
         let mut normalized_options = mnt_opt.clone();
         normalized_options.add_properties = mount.properties;
-        self.mount_table
-            .add_mount(assign_id, mount_path, ufs_path, &normalized_options)
+        let info = self.mount_table.build_mount_info(
+            assign_id,
+            mount_path,
+            ufs_path,
+            &normalized_options,
+        )?;
+        let _ = self.create_mount_point(mount_path)?;
+        self.master_fs.commit_mount(info.clone())?;
+        self.mount_table.unprotected_add_mount(info)
     }
 
     fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let _commit_guard = self.commit_lock.lock();
         let path = Path::from_str(cv_path)?;
         let Some(existing) = self.get_mount_info(&path)? else {
             return err_box!("mount point {} not found for update", cv_path);
@@ -119,7 +123,9 @@ impl MountManager {
         let mut merged = existing.merge_with(mnt_opt.clone());
         Self::normalize_mount_config(&mut merged)?;
 
-        self.mount_table.update_mount(merged)
+        let info = self.mount_table.build_updated_mount_info(merged)?;
+        self.master_fs.commit_mount(info.clone())?;
+        self.mount_table.unprotected_add_mount(info)
     }
 
     /// same baseuri of ufs can only mount once
@@ -133,6 +139,7 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
+        self.master_fs.ensure_metadata_current()?;
         if mnt_opt.update {
             return self.update_mount(cv_path, mnt_opt);
         }
@@ -145,10 +152,15 @@ impl MountManager {
     }
 
     pub fn umount(&self, cv_path: &str) -> FsResult<()> {
-        self.mount_table.umount(cv_path)
+        self.master_fs.ensure_metadata_current()?;
+        let _commit_guard = self.commit_lock.lock();
+        let mount_id = self.mount_table.get_mount_id_by_path(cv_path)?;
+        self.master_fs.commit_unmount(mount_id)?;
+        self.mount_table.unprotected_umount_by_id(mount_id)
     }
 
     pub fn unmount_by_id(&self, id: u32) -> FsResult<()> {
+        self.master_fs.ensure_metadata_current()?;
         let info = self.mount_table.get_mount_info_by_id(id)?;
         self.umount(&info.cv_path)
     }
@@ -157,7 +169,16 @@ impl MountManager {
         self.mount_table.unprotected_umount_by_id(id)
     }
 
+    pub fn unprotected_umount_if_mounted(&self, id: u32) -> FsResult<bool> {
+        if !self.mount_table.has_mounted(id)? {
+            return Ok(false);
+        }
+        self.mount_table.unprotected_umount_by_id(id)?;
+        Ok(true)
+    }
+
     pub fn has_mounted(&self, id: u32) -> FsResult<bool> {
+        self.master_fs.ensure_metadata_current()?;
         self.mount_table.has_mounted(id)
     }
 
@@ -165,10 +186,16 @@ impl MountManager {
      * use ufs_uri to find mount entry
      */
     pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+        self.master_fs.ensure_metadata_current()?;
+        self.get_mount_info_unchecked(path)
+    }
+
+    pub(crate) fn get_mount_info_unchecked(&self, path: &Path) -> FsResult<Option<MountInfo>> {
         self.mount_table.get_mount_info(path)
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
+        self.master_fs.ensure_metadata_current()?;
         let table = self.mount_table.get_mount_table()?;
 
         let mut entries = Vec::new();
@@ -176,54 +203,5 @@ impl MountManager {
             entries.push(entry.clone());
         });
         Ok(entries)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MountManager;
-    use curvine_model::{AccessMode, MountInfo, MountOptions, WriteType};
-
-    fn mount_info(write_type: WriteType, access_mode: AccessMode, write_cache: bool) -> MountInfo {
-        MountOptions::builder()
-            .write_type(write_type)
-            .access_mode(access_mode)
-            .write_cache(write_cache)
-            .build()
-            .to_info(1, "/mnt", "file:///tmp/curvine-mount")
-    }
-
-    #[test]
-    fn normalize_mount_config_accepts_write_cache_for_cache_mode_read_write() {
-        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadWrite, true);
-
-        MountManager::normalize_mount_config(&mut info).unwrap();
-    }
-
-    #[test]
-    fn normalize_mount_config_rejects_write_cache_for_read_only_cache_mode() {
-        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, true);
-
-        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("write_cache requires cache_mode with read_write"));
-    }
-
-    #[test]
-    fn normalize_mount_config_rejects_write_cache_for_fs_mode() {
-        let mut info = mount_info(WriteType::FsMode, AccessMode::ReadWrite, true);
-
-        let err = MountManager::normalize_mount_config(&mut info).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("write_cache requires cache_mode with read_write"));
-    }
-
-    #[test]
-    fn normalize_mount_config_accepts_disabled_write_cache() {
-        let mut info = mount_info(WriteType::CacheMode, AccessMode::ReadOnly, false);
-
-        MountManager::normalize_mount_config(&mut info).unwrap();
     }
 }

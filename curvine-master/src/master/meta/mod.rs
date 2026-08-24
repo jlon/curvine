@@ -18,12 +18,27 @@ pub mod inode;
 mod fs_dir;
 pub(crate) use self::fs_dir::CacheInvalidationResult;
 pub use self::fs_dir::FsDir;
+pub(crate) use self::fs_dir::SameParentRename;
 
 mod fs_stats;
 pub use self::fs_stats::FileSystemStats;
 
 mod inode_id;
 pub use self::inode_id::InodeId;
+
+mod inode_lock_manager;
+pub use self::inode_lock_manager::*;
+
+mod metadata_replica_reader;
+pub(crate) use self::metadata_replica_reader::*;
+
+mod block_location_lock_manager;
+pub use self::block_location_lock_manager::*;
+
+mod namespace_commit_gate;
+pub use self::namespace_commit_gate::*;
+
+mod object_lock_pool;
 
 pub mod store;
 

@@ -20,6 +20,7 @@ use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 // Network channel message processor. It associates network connection and message processing logic.
@@ -29,16 +30,38 @@ pub struct StreamHandler<F, M> {
     handler: Arc<M>,
     close_idle: bool,
     timeout: Duration,
+    request_admission: Option<Arc<Semaphore>>,
 }
 
 impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     pub fn new(rt: Arc<Runtime>, frame: F, handler: M, conf: &ServerConf) -> Self {
+        Self::new_with_optional_admission(rt, frame, handler, conf, None)
+    }
+
+    pub fn new_with_request_admission(
+        rt: Arc<Runtime>,
+        frame: F,
+        handler: M,
+        conf: &ServerConf,
+        request_admission: Arc<Semaphore>,
+    ) -> Self {
+        Self::new_with_optional_admission(rt, frame, handler, conf, Some(request_admission))
+    }
+
+    fn new_with_optional_admission(
+        rt: Arc<Runtime>,
+        frame: F,
+        handler: M,
+        conf: &ServerConf,
+        request_admission: Option<Arc<Semaphore>>,
+    ) -> Self {
         StreamHandler {
             rt,
             frame,
             handler: Arc::new(handler),
             close_idle: conf.close_idle,
             timeout: Duration::from_millis(conf.timeout_ms),
+            request_admission,
         }
     }
 
@@ -71,34 +94,53 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     }
 
     pub async fn call(&mut self, request: Message) -> IOResult<()> {
-        let response = if self.handler.is_sync(&request) {
-            let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
-
-            let handler = self.handler.clone();
-            rt.spawn_blocking(move || match handler.handle(&request) {
-                Err(e) => {
-                    debug!("handler request {} error: {}", request.req_id(), e);
-                    request.error_ext(&e)
-                }
-
-                Ok(v) => v,
-            })
-            .await?
+        let admission = self
+            .request_admission
+            .clone()
+            .or_else(|| self.handler.request_admission(&request));
+        let response = if let Some(admission) = admission {
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(|_| "RPC request admission has stopped")?;
+            let response = self.handle_request(request).await?;
+            drop(permit);
+            response
         } else {
-            let protocol = request.protocol;
-            match self.handler.async_handle(request).await {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("handler request {} error: {}", protocol.req_id, e);
-                    Builder::protocol(protocol).build().error_ext(&e)
-                }
-            }
+            self.handle_request(request).await?
         };
 
         if response.not_empty() {
             self.frame.send(response).await
         } else {
             Ok(())
+        }
+    }
+
+    async fn handle_request(&self, request: Message) -> IOResult<Message> {
+        if self.handler.is_sync(&request) {
+            let rt = self.handler.get_rt(&request).unwrap_or(&self.rt);
+
+            let handler = self.handler.clone();
+            Ok(rt
+                .spawn_blocking(move || match handler.handle(&request) {
+                    Err(e) => {
+                        debug!("handler request {} error: {}", request.req_id(), e);
+                        request.error_ext(&e)
+                    }
+
+                    Ok(v) => v,
+                })
+                .await?)
+        } else {
+            let protocol = request.protocol;
+            match self.handler.async_handle(request).await {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    debug!("handler request {} error: {}", protocol.req_id, e);
+                    Ok(Builder::protocol(protocol).build().error_ext(&e))
+                }
+            }
         }
     }
 

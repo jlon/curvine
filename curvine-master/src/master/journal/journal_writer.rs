@@ -14,38 +14,66 @@
 
 #![allow(clippy::result_large_err)]
 
+use crate::master::journal::read_barrier::JournalReadBarrier;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
-use curvine_core_error::err_box;
-use curvine_error::FsResult;
+use curvine_error::{FsError, FsResult};
 use curvine_model::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_raft::conf::JournalConfExt;
 use curvine_raft::raft::RaftClient;
-use curvine_runtime::common::{FileUtils, LocalTime};
 use curvine_runtime::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use curvine_runtime::sync::AtomicCounter;
-use log::{debug, info, warn};
+use log::{debug, error};
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+
+thread_local! {
+    static JOURNAL_PERMIT_SCOPES: RefCell<Vec<Vec<JournalPermit>>> = const { RefCell::new(Vec::new()) };
+    static JOURNAL_COMMIT_SCOPES: RefCell<Vec<Vec<mpsc::Receiver<()>>>> = const { RefCell::new(Vec::new()) };
+}
 
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
+    require_raft_commit: bool,
     node_id: u64,
-    sender: BlockingSender<JournalEntry>,
+    sender: BlockingSender<QueuedJournalEntry>,
+    permit_pool: Arc<JournalPermitPool>,
+    read_barrier: Arc<JournalReadBarrier>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
-    metadata_delta_log: Mutex<MetadataDeltaLog>,
+    receiver: Option<Mutex<BlockingReceiver<QueuedJournalEntry>>>,
+    metadata_delta_log: MetadataDeltaLog,
 
     snapshot_entries: u64,
     entries_since_snapshot: AtomicCounter,
+    snapshot_requested: AtomicBool,
+    snapshot_in_progress: AtomicBool,
 }
 
-#[derive(Default)]
+/// Sharded bounded ring of recent CV metadata changes served to delta
+/// pagination readers.
+///
+/// Every namespace mutation used to serialize on one global `Mutex` just to
+/// append its change record. Shards are keyed by op id so writers never share
+/// a lock line; pagination reads are rare and take each shard lock once in
+/// index order. The effective low watermark is the minimum across shards, so
+/// rejection of over-range requests stays conservative.
 struct MetadataDeltaLog {
+    shards: Vec<Mutex<MetadataDeltaShard>>,
+}
+
+/// Shard sizing grows the shard count with the configured capacity until each
+/// shard owns roughly this many live entries, capped so small capacities stay
+/// on a single lock.
+const METADATA_DELTA_LOG_SHARD_GRAIN: usize = 1024;
+const METADATA_DELTA_LOG_SHARD_LIMIT: usize = 16;
+
+struct MetadataDeltaShard {
     capacity: usize,
     low_watermark: u64,
     changes: VecDeque<CvMetadataChange>,
@@ -55,6 +83,7 @@ impl JournalWriter {
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> FsResult<Self> {
         let node_id = conf.node_id()?;
         let metrics = Master::get_metrics()?;
+        let permit_pool = Arc::new(JournalPermitPool::new(conf.writer_channel_size));
         let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
@@ -68,28 +97,172 @@ impl JournalWriter {
 
         Ok(Self {
             enable: conf.enable,
+            // Test mode intentionally keeps the receiver for direct journal assertions
+            // and does not start SenderTask, so no Raft commit receipt can arrive.
+            require_raft_commit: !testing,
             node_id,
             sender,
+            permit_pool,
+            read_barrier: Arc::new(JournalReadBarrier::new()),
             metrics,
             receiver,
-            metadata_delta_log: Mutex::new(MetadataDeltaLog::new(conf.metadata_delta_log_capacity)),
+            metadata_delta_log: MetadataDeltaLog::new(conf.metadata_delta_log_capacity),
             snapshot_entries: conf.snapshot_entries,
             entries_since_snapshot: AtomicCounter::new(0),
+            snapshot_requested: AtomicBool::new(false),
+            snapshot_in_progress: AtomicBool::new(false),
         })
     }
 
-    fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
+    fn send_inner(
+        &self,
+        entry: JournalEntry,
+        committed: Option<mpsc::SyncSender<()>>,
+    ) -> FsResult<()> {
+        let permit = match Self::take_scoped_permit() {
+            Some(permit) => permit,
+            None => self.reserve()?,
+        };
+        self.enqueue_with_completion(permit, entry, committed)
+    }
+
+    fn enqueue_after_commit(&self, entry: JournalEntry) -> FsResult<()> {
+        if !self.require_raft_commit {
+            return self.send_inner(entry, None);
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        if let Err(error) = self.send_inner(entry, Some(tx)) {
+            error!(
+                "journal enqueue failed after metadata commit; aborting master: {}",
+                error
+            );
+            std::process::abort();
+        }
+        if let Err(waiter) = Self::record_commit_waiter(rx) {
+            JournalCommitScope::wait_for_commit(waiter)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_background_after_commit(&self, entry: JournalEntry) -> FsResult<()> {
+        if let Err(error) = self.send_inner(entry, None) {
+            error!(
+                "background journal enqueue failed after metadata commit; aborting master: {}",
+                error
+            );
+            std::process::abort();
+        }
+        Ok(())
+    }
+
+    pub fn reserve(&self) -> FsResult<JournalPermit> {
+        Ok(JournalPermit {
+            _permit: self.permit_pool.try_acquire()?,
+        })
+    }
+
+    pub fn begin_metadata_catch_up(&self, applied_index: u64, required_index: u64) {
+        self.read_barrier
+            .begin_catch_up(applied_index, required_index);
+    }
+
+    pub fn require_metadata_catch_up(&self, required_index: u64) {
+        self.read_barrier.require_catch_up(required_index);
+    }
+
+    pub fn advance_metadata_applied(&self, applied_index: u64) {
+        self.read_barrier.advance_applied(applied_index);
+    }
+
+    pub fn advance_metadata_catch_up(&self, applied_index: u64) {
+        self.read_barrier.advance_catch_up(applied_index);
+    }
+
+    pub fn ensure_metadata_current(&self) -> FsResult<()> {
+        self.read_barrier.ensure_current()
+    }
+
+    pub fn is_metadata_current(&self) -> bool {
+        self.read_barrier.is_current()
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub fn reserve_scope(&self, count: usize) -> FsResult<JournalPermitScope> {
+        if !self.enable {
+            return Ok(JournalPermitScope { active: false });
+        }
+
+        let mut permits = Vec::with_capacity(count);
+        for _ in 0..count {
+            permits.push(self.reserve()?);
+        }
+
+        JOURNAL_PERMIT_SCOPES.with(|scopes| scopes.borrow_mut().push(permits));
+        Ok(JournalPermitScope { active: true })
+    }
+
+    pub fn begin_commit_scope(&self) -> JournalCommitScope {
+        if !self.enable {
+            return JournalCommitScope {
+                active: false,
+                completed: true,
+            };
+        }
+
+        JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().push(vec![]));
+        JournalCommitScope {
+            active: true,
+            completed: false,
+        }
+    }
+
+    fn take_scoped_permit() -> Option<JournalPermit> {
+        JOURNAL_PERMIT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            scopes.last_mut().and_then(|permits| permits.pop())
+        })
+    }
+
+    fn record_commit_waiter(waiter: mpsc::Receiver<()>) -> Result<(), mpsc::Receiver<()>> {
+        JOURNAL_COMMIT_SCOPES.with(|scopes| {
+            let mut scopes = scopes.borrow_mut();
+            let Some(waiters) = scopes.last_mut() else {
+                return Err(waiter);
+            };
+            waiters.push(waiter);
+            Ok(())
+        })
+    }
+
+    pub fn enqueue_with_permit(&self, permit: JournalPermit, entry: JournalEntry) -> FsResult<()> {
+        self.enqueue_with_completion(permit, entry, None)
+    }
+
+    fn enqueue_with_completion(
+        &self,
+        permit: JournalPermit,
+        entry: JournalEntry,
+        committed: Option<mpsc::SyncSender<()>>,
+    ) -> FsResult<()> {
         debug!("send_entry {:?}", entry);
-        self.sender.send(entry)?;
+        self.sender.send(QueuedJournalEntry {
+            entry,
+            _permit: permit,
+            committed,
+        })?;
         self.metrics.journal_queue_len.inc();
         Ok(())
     }
 
-    fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
+    fn send(&self, _fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
             self.record_metadata_delta(&entry);
-            self.send_inner(entry)?;
-            self.maybe_emit_snapshot(fs_dir)?;
+            self.enqueue_after_commit(entry)?;
+            self.request_snapshot_if_needed();
         }
         Ok(())
     }
@@ -99,54 +272,62 @@ impl JournalWriter {
         if changes.is_empty() {
             return;
         }
-        self.metadata_delta_log.lock().unwrap().push(changes);
+        self.metadata_delta_log.push(&changes);
     }
 
-    fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+    fn request_snapshot_if_needed(&self) {
         if self.snapshot_entries == 0 {
-            return Ok(());
+            return;
         }
 
         let entries = self.entries_since_snapshot.add_and_get(1);
         if entries < self.snapshot_entries {
-            return Ok(());
+            return;
         }
 
-        let now = LocalTime::mills();
         self.entries_since_snapshot.set(0);
-        let dir = match fs_dir.store.create_checkpoint(now) {
-            Ok(d) => d,
-            Err(e) => {
-                return err_box!("leaderSnapshot: create_checkpoint failed: {}", e);
-            }
-        };
+        self.snapshot_requested.store(true, Ordering::SeqCst);
+    }
 
-        info!(
-            "create leader snapshot, dir {}, entries {}, cost {} ms, inode_id {}",
-            dir,
-            entries,
-            LocalTime::mills() - now,
-            fs_dir.inode_id.current()
-        );
-
-        let snapshot_entry = JournalEntry::Snapshot(SnapshotEntry {
-            op_id: fs_dir.next_op_id(),
-            rpc_id: 0,
-            node_id: self.node_id,
-            dir: dir.clone(),
-        });
-
-        if let Err(send_error) = self.send_inner(snapshot_entry) {
-            if let Err(cleanup_error) = FileUtils::delete_path(&dir, true) {
-                warn!(
-                    "failed to remove checkpoint {} after snapshot entry send failure: {}",
-                    dir, cleanup_error
-                );
-            }
-
-            return Err(send_error);
+    pub fn try_begin_snapshot(&self) -> bool {
+        if !self.snapshot_requested.swap(false, Ordering::SeqCst) {
+            return false;
         }
-        Ok(())
+
+        if self
+            .snapshot_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            true
+        } else {
+            self.snapshot_requested.store(true, Ordering::SeqCst);
+            false
+        }
+    }
+
+    pub fn finish_snapshot(&self, success: bool) {
+        if !success {
+            self.snapshot_requested.store(true, Ordering::SeqCst);
+        }
+        self.snapshot_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub fn enqueue_snapshot_with_permit(
+        &self,
+        permit: JournalPermit,
+        op_id: u64,
+        dir: String,
+    ) -> FsResult<()> {
+        self.enqueue_with_permit(
+            permit,
+            JournalEntry::Snapshot(SnapshotEntry {
+                op_id,
+                rpc_id: 0,
+                node_id: self.node_id,
+                dir,
+            }),
+        )
     }
 
     pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -228,6 +409,23 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::OverWriteFile(entry))
     }
 
+    pub fn log_cache_invalidations(
+        &self,
+        fs_dir: &FsDir,
+        inodes: Vec<crate::master::meta::inode::InodeView>,
+    ) -> FsResult<()> {
+        if inodes.is_empty() {
+            return Ok(());
+        }
+
+        let entry = CacheInvalidationEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            inodes,
+        };
+        self.send(fs_dir, JournalEntry::CacheInvalidation(entry))
+    }
+
     pub fn log_rename<P: AsRef<str>>(
         &self,
         fs_dir: &FsDir,
@@ -278,39 +476,34 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::Free(entry))
     }
 
-    pub fn log_cache_invalidations(
-        &self,
-        fs_dir: &FsDir,
-        inodes: Vec<crate::master::meta::inode::InodeView>,
-    ) -> FsResult<()> {
-        if inodes.is_empty() {
-            return Ok(());
-        }
-
-        let entry = CacheInvalidationEntry {
-            op_id: fs_dir.next_op_id(),
-            rpc_id: 0,
-            inodes,
-        };
-        self.send(fs_dir, JournalEntry::CacheInvalidation(entry))
-    }
-
-    pub fn log_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+    pub fn log_mount_by_id(&self, op_id: u64, info: MountInfo) -> FsResult<()> {
         let entry = MountEntry {
-            op_id: fs_dir.next_op_id(),
+            op_id,
             rpc_id: 0,
             info,
         };
-        self.send(fs_dir, JournalEntry::Mount(entry))
+        if self.enable {
+            let entry = JournalEntry::Mount(entry);
+            self.record_metadata_delta(&entry);
+            self.enqueue_after_commit(entry)?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
-    pub fn log_unmount(&self, fs_dir: &FsDir, id: u32) -> FsResult<()> {
+    pub fn log_unmount_by_id(&self, op_id: u64, id: u32) -> FsResult<()> {
         let entry = UnMountEntry {
-            op_id: fs_dir.next_op_id(),
+            op_id,
             rpc_id: 0,
             id,
         };
-        self.send(fs_dir, JournalEntry::UnMount(entry))
+        if self.enable {
+            let entry = JournalEntry::UnMount(entry);
+            self.record_metadata_delta(&entry);
+            self.enqueue_after_commit(entry)?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
     pub fn log_set_attr(&self, fs_dir: &FsDir, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
@@ -368,8 +561,7 @@ impl JournalWriter {
             term,
             index,
         };
-        self.metrics.journal_queue_len.inc();
-        self.sender.send(JournalEntry::UfsApplied(entry))?;
+        self.enqueue_background_after_commit(JournalEntry::UfsApplied(entry))?;
 
         Ok(())
     }
@@ -382,6 +574,22 @@ impl JournalWriter {
             locks,
         };
         self.send(fs_dir, JournalEntry::SetLocks(entry))
+    }
+
+    pub fn log_set_locks_by_id(&self, op_id: u64, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
+        let entry = SetLocksEntry {
+            op_id,
+            rpc_id: 0,
+            ino,
+            locks,
+        };
+        if self.enable {
+            let entry = JournalEntry::SetLocks(entry);
+            self.record_metadata_delta(&entry);
+            self.enqueue_after_commit(entry)?;
+            self.request_snapshot_if_needed();
+        }
+        Ok(())
     }
 
     // for testing
@@ -398,7 +606,8 @@ impl JournalWriter {
             }
         };
         while let Ok(v) = receiver.try_recv() {
-            entries.push(v);
+            self.metrics.journal_queue_len.dec();
+            entries.push(v.entry);
         }
         entries
     }
@@ -408,30 +617,71 @@ impl JournalWriter {
         from_epoch: u64,
         to_epoch: u64,
     ) -> Option<Vec<CvMetadataChange>> {
-        let log = self.metadata_delta_log.lock().unwrap();
-        if from_epoch < log.low_watermark {
-            return None;
-        }
-        Some(
-            log.changes
-                .iter()
-                .filter(|change| change.op_id > from_epoch && change.op_id <= to_epoch)
-                .cloned()
-                .collect(),
-        )
+        self.metadata_delta_log.changes_since(from_epoch, to_epoch)
     }
 }
 
 impl MetadataDeltaLog {
     fn new(capacity: usize) -> Self {
+        let shard_count = if capacity == 0 {
+            1
+        } else {
+            (capacity / METADATA_DELTA_LOG_SHARD_GRAIN).clamp(1, METADATA_DELTA_LOG_SHARD_LIMIT)
+        };
+        let shard_capacity = if capacity == 0 {
+            0
+        } else {
+            capacity.div_ceil(shard_count)
+        };
         Self {
-            capacity,
-            low_watermark: 0,
-            changes: VecDeque::with_capacity(capacity.min(1024)),
+            shards: (0..shard_count)
+                .map(|_| {
+                    Mutex::new(MetadataDeltaShard {
+                        capacity: shard_capacity,
+                        low_watermark: 0,
+                        changes: VecDeque::with_capacity(shard_capacity.min(1024)),
+                    })
+                })
+                .collect(),
         }
     }
 
-    fn push(&mut self, changes: Vec<CvMetadataChange>) {
+    fn push(&self, changes: &[CvMetadataChange]) {
+        // Entries carry a single op id; routing on it spreads sequential
+        // mutations round-robin across shards without any shared state.
+        let route_op_id = changes.iter().map(|change| change.op_id).max();
+        let Some(route_op_id) = route_op_id else {
+            return;
+        };
+        let shard_index = (route_op_id as usize) % self.shards.len();
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        shard.push(changes);
+    }
+
+    fn changes_since(&self, from_epoch: u64, to_epoch: u64) -> Option<Vec<CvMetadataChange>> {
+        let mut low_watermark = u64::MAX;
+        let mut matched = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            low_watermark = low_watermark.min(shard.low_watermark);
+            matched.extend(
+                shard
+                    .changes
+                    .iter()
+                    .filter(|change| change.op_id > from_epoch && change.op_id <= to_epoch)
+                    .cloned(),
+            );
+        }
+        if from_epoch < low_watermark {
+            return None;
+        }
+        matched.sort_unstable_by_key(|change| change.op_id);
+        Some(matched)
+    }
+}
+
+impl MetadataDeltaShard {
+    fn push(&mut self, changes: &[CvMetadataChange]) {
         if self.capacity == 0 {
             if let Some(max_op_id) = changes.iter().map(|change| change.op_id).max() {
                 self.low_watermark = self.low_watermark.max(max_op_id);
@@ -439,7 +689,7 @@ impl MetadataDeltaLog {
             return;
         }
         for change in changes {
-            self.changes.push_back(change);
+            self.changes.push_back(change.clone());
             while self.changes.len() > self.capacity {
                 if let Some(evicted) = self.changes.pop_front() {
                     self.low_watermark = self.low_watermark.max(evicted.op_id);
@@ -449,125 +699,125 @@ impl MetadataDeltaLog {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::master::meta::inode::ttl::TtlBucketList;
-    use crate::master::quota::eviction::evictor::{Evictor, LRUEvictor};
-    use crate::master::quota::eviction::EvictionConf;
-    use curvine_config::ClusterConf;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::time::Duration;
+pub struct QueuedJournalEntry {
+    pub(crate) entry: JournalEntry,
+    _permit: JournalPermit,
+    pub(crate) committed: Option<mpsc::SyncSender<()>>,
+}
 
-    fn test_conf(name: &str) -> ClusterConf {
-        let mut conf = ClusterConf {
-            testing: true,
-            format_master: true,
-            journal: JournalConf {
-                enable: true,
-                snapshot_entries: 1,
-                writer_channel_size: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        conf.change_test_meta_dir(name);
-        conf
-    }
+pub struct JournalPermit {
+    _permit: Option<JournalQueuePermit>,
+}
 
-    fn build_writer(conf: &ClusterConf) -> FsResult<JournalWriter> {
-        Master::init_test_metrics();
+pub struct JournalPermitScope {
+    active: bool,
+}
 
-        let rt = conf.journal.create_runtime();
-        let client = RaftClient::from_conf(rt, &conf.journal);
-        JournalWriter::new(true, client, &conf.journal)
-    }
-
-    fn build_fs_dir(conf: &ClusterConf, writer: Arc<JournalWriter>) -> FsResult<FsDir> {
-        let ttl_bucket_list = Arc::new(TtlBucketList::new(
-            conf.master.ttl_bucket_interval_ms() as i64
-        )?);
-
-        let eviction_conf = EvictionConf::from_conf(conf);
-        let evictor: Arc<dyn Evictor> = Arc::new(LRUEvictor::new(eviction_conf));
-
-        FsDir::new(conf, writer, ttl_bucket_list, evictor)
-    }
-
-    fn checkpoint_dirs(conf: &ClusterConf) -> Vec<PathBuf> {
-        let db_conf = conf.db_conf();
-        let checkpoint_dir = Path::new(&db_conf.checkpoint_dir);
-
-        if !checkpoint_dir.exists() {
-            return Vec::new();
+impl Drop for JournalPermitScope {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
         }
-
-        fs::read_dir(checkpoint_dir)
-            .expect("failed to read checkpoint directory")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect()
+        JOURNAL_PERMIT_SCOPES.with(|scopes| {
+            let _ = scopes.borrow_mut().pop();
+        });
     }
+}
 
-    #[test]
-    fn removes_checkpoint_when_snapshot_enqueue_fails() -> FsResult<()> {
-        let conf = test_conf("snapshot_enqueue_failure");
-        let mut writer = build_writer(&conf)?;
+pub struct JournalCommitScope {
+    active: bool,
+    completed: bool,
+}
 
-        // The testing writer retains the only receiver. Dropping it makes
-        // std::sync::mpsc::Sender::send return an error before handoff.
-        let receiver = writer
-            .receiver
-            .take()
-            .expect("testing writer should retain its receiver");
-        drop(receiver);
-
-        let writer = Arc::new(writer);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
-
-        let result = writer.maybe_emit_snapshot(&fs_dir);
-        assert!(result.is_err(), "snapshot enqueue should fail");
-
-        let checkpoints = checkpoint_dirs(&conf);
-        assert!(
-            checkpoints.is_empty(),
-            "checkpoint should be removed after enqueue failure: {:?}",
-            checkpoints
-        );
-
+impl JournalCommitScope {
+    pub fn wait(mut self) -> FsResult<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let waiters =
+            JOURNAL_COMMIT_SCOPES.with(|scopes| scopes.borrow_mut().pop().unwrap_or_default());
+        self.completed = true;
+        for waiter in waiters {
+            Self::wait_for_commit(waiter)?;
+        }
         Ok(())
     }
 
-    #[test]
-    fn keeps_checkpoint_when_snapshot_enqueue_succeeds() -> FsResult<()> {
-        let conf = test_conf("snapshot_enqueue_success");
-        let writer = Arc::new(build_writer(&conf)?);
-        let fs_dir = build_fs_dir(&conf, writer.clone())?;
+    fn wait_for_commit(waiter: mpsc::Receiver<()>) -> FsResult<()> {
+        if let Err(error) = waiter.recv() {
+            error!(
+                "journal commit failed after metadata commit; aborting master: {}",
+                error
+            );
+            std::process::abort();
+        }
+        Ok(())
+    }
+}
 
-        writer.maybe_emit_snapshot(&fs_dir)?;
+impl Drop for JournalCommitScope {
+    fn drop(&mut self) {
+        if self.active && !self.completed {
+            JOURNAL_COMMIT_SCOPES.with(|scopes| {
+                let _ = scopes.borrow_mut().pop();
+            });
+        }
+    }
+}
 
-        let entry = writer
-            .receiver
-            .as_ref()
-            .expect("testing writer should retain its receiver")
-            .lock()
-            .expect("testing receiver lock should not be poisoned")
-            .recv_timeout(Duration::from_secs(1))
-            .expect("snapshot entry should be enqueued");
+struct JournalQueuePermit {
+    pool: Arc<JournalPermitPool>,
+}
 
-        match entry {
-            JournalEntry::Snapshot(entry) => {
-                assert!(
-                    Path::new(&entry.dir).exists(),
-                    "checkpoint should remain after successful handoff: {}",
-                    entry.dir
-                );
+impl Drop for JournalQueuePermit {
+    fn drop(&mut self) {
+        self.pool.release();
+    }
+}
+
+struct JournalPermitPool {
+    capacity: usize,
+    available: AtomicUsize,
+}
+
+impl JournalPermitPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            available: AtomicUsize::new(capacity),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> FsResult<Option<JournalQueuePermit>> {
+        if self.capacity == 0 {
+            return Ok(None);
+        }
+
+        let mut current = self.available.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return Err(FsError::common("journal writer queue is full"));
             }
-            other => panic!("expected snapshot entry, got {:?}", other),
+            match self.available.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Some(JournalQueuePermit { pool: self.clone() })),
+                Err(now) => current = now,
+            }
         }
+    }
 
-        Ok(())
+    fn release(&self) {
+        if self.capacity == 0 {
+            return;
+        }
+        let previous = self.available.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous < self.capacity,
+            "journal permit release without matching acquire"
+        );
     }
 }

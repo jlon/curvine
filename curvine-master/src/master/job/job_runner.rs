@@ -41,6 +41,7 @@ pub struct LoadJobRunner {
     factory: Arc<UfsFactory>,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
+    enforce_metadata_barrier: bool,
 }
 
 #[derive(Clone)]
@@ -69,6 +70,7 @@ impl LoadJobRunner {
         factory: Arc<UfsFactory>,
         job_max_files: usize,
         run_seq: Arc<AtomicCounter>,
+        enforce_metadata_barrier: bool,
     ) -> Self {
         Self {
             jobs,
@@ -76,7 +78,39 @@ impl LoadJobRunner {
             factory,
             job_max_files,
             run_seq,
+            enforce_metadata_barrier,
         }
+    }
+
+    fn file_status(&self, path: &str) -> FsResult<curvine_model::FileStatus> {
+        if self.enforce_metadata_barrier {
+            self.master_fs.file_status(path)
+        } else {
+            self.master_fs.file_status_unchecked(path)
+        }
+    }
+
+    fn list_status(&self, path: &str) -> FsResult<Vec<curvine_model::FileStatus>> {
+        if self.enforce_metadata_barrier {
+            self.master_fs.list_status(path)
+        } else {
+            self.master_fs.list_status_unchecked(path)
+        }
+    }
+
+    fn source_read_plan_json(&self, path: &Path) -> FsResult<String> {
+        if self.enforce_metadata_barrier || !path.is_cv() {
+            return Ok(String::new());
+        }
+
+        let blocks = self.master_fs.get_block_locations_unchecked(path.path())?;
+        serde_json::to_string(&blocks).map_err(|err| {
+            FsError::common(format!(
+                "Unable to prepare replay CV read plan for {}: {}",
+                path.full_path(),
+                err
+            ))
+        })
     }
 
     pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
@@ -627,7 +661,7 @@ impl LoadJobRunner {
         run_id: u64,
     ) -> FsResult<PlannedLoadJob> {
         let source_status = if source_path.is_cv() {
-            self.master_fs.file_status(source_path.path())?
+            self.file_status(source_path.path())?
         } else {
             let ufs = self.factory.get_ufs(mnt)?;
             ufs.get_status(source_path).await?
@@ -650,7 +684,7 @@ impl LoadJobRunner {
                 let dir_path = Path::from_str(status.path)?;
                 let childs = if dir_path.is_cv() {
                     // Traverse Curvine directory
-                    self.master_fs.list_status(dir_path.path())?
+                    self.list_status(dir_path.path())?
                 } else {
                     // Traverse UFS directory
                     let ufs = self.factory.get_ufs(mnt)?;
@@ -684,6 +718,7 @@ impl LoadJobRunner {
                 let task_id = format!("{}_run_{}_task_{}", job.job_id, run_id, task_index);
                 task_index += 1;
                 total_size += status.len;
+                let source_read_plan_json = self.source_read_plan_json(&source_path)?;
 
                 let task = LoadTaskInfo {
                     job: job.clone(),
@@ -692,7 +727,7 @@ impl LoadJobRunner {
                     source_path: source_path.clone_uri(),
                     target_path: target_path.clone_uri(),
                     create_time: LocalTime::mills() as i64,
-                    source_read_plan_json: String::new(),
+                    source_read_plan_json,
                     transfer_report: None,
                 };
                 tasks.insert(task_id.clone(), TaskDetail::new(task));

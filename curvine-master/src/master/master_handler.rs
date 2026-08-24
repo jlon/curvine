@@ -26,17 +26,17 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileStatus, FreeResult, HeartbeatStatus,
+    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileLock, FileStatus, FreeResult, HeartbeatStatus,
     ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
-use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use curvine_runtime::runtime::{RpcRuntime, Runtime};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -46,7 +46,13 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
-    pub(crate) control_rpc_executor: Arc<GroupExecutor>,
+    pub(crate) control_rpc_rt: Arc<Runtime>,
+    pub(crate) control_rpc_admission: Arc<Semaphore>,
+    pub(crate) client_request_admission: Arc<Semaphore>,
+    pub(crate) client_blocking_admission: Option<Arc<Semaphore>>,
+    pub(crate) control_request_admission: Arc<Semaphore>,
+    pub(crate) metadata_read_rt: Arc<Runtime>,
+    pub(crate) metadata_read_admission: Arc<Semaphore>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
 }
@@ -60,7 +66,13 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
-        control_rpc_executor: Arc<GroupExecutor>,
+        control_rpc_rt: Arc<Runtime>,
+        control_rpc_admission: Arc<Semaphore>,
+        client_request_admission: Arc<Semaphore>,
+        client_blocking_admission: Option<Arc<Semaphore>>,
+        control_request_admission: Arc<Semaphore>,
+        metadata_read_rt: Arc<Runtime>,
+        metadata_read_admission: Arc<Semaphore>,
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
@@ -74,7 +86,13 @@ impl MasterHandler {
             conn_state,
             mount_manager,
             job_handler,
-            control_rpc_executor,
+            control_rpc_rt,
+            control_rpc_admission,
+            client_request_admission,
+            client_blocking_admission,
+            control_request_admission,
+            metadata_read_rt,
+            metadata_read_admission,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
         }
@@ -196,6 +214,21 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    async fn async_file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: GetFileStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let status = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || fs.file_status(&header.path),
+        )
+        .await?;
+        ctx.response(GetFileStatusResponse {
+            status: ProtoUtils::file_status_to_pb(status),
+        })
+    }
+
     pub fn exists(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: ExistsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
@@ -203,6 +236,19 @@ impl MasterHandler {
         let exists = self.fs.exists(&header.path)?;
         let rep_header = ExistsResponse { exists };
         ctx.response(rep_header)
+    }
+
+    async fn async_exists(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ExistsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let exists = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || fs.exists(&header.path),
+        )
+        .await?;
+        ctx.response(ExistsResponse { exists })
     }
 
     pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<bool> {
@@ -253,7 +299,15 @@ impl MasterHandler {
         if self.check_is_retry(req_id)? {
             return Ok(true);
         }
-        let flags = RenameFlags::new(header.flags);
+        let flags = RenameFlags::try_new(header.flags).ok_or_else(|| {
+            FsError::invalid_argument(format!("invalid rename flags: {:#x}", header.flags))
+        })?;
+        if !flags.is_supported() {
+            return Err(FsError::unsupported(format!(
+                "unsupported rename flags: {:#x}",
+                header.flags
+            )));
+        }
         let res = self.fs.rename(&header.src, &header.dst, flags);
         self.set_req_cache(req_id, res)
     }
@@ -283,6 +337,24 @@ impl MasterHandler {
 
     fn process_list_status(fs: MasterFilesystem, path: String) -> FsResult<Vec<FileStatus>> {
         fs.list_status(&path)
+    }
+
+    async fn async_list_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListStatusRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || Self::process_list_status(fs, header.path),
+        )
+        .await?;
+        ctx.response(ListStatusResponse {
+            statuses: list
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect(),
+        })
     }
 
     // The add block internally determines whether it is a retry request.
@@ -444,26 +516,72 @@ impl MasterHandler {
         fs.get_block_locations(path)
     }
 
-    async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
+    async fn async_get_block_locations(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetBlockLocationsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(req.path.to_string()), None);
+        let fs = self.fs.clone();
+        let blocks = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || Self::process_get_block_locations(fs, req.path),
+        )
+        .await?;
+        let rep_header = GetBlockLocationsResponse {
+            blocks: ProtoUtils::file_blocks_to_pb(blocks),
+        };
+        ctx.response(rep_header)
+    }
+
+    async fn async_open_file_read(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: OpenFileRequest = ctx.parse_header()?;
+        let flags = OpenFlags::new(header.flags);
+        if !flags.read_only() {
+            return err_box!("mutable OpenFile request was dispatched as a metadata read");
+        }
+        let audit_path = format!("{}:{}", flags.access_mark(), header.path);
+        ctx.set_audit(Some(audit_path), None);
+        let fs = self.fs.clone();
+        let blocks = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || Self::process_get_block_locations(fs, header.path),
+        )
+        .await?;
+        ctx.response(OpenFileResponse {
+            file_blocks: ProtoUtils::file_blocks_to_pb(blocks),
+        })
+    }
+
+    async fn run_master_rpc_task<T, F>(
+        rt: Arc<Runtime>,
+        admission: Arc<Semaphore>,
+        task: F,
+    ) -> FsResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> FsResult<T> + Send + 'static,
     {
-        let (tx, rx) = oneshot::channel();
-        executor.try_spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(task))
-                .unwrap_or_else(|_| err_box!("master control RPC task panicked"));
-            let _ = tx.send(result);
-        })?;
-        rx.await?
+        let permit = admission
+            .acquire_owned()
+            .await
+            .map_err(|_| FsError::common("master RPC executor has stopped"))?;
+        rt.spawn_blocking(move || {
+            let _permit = permit;
+            panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| err_box!("master RPC task panicked"))
+        })
+        .await
+        .map_err(|error| FsError::common(format!("master RPC executor stopped: {error}")))?
     }
 
     async fn async_get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMasterInfoRequest = ctx.parse_header()?;
         let fs = self.fs.clone();
-        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            Self::process_get_master_info(fs)
-        })
+        let info = Self::run_master_rpc_task(
+            self.control_rpc_rt.clone(),
+            self.control_rpc_admission.clone(),
+            move || Self::process_get_master_info(fs),
+        )
         .await?;
         let rep_header = ProtoUtils::master_info_to_pb(info);
         ctx.response(rep_header)
@@ -476,24 +594,28 @@ impl MasterHandler {
         let req: GetCvMetadataSnapshotPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-snapshot".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            let page = fs.cv_metadata_snapshot_page(
-                req.page_token,
-                req.page_size.unwrap_or(10_000) as usize,
-            )?;
-            Ok(GetCvMetadataSnapshotPageResponse {
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(|entry| CvMetadataSnapshotEntryProto {
-                        status: ProtoUtils::file_status_to_pb(entry.status),
-                        blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                    })
-                    .collect(),
-                next_page_token: page.next_page_token,
-                epoch: page.epoch,
-            })
-        })
+        let response = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || {
+                let page = fs.cv_metadata_snapshot_page(
+                    req.page_token,
+                    req.page_size.unwrap_or(10_000) as usize,
+                )?;
+                Ok(GetCvMetadataSnapshotPageResponse {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|entry| CvMetadataSnapshotEntryProto {
+                            status: ProtoUtils::file_status_to_pb(entry.status),
+                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                        })
+                        .collect(),
+                    next_page_token: page.next_page_token,
+                    epoch: page.epoch,
+                })
+            },
+        )
         .await?;
         ctx.response(response)
     }
@@ -505,31 +627,35 @@ impl MasterHandler {
         let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
-            let page = fs.cv_metadata_delta_page(
-                req.from_epoch,
-                req.target_epoch,
-                req.page_token,
-                req.page_size.unwrap_or(10_000) as usize,
-            )?;
-            Ok(GetCvMetadataDeltaPageResponse {
-                entries: page
-                    .entries
-                    .into_iter()
-                    .map(|entry| CvMetadataDeltaEntryProto {
-                        path: entry.path,
-                        entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
-                            status: ProtoUtils::file_status_to_pb(entry.status),
-                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                        }),
-                    })
-                    .collect(),
-                next_page_token: page.next_page_token,
-                from_epoch: page.from_epoch,
-                to_epoch: page.to_epoch,
-                full_snapshot_required: page.full_snapshot_required,
-            })
-        })
+        let response = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || {
+                let page = fs.cv_metadata_delta_page(
+                    req.from_epoch,
+                    req.target_epoch,
+                    req.page_token,
+                    req.page_size.unwrap_or(10_000) as usize,
+                )?;
+                Ok(GetCvMetadataDeltaPageResponse {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|entry| CvMetadataDeltaEntryProto {
+                            path: entry.path,
+                            entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
+                                status: ProtoUtils::file_status_to_pb(entry.status),
+                                blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                            }),
+                        })
+                        .collect(),
+                    next_page_token: page.next_page_token,
+                    from_epoch: page.from_epoch,
+                    to_epoch: page.to_epoch,
+                    full_snapshot_required: page.full_snapshot_required,
+                })
+            },
+        )
         .await?;
         ctx.response(response)
     }
@@ -612,6 +738,39 @@ impl MasterHandler {
         match &self.conn_state {
             None => "",
             Some(v) => &v.remote_addr.hostname,
+        }
+    }
+
+    fn ensure_active(&self, code: RpcCode) -> FsResult<()> {
+        if self.fs.master_monitor.is_active() {
+            Ok(())
+        } else {
+            Err(FsError::not_leader_master(code, self.client_ip()))
+        }
+    }
+
+    fn is_read_only_open(msg: &Message) -> bool {
+        msg.parse_header::<OpenFileRequest>()
+            .map(|header| OpenFlags::new(header.flags).read_only())
+            .unwrap_or(false)
+    }
+
+    fn requires_active_after_response(msg: &Message) -> bool {
+        match RpcCode::from(msg.code()) {
+            RpcCode::OpenFile => Self::is_read_only_open(msg),
+            RpcCode::FileStatus
+            | RpcCode::Exists
+            | RpcCode::ListStatus
+            | RpcCode::ListOptions
+            | RpcCode::GetBlockLocations
+            | RpcCode::GetLock
+            | RpcCode::GetMountTable
+            | RpcCode::GetMountInfo
+            | RpcCode::GetJobStatus
+            | RpcCode::GetMasterInfo
+            | RpcCode::GetCvMetadataSnapshotPage
+            | RpcCode::GetCvMetadataDeltaPage => true,
+            _ => false,
         }
     }
 
@@ -766,11 +925,35 @@ impl MasterHandler {
         let lock = ProtoUtils::file_lock_from_pb(header.lock);
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let conflict = self.fs.get_lock(header.path, lock)?;
+        let conflict = Self::process_get_lock(self.fs.clone(), header.path, lock)?;
         let rep_header = GetLockResponse {
             conflict: conflict.map(ProtoUtils::file_lock_to_pb),
         };
         ctx.response(rep_header)
+    }
+
+    fn process_get_lock(
+        fs: MasterFilesystem,
+        path: String,
+        lock: FileLock,
+    ) -> FsResult<Option<FileLock>> {
+        fs.get_lock(path, lock)
+    }
+
+    async fn async_get_lock(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: GetLockRequest = ctx.parse_header()?;
+        let lock = ProtoUtils::file_lock_from_pb(header.lock);
+        ctx.set_audit(Some(header.path.to_string()), None);
+        let fs = self.fs.clone();
+        let conflict = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || Self::process_get_lock(fs, header.path, lock),
+        )
+        .await?;
+        ctx.response(GetLockResponse {
+            conflict: conflict.map(ProtoUtils::file_lock_to_pb),
+        })
     }
 
     pub fn set_lock(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -816,6 +999,29 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
+    async fn async_list_options(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListOptionsRequest = ctx.parse_header()?;
+        if header.options.limit.unwrap_or(0) < 0 {
+            return err_box!("list options limit must be greater than 0");
+        }
+        let opts = ProtoUtils::list_options_from_pb(header.options);
+        let audit_path = format!("{}[{}]", header.path, opts);
+        ctx.set_audit(Some(audit_path), None);
+        let fs = self.fs.clone();
+        let list = Self::run_master_rpc_task(
+            self.metadata_read_rt.clone(),
+            self.metadata_read_admission.clone(),
+            move || Self::process_list_options(fs, header.path, opts),
+        )
+        .await?;
+        ctx.response(ListOptionsResponse {
+            statuses: list
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect(),
+        })
+    }
+
     fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
@@ -846,12 +1052,24 @@ impl MessageHandler for MasterHandler {
 
     fn is_sync(&self, msg: &Message) -> bool {
         let code = RpcCode::from(msg.code());
+        if code == RpcCode::OpenFile {
+            return msg
+                .parse_header::<OpenFileRequest>()
+                .map(|header| !OpenFlags::new(header.flags).read_only())
+                .unwrap_or(false);
+        }
         !matches!(
             code,
             RpcCode::SubmitJob
                 | RpcCode::GetJobStatus
                 | RpcCode::CancelJob
                 | RpcCode::ReportTask
+                | RpcCode::FileStatus
+                | RpcCode::Exists
+                | RpcCode::ListStatus
+                | RpcCode::ListOptions
+                | RpcCode::GetBlockLocations
+                | RpcCode::GetLock
                 | RpcCode::GetMasterInfo
                 | RpcCode::GetCvMetadataSnapshotPage
                 | RpcCode::GetCvMetadataDeltaPage
@@ -918,15 +1136,23 @@ impl MessageHandler for MasterHandler {
 
                 RpcCode::ReportBlockReplicationResult => {
                     if let Some(ref replication_service) = self.replication_handler {
-                        return replication_service.handle(msg);
+                        replication_service.handle(msg)
                     } else {
-                        return Err(FsError::common("Replication service not initialized"));
+                        Err(FsError::common("Replication service not initialized"))
                     }
                 }
 
                 // Unsupported request
                 _ => err_box!("Unsupported operation"),
             }
+        };
+        let response = if Self::requires_active_after_response(msg) {
+            response.and_then(|message| {
+                self.ensure_active(ctx.code)?;
+                Ok(message)
+            })
+        } else {
+            response
         };
 
         self.record_rpc_observability(ctx, &response);
@@ -955,14 +1181,21 @@ impl MessageHandler for MasterHandler {
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
 
-        let res = if !self.fs.master_monitor.is_active() {
-            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
+        let res = if let Err(error) = self.ensure_active(ctx.code) {
+            Err(error)
         } else {
             match code {
                 RpcCode::SubmitJob => self.job_handler.submit_job(ctx).await,
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
+                RpcCode::OpenFile => self.async_open_file_read(ctx).await,
+                RpcCode::FileStatus => self.async_file_status(ctx).await,
+                RpcCode::Exists => self.async_exists(ctx).await,
+                RpcCode::ListStatus => self.async_list_status(ctx).await,
+                RpcCode::ListOptions => self.async_list_options(ctx).await,
+                RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
+                RpcCode::GetLock => self.async_get_lock(ctx).await,
                 RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
@@ -971,6 +1204,14 @@ impl MessageHandler for MasterHandler {
 
                 v => err_box!("unsupported operation {:?}", v),
             }
+        };
+        let res = if Self::requires_active_after_response(&msg) {
+            res.and_then(|message| {
+                self.ensure_active(ctx.code)?;
+                Ok(message)
+            })
+        } else {
+            res
         };
 
         self.record_rpc_observability(ctx, &res);
@@ -985,11 +1226,29 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         if matches!(
             code,
-            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetMasterInfo
+            RpcCode::WorkerHeartbeat
+                | RpcCode::WorkerBlockReport
+                | RpcCode::ReportBlockReplicationResult
         ) {
             Some(&self.actor_rt)
         } else {
             None
+        }
+    }
+
+    fn request_admission(&self, msg: &Message) -> Option<Arc<Semaphore>> {
+        let code = RpcCode::from(msg.code());
+        if matches!(
+            code,
+            RpcCode::WorkerHeartbeat
+                | RpcCode::WorkerBlockReport
+                | RpcCode::ReportBlockReplicationResult
+        ) {
+            Some(self.control_request_admission.clone())
+        } else if self.is_sync(msg) {
+            self.client_blocking_admission.clone()
+        } else {
+            Some(self.client_request_admission.clone())
         }
     }
 }

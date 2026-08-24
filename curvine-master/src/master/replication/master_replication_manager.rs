@@ -138,10 +138,7 @@ impl MasterReplicationManager {
     ) -> CommonResult<()> {
         // todo: check whether the block_id replicas legal
 
-        let locations = {
-            let fs_dir = self.fs.fs_dir.read();
-            fs_dir.get_block_locations(block_id)?
-        };
+        let locations = self.fs.get_block_locations_by_id(block_id)?;
 
         // step1: find out the available worker to replicate blocks
         // todo: use pluggable policy to find out the best worker to do replication
@@ -246,18 +243,25 @@ impl MasterReplicationManager {
         let success = req.success;
         let message = req.message;
         let storage_type = req.storage_type;
+        if success {
+            let target_worker_id = match self.inflight_blocks.get(&block_id) {
+                Some(entry) => entry.target_worker.worker_id,
+                None => {
+                    warn!("Should not happen that Block {} not found", block_id);
+                    return Ok(());
+                }
+            };
+            info!("Successfully replicated {}", block_id);
+            let location = BlockLocation::new(target_worker_id, storage_type.into());
+            self.fs.add_block_location(block_id, location)?;
+        }
+
         match self.inflight_blocks.remove(&block_id) {
             None => {
                 warn!("Should not happen that Block {} not found", block_id);
             }
             Some(entry) => {
-                if success {
-                    info!("Successfully replicated {}", block_id);
-                    let dir = self.fs.fs_dir.write();
-                    let location =
-                        BlockLocation::new(entry.1.target_worker.worker_id, storage_type.into());
-                    dir.add_block_location(block_id, location)?;
-                } else {
+                if !success {
                     error!(
                         "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                         block_id, &entry.1.target_worker, message

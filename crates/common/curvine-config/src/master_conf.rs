@@ -55,6 +55,9 @@ pub struct MasterConf {
     pub retry_cache_size: u64,
     pub retry_cache_ttl: String,
 
+    // Immutable regular-file inode cache payload budget used by metadata reads.
+    pub metadata_read_cache_size: ByteUnit,
+
     pub block_report_limit: usize,
 
     // Worker selects strategy
@@ -178,6 +181,18 @@ impl MasterConf {
             return err_box!("master.global_limit must be greater than zero");
         }
 
+        if self.actor_threads == 0 {
+            return err_box!("master.actor_threads must be greater than zero");
+        }
+
+        if self.executor_threads == 0 {
+            return err_box!("master.executor_threads must be greater than zero");
+        }
+
+        if self.executor_channel_size == 0 {
+            return err_box!("master.executor_channel_size must be greater than zero");
+        }
+
         Ok(())
     }
 
@@ -277,6 +292,8 @@ impl Default for MasterConf {
             retry_cache_size: 100_000,
             retry_cache_ttl: "10m".to_string(),
 
+            metadata_read_cache_size: ByteUnit::mb(128),
+
             block_report_limit: 1000,
 
             worker_policy: "local".to_string(),
@@ -328,7 +345,6 @@ impl Default for MasterConf {
             quota_eviction_scan_page: 2,
             quota_eviction_dry_run: false,
             quota_eviction_capacity: 5_000_000, // Default: 5 million entries (~250MB)
-
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
 

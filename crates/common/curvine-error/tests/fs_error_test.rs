@@ -16,3 +16,14 @@ fn block_not_found_round_trips_with_structured_kind() {
         other => panic!("expected BlockNotFound, got {:?}", other),
     }
 }
+
+#[test]
+fn resource_exhausted_round_trips_and_is_retryable() {
+    let error = FsError::resource_exhausted("master metadata-read executor queue is full");
+    assert!(matches!(error.kind(), ErrorKind::ResourceExhausted));
+    assert!(error.should_retry());
+
+    let decoded = FsError::decode(error.encode());
+    assert!(matches!(decoded.kind(), ErrorKind::ResourceExhausted));
+    assert!(decoded.should_retry());
+}

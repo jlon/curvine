@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use curvine_core_error::CommonResult;
-use curvine_model::BlockLocation;
+use curvine_model::{BlockLocation, DirectoryAttributeDelta, DirectoryAttributes, ListOptions};
 use curvine_rocksdb::DBConf;
 use curvine_runtime::common::Utils;
 use curvine_server::master::meta::inode::ttl::TtlBucketList;
-use curvine_server::master::meta::inode::{InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
+use curvine_server::master::meta::inode::{Inode, InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
 use curvine_server::master::meta::store::{InodeStore, RocksInodeStore};
 use curvine_server::master::meta::FsDir;
 use curvine_server::master::Master;
@@ -41,6 +41,31 @@ fn test_inode_dir_add_children_and_sort_alphabetically() {
     assert_eq!(children[1].name(), "aa2");
     assert_eq!(children[2].name(), "aa3");
     assert_eq!(children[3].name(), "b");
+}
+
+#[test]
+fn directory_times_never_regress() {
+    let mut directory = InodeDir::new(1, 10);
+
+    directory.update_mtime(20);
+    directory.update_mtime(15);
+    directory.update_ctime(25);
+    directory.update_ctime(18);
+
+    assert_eq!(directory.mtime(), 20);
+    assert_eq!(directory.ctime(), 25);
+}
+
+#[test]
+fn large_list_limit_is_bounded_by_sharded_directory_size() {
+    let mut root = InodeDir::new(0, 0);
+    for id in 0..257 {
+        root.add_file_child(&format!("file-{id:04}"), InodeFile::new(id + 1, 0))
+            .unwrap();
+    }
+
+    let entries = root.list_options(&ListOptions::with_limit(i32::MAX as usize));
+    assert_eq!(entries.len(), 257);
 }
 
 #[test]
@@ -93,6 +118,164 @@ fn test_rocks_inode_store_add_delete_child_and_iterator() -> CommonResult<()> {
     println!("vec = {:?}", vec);
     assert_eq!(vec, vec![2, 3]);
 
+    Ok(())
+}
+
+#[test]
+fn directory_attribute_merge_survives_store_reopen() -> CommonResult<()> {
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/directory-attributes-{}",
+        Utils::rand_str(6)
+    )));
+    let directory_id = 701;
+    {
+        let db = RocksInodeStore::new(conf.clone(), true)?;
+        let mut batch = db.new_batch();
+        batch.write_directory_attributes(directory_id, DirectoryAttributes::new(10, 10, 2))?;
+        batch.merge_directory_attributes(directory_id, DirectoryAttributeDelta::for_child(15))?;
+        batch.merge_directory_attributes(directory_id, DirectoryAttributeDelta::new(14, 18, -1))?;
+        batch.commit()?;
+
+        assert_eq!(
+            db.get_directory_attributes(directory_id)?,
+            Some(DirectoryAttributes::new(15, 18, 1))
+        );
+    }
+
+    let db = RocksInodeStore::new(conf, false)?;
+    assert_eq!(
+        db.get_directory_attributes(directory_id)?,
+        Some(DirectoryAttributes::new(15, 18, 1))
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_attribute_merge_initializes_missing_base_once() -> CommonResult<()> {
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/directory-attributes-initial-{}",
+        Utils::rand_str(6)
+    )));
+    let directory_id = 702;
+    let base = DirectoryAttributes::new(10, 10, 2);
+    let db = RocksInodeStore::new(conf, true)?;
+    let mut batch = db.new_batch();
+    batch.merge_directory_attributes(
+        directory_id,
+        DirectoryAttributeDelta::new(15, 15, 1).with_base(base),
+    )?;
+    batch.merge_directory_attributes(
+        directory_id,
+        DirectoryAttributeDelta::new(20, 20, 1).with_base(base),
+    )?;
+    batch.commit()?;
+
+    assert_eq!(
+        db.get_directory_attributes(directory_id)?,
+        Some(DirectoryAttributes::new(20, 20, 4))
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_attribute_merge_rejects_conflicting_missing_bases() -> CommonResult<()> {
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/directory-attributes-conflict-{}",
+        Utils::rand_str(6)
+    )));
+    let directory_id = 703;
+    let db = RocksInodeStore::new(conf, true)?;
+    let mut batch = db.new_batch();
+    batch.merge_directory_attributes(
+        directory_id,
+        DirectoryAttributeDelta::new(15, 15, 1).with_base(DirectoryAttributes::new(10, 10, 2)),
+    )?;
+    batch.merge_directory_attributes(
+        directory_id,
+        DirectoryAttributeDelta::new(20, 20, 1).with_base(DirectoryAttributes::new(11, 11, 2)),
+    )?;
+    if batch.commit().is_ok() {
+        assert!(db.get_directory_attributes(directory_id).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn directory_attribute_base_is_created_when_a_new_directory_becomes_parent() -> CommonResult<()> {
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/directory-attribute-create-{}",
+        Utils::rand_str(6)
+    )));
+    let store = InodeStore::new(
+        RocksInodeStore::new(conf, true)?,
+        Arc::new(TtlBucketList::new(60_000)?),
+    )?;
+    store.initialize_root_directory_attributes()?;
+
+    let root = FsDir::create_root();
+    let parent = InodeView::new_dir("parent".to_string(), InodeDir::new(801, 10));
+    let child = InodeView::new_dir("child".to_string(), InodeDir::new(802, 20));
+    let file = InodeView::new_file("file".to_string(), InodeFile::new(803, 30));
+
+    store.apply_add(&root, &parent, None)?;
+    assert_eq!(store.store().get_directory_attributes(parent.id())?, None);
+
+    store.apply_add(&parent, &child, None)?;
+    assert_eq!(
+        store.store().get_directory_attributes(parent.id())?,
+        Some(DirectoryAttributes::new(20, 20, 3))
+    );
+
+    store.apply_add(&child, &file, None)?;
+    assert_eq!(
+        store.store().get_directory_attributes(child.id())?,
+        Some(DirectoryAttributes::new(30, 30, 2))
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_attribute_migration_is_idempotent() -> CommonResult<()> {
+    let conf = DBConf::new(Utils::test_sub_dir(format!(
+        "inode-test/directory-attribute-migration-{}",
+        Utils::rand_str(6)
+    )));
+    let store = InodeStore::new(
+        RocksInodeStore::new(conf, true)?,
+        Arc::new(TtlBucketList::new(60_000)?),
+    )?;
+    let root = FsDir::create_root();
+    let directory = InodeView::new_dir("dir".to_string(), InodeDir::new(702, 20));
+
+    {
+        let mut batch = store.new_batch();
+        batch.write_inode(&root)?;
+        batch.write_inode(&directory)?;
+        batch.add_child(ROOT_INODE_ID, "dir", directory.id())?;
+        batch.commit()?;
+    }
+
+    store.migrate_directory_attributes()?;
+    assert_eq!(
+        store.store().get_directory_attributes(ROOT_INODE_ID)?,
+        Some(DirectoryAttributes::new(0, 0, 2))
+    );
+    assert_eq!(
+        store.store().get_directory_attributes(directory.id())?,
+        Some(DirectoryAttributes::new(20, 20, 2))
+    );
+
+    {
+        let mut batch = store.new_batch();
+        batch
+            .merge_directory_attributes(directory.id(), DirectoryAttributeDelta::new(30, 30, 1))?;
+        batch.commit()?;
+    }
+    store.migrate_directory_attributes()?;
+    assert_eq!(
+        store.store().get_directory_attributes(directory.id())?,
+        Some(DirectoryAttributes::new(30, 30, 3))
+    );
     Ok(())
 }
 

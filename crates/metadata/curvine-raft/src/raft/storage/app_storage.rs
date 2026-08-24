@@ -19,10 +19,16 @@ use raft::StateRole;
 use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::storage::ApplyMsg;
 use crate::raft::RaftResult;
+use raft::eraftpb::Entry;
 
 /// Application layer storage.
 /// Replay raft log
 pub trait AppStorage: Clone + Send + Sync + 'static {
+    /// Fence hook invoked before replaying committed entries.
+    fn before_apply_entries(&self, _entries: &[Entry]) -> RaftResult<()> {
+        Ok(())
+    }
+
     fn apply(&self, wait: bool, msg: ApplyMsg) -> impl Future<Output = RaftResult<()>> + Send;
 
     fn get_fsm_state(&self) -> FsmState;

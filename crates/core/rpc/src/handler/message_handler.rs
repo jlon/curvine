@@ -19,6 +19,8 @@ use curvine_io::DataSlice;
 use curvine_runtime::runtime::Runtime;
 use log::info;
 use std::future::Future;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Message Processors.
 pub trait MessageHandler: Send + Sync + 'static {
@@ -45,6 +47,13 @@ pub trait MessageHandler: Send + Sync + 'static {
     }
 
     fn get_rt(&self, _msg: &Message) -> Option<&Runtime> {
+        None
+    }
+
+    // Returns the admission gate for this request. Acquiring the permit is
+    // asynchronous, so overloaded handlers apply backpressure without blocking
+    // a runtime thread or rejecting a healthy request.
+    fn request_admission(&self, _msg: &Message) -> Option<Arc<Semaphore>> {
         None
     }
 }

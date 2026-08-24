@@ -59,6 +59,12 @@ pub struct MasterMetrics {
 
     pub(crate) operation_duration: HistogramVec,
 
+    // Metadata readers normally complete through version validation. These
+    // counters only record the exceptional progress paths, keeping the hot
+    // read path free of observability work.
+    pub(crate) metadata_read_fallback_total: CounterVec,
+    pub(crate) metadata_topology_quiesce_total: Counter,
+
     // for quota eviction (LRU)
     pub(crate) eviction_lru_cache_size: Gauge,
     pub(crate) eviction_trigger_count: Counter,
@@ -150,6 +156,16 @@ impl MasterMetrics {
                 &buckets,
             )?,
 
+            metadata_read_fallback_total: m::new_counter_vec(
+                "metadata_read_fallback_total",
+                "Metadata reads that exhausted optimistic validation by fallback stage",
+                &["stage"],
+            )?,
+            metadata_topology_quiesce_total: m::new_counter(
+                "metadata_topology_quiesce_total",
+                "Metadata reads that temporarily quiesced topology writes for progress",
+            )?,
+
             // Quota eviction metrics
             eviction_lru_cache_size: m::new_gauge(
                 "eviction_lru_cache_size",
@@ -203,18 +219,16 @@ impl MasterMetrics {
             self.blocks_size_avg.set(avg_size);
         }
 
-        let fs_dir = fs.fs_dir.read();
-        let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
+        let rocksdb_metrics = fs.get_rocksdb_metrics()?;
         for (key, value) in rocksdb_metrics {
             self.rocksdb_metrics
                 .with_label_values(&[&key])
                 .set(value as i64);
         }
 
-        let ttl_list = fs_dir.get_ttl_bucket_list();
-        drop(fs_dir);
-        self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
-        self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
+        let (ttl_bucket_len, ttl_total_inodes) = fs.ttl_bucket_counts();
+        self.ttl_bucket_len.set(ttl_bucket_len as i64);
+        self.ttl_total_inodes.set(ttl_total_inodes as i64);
 
         self.worker_num
             .with_label_values(&["live"])

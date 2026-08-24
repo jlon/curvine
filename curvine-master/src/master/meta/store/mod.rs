@@ -14,6 +14,13 @@
 
 mod inode_store;
 pub use self::inode_store::InodeStore;
+pub(crate) use self::inode_store::RenameStoreRequest;
 
 mod rocks_inode_store;
 pub use self::rocks_inode_store::*;
+
+mod store_handle;
+pub use self::store_handle::{RocksStoreHandle, RocksStoreReadGuard};
+
+mod store_path_resolver;
+pub use self::store_path_resolver::*;

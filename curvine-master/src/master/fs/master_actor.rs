@@ -86,13 +86,7 @@ impl MasterActor {
     pub fn start_ttl_scheduler(&mut self) -> CommonResult<()> {
         info!("Starting inode ttl scheduler.");
 
-        let ttl_bucket_list = {
-            let fs_dir_lock = self.fs.fs_dir();
-            let fs_dir = fs_dir_lock.read();
-            fs_dir.get_ttl_bucket_list()
-        };
-
-        let ttl_manager = InodeTtlManager::new(self.fs.clone(), ttl_bucket_list)?;
+        let ttl_manager = InodeTtlManager::new(self.fs.clone(), self.fs.ttl_bucket_list())?;
 
         let ttl_manager_arc = Arc::new(ttl_manager);
 

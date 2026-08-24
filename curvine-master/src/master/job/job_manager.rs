@@ -14,7 +14,7 @@
 
 use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobContext, JobStore, LoadJobRunner, MountManager};
+use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext, CommonResult};
@@ -42,7 +42,6 @@ pub struct JobManager {
     transfer_enabled: bool,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
-    terminal_retention: Duration,
     job_max_files: usize,
     run_seq: Arc<AtomicCounter>,
     load_job_semaphore: Arc<Semaphore>,
@@ -66,7 +65,6 @@ impl JobManager {
             transfer_enabled: conf.transfer.enabled,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
-            terminal_retention: conf.job.terminal_retention,
             job_max_files: conf.job.job_max_files,
             run_seq: Arc::new(AtomicCounter::new(0)),
             load_job_semaphore: Arc::new(Semaphore::new(conf.job.master_max_concurrent_load_jobs)),
@@ -76,14 +74,12 @@ impl JobManager {
     /// Start the job manager
     pub fn start(&self) -> CommonResult<()> {
         let cleanup_interval = self.job_cleanup_ttl.as_millis() as u64;
-        let running_ttl_ms = duration_ms(self.job_life_ttl);
-        let terminal_retention_ms = duration_ms(self.terminal_retention);
+        let ttl_ms = self.job_life_ttl.as_millis() as i64;
 
         let executor = ScheduledExecutor::new("job_cleanup", cleanup_interval);
         executor.start(JobCleanupTask {
             jobs: self.jobs.clone(),
-            running_ttl_ms,
-            terminal_retention_ms,
+            ttl_ms,
         })?;
 
         info!("JobManager started");
@@ -150,11 +146,34 @@ impl JobManager {
             self.factory.clone(),
             self.job_max_files,
             self.run_seq.clone(),
+            true,
+        )
+    }
+
+    pub fn create_replay_runner(&self) -> LoadJobRunner {
+        LoadJobRunner::new(
+            self.jobs.clone(),
+            self.master_fs.clone(),
+            self.factory.clone(),
+            self.job_max_files,
+            self.run_seq.clone(),
+            false,
         )
     }
 
     pub fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         if let Some(mnt) = self.mount_manager.get_mount_info(path)? {
+            let mnt_value = self.factory.get_mnt(&mnt)?;
+            let target_path = mnt_value.toggle_path(path)?;
+
+            Ok(Some((target_path, mnt_value)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_mnt_for_replay(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+        if let Some(mnt) = self.mount_manager.get_mount_info_unchecked(path)? {
             let mnt_value = self.factory.get_mnt(&mnt)?;
             let target_path = mnt_value.toggle_path(path)?;
 
@@ -293,42 +312,7 @@ impl JobManager {
 
 struct JobCleanupTask {
     jobs: JobStore,
-    running_ttl_ms: i64,
-    terminal_retention_ms: i64,
-}
-
-struct ExpiredJob {
-    job_id: String,
-    run_id: u64,
-}
-
-impl JobCleanupTask {
-    fn is_expired(&self, job: &JobContext, now: i64) -> bool {
-        let state: JobTaskState = job.state.state();
-        let expired_at = if state.is_finish() {
-            let terminal_at = if job.progress.update_time > 0 {
-                job.progress.update_time
-            } else {
-                job.info.create_time
-            };
-            terminal_at.saturating_add(self.terminal_retention_ms)
-        } else {
-            job.info.create_time.saturating_add(self.running_ttl_ms)
-        };
-
-        now > expired_at
-    }
-
-    fn remove_expired_job(&self, expired_job: ExpiredJob) -> FsResult<()> {
-        let now = LocalTime::mills() as i64;
-        if let Some(v) = self.jobs.remove_job_if(&expired_job.job_id, |job| {
-            job.run_id == expired_job.run_id && self.is_expired(job, now)
-        })? {
-            debug!("Removing expired job: {:?}", v.1.info);
-        }
-
-        Ok(())
-    }
+    ttl_ms: i64,
 }
 
 impl LoopTask for JobCleanupTask {
@@ -340,16 +324,15 @@ impl LoopTask for JobCleanupTask {
         let now = LocalTime::mills() as i64;
         for entry in self.jobs.iter() {
             let job = entry.value();
-            if self.is_expired(job, now) {
-                jobs_to_remove.push(ExpiredJob {
-                    job_id: job.info.job_id.clone(),
-                    run_id: job.run_id,
-                });
+            if now > self.ttl_ms + job.info.create_time {
+                jobs_to_remove.push(job.info.job_id.clone());
             }
         }
 
-        for expired_job in jobs_to_remove {
-            self.remove_expired_job(expired_job)?;
+        for job_id in jobs_to_remove {
+            if let Some(v) = self.jobs.remove(&job_id) {
+                debug!("Removing expired job: {:?}", v.1.info);
+            }
         }
 
         Ok(())
@@ -357,169 +340,5 @@ impl LoopTask for JobCleanupTask {
 
     fn terminate(&self) -> bool {
         false
-    }
-}
-
-fn duration_ms(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::job_store::JobCallback;
-    use super::*;
-    use curvine_config::ClientConf;
-    use curvine_model::MountInfo;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    fn test_job_context(
-        job_id: &str,
-        state: JobTaskState,
-        create_time: i64,
-        update_time: i64,
-    ) -> JobContext {
-        let command = LoadJobCommand::builder("file://source").build();
-        let mount = MountInfo::default();
-        let mut job = JobContext::with_conf(
-            &command,
-            job_id.to_string(),
-            "file://source".to_string(),
-            "/mnt/source".to_string(),
-            &mount,
-            &ClientConf::default(),
-            1,
-        );
-        job.info.create_time = create_time;
-        job.progress.update_time = update_time;
-        job.state.advance_state(state, true);
-        job
-    }
-
-    #[test]
-    fn cleanup_uses_short_retention_for_terminal_jobs() -> FsResult<()> {
-        let store = JobStore::new();
-        let now = LocalTime::mills() as i64;
-        let old = now - 20_000;
-
-        store.insert(
-            "old-completed".to_string(),
-            test_job_context("old-completed", JobTaskState::Completed, old, old),
-        );
-        store.insert(
-            "old-failed".to_string(),
-            test_job_context("old-failed", JobTaskState::Failed, old, old),
-        );
-        store.insert(
-            "old-canceled".to_string(),
-            test_job_context("old-canceled", JobTaskState::Canceled, old, old),
-        );
-        store.insert(
-            "old-running".to_string(),
-            test_job_context("old-running", JobTaskState::Loading, old, old),
-        );
-        store.insert(
-            "recent-completed".to_string(),
-            test_job_context("recent-completed", JobTaskState::Completed, old, now),
-        );
-
-        let cleanup = JobCleanupTask {
-            jobs: store.clone(),
-            running_ttl_ms: 60_000,
-            terminal_retention_ms: 1_000,
-        };
-        cleanup.run()?;
-
-        assert!(store.get("old-completed").is_none());
-        assert!(store.get("old-failed").is_none());
-        assert!(store.get("old-canceled").is_none());
-        assert!(store.get("old-running").is_some());
-        assert!(store.get("recent-completed").is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_removes_callbacks_with_expired_job() -> FsResult<()> {
-        let store = JobStore::new();
-        let job_id = "callback-job";
-        let now = LocalTime::mills() as i64;
-        let old = now - 20_000;
-
-        store.insert(
-            job_id.to_string(),
-            test_job_context(job_id, JobTaskState::Failed, old, old),
-        );
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = calls.clone();
-        store.register_callback(
-            job_id.to_string(),
-            JobCallback::new(move |_, _, _, _| {
-                callback_calls.fetch_add(1, Ordering::Relaxed);
-            }),
-        )?;
-
-        let cleanup = JobCleanupTask {
-            jobs: store.clone(),
-            running_ttl_ms: 60_000,
-            terminal_retention_ms: 1_000,
-        };
-        cleanup.run()?;
-        assert!(store.get(job_id).is_none());
-
-        store.insert(
-            job_id.to_string(),
-            test_job_context(job_id, JobTaskState::Pending, now, 0),
-        );
-        store.update_state(job_id, JobTaskState::Failed, "fresh failure")?;
-
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_does_not_remove_replaced_job_with_same_id() -> FsResult<()> {
-        let store = JobStore::new();
-        let job_id = "replaced-job";
-        let now = LocalTime::mills() as i64;
-        let old = now - 20_000;
-
-        store.insert(
-            job_id.to_string(),
-            test_job_context(job_id, JobTaskState::Completed, old, old),
-        );
-
-        let expired_job = ExpiredJob {
-            job_id: job_id.to_string(),
-            run_id: 1,
-        };
-
-        let mut fresh_job = test_job_context(job_id, JobTaskState::Pending, now, 0);
-        fresh_job.run_id = 2;
-        store.insert(job_id.to_string(), fresh_job);
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = calls.clone();
-        store.register_callback(
-            job_id.to_string(),
-            JobCallback::new(move |_, _, _, _| {
-                callback_calls.fetch_add(1, Ordering::Relaxed);
-            }),
-        )?;
-
-        let cleanup = JobCleanupTask {
-            jobs: store.clone(),
-            running_ttl_ms: 60_000,
-            terminal_retention_ms: 1_000,
-        };
-        cleanup.remove_expired_job(expired_job)?;
-
-        let job = store.get(job_id).expect("fresh job should not be removed");
-        assert_eq!(job.run_id, 2);
-        drop(job);
-
-        store.update_state(job_id, JobTaskState::Failed, "fresh failure")?;
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        Ok(())
     }
 }

@@ -14,6 +14,7 @@
 
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
+use curvine_error::FsError;
 use curvine_fs_api::CurvineURI;
 use curvine_model::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
@@ -22,17 +23,18 @@ use curvine_model::{
 use curvine_net::net::NetUtils;
 use curvine_raft::proto::raft::{AppliedIndex, FsmState, SnapshotData, SnapshotFileList};
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
-use curvine_raft::raft::{NodeId, RaftPeer};
+use curvine_raft::raft::{NodeId, RaftError, RaftPeer};
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{FileUtils, Logger, TimeSpent, Utils};
 use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{
-    JournalBatch, JournalEntry, JournalLoader, JournalSystem, UfsLoader,
+    JournalBatch, JournalEntry, JournalLoader, JournalSystem, SnapshotManifest, UfsLoader,
 };
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use raft::eraftpb::Entry;
+use raft::eraftpb::{Entry, EntryType};
+use raft::StateRole;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
@@ -56,6 +58,21 @@ fn replay_entries(
             loader.apply(true, ApplyMsg::new_entry(entry)).await?;
         }
         Ok(())
+    })
+}
+
+fn build_raft_entry(
+    index: u64,
+    term: u64,
+    entry: curvine_server::master::journal::JournalEntry,
+) -> CommonResult<Entry> {
+    let mut batch = JournalBatch::new(index);
+    batch.push(entry);
+    Ok(Entry {
+        term,
+        index,
+        data: SerdeUtils::serialize(&batch)?,
+        ..Default::default()
     })
 }
 
@@ -96,6 +113,111 @@ fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
     ));
     std::fs::create_dir_all(&dir)?;
     CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
+#[test]
+fn snapshot_manifest_accepts_legacy_checkpoint_without_manifest() -> CommonResult<()> {
+    let dir = Utils::test_sub_dir("journal-test/legacy-checkpoint-without-manifest");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(std::path::Path::new(&dir).join("CURRENT"), b"legacy")?;
+
+    SnapshotManifest::validate_checkpoint_if_present(&dir, 1, 1)?;
+    Ok(())
+}
+
+#[test]
+fn test_new_leader_applies_previous_term_metadata_entry() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let path = "/previous-term-dir";
+    let mut source_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    source_conf.change_test_meta_dir("journal-previous-term-source");
+    let source_fs = JournalSystem::fs_only_for_test(&source_conf)?;
+    source_fs.mkdir(path, false)?;
+    let entry = match source_fs.fs_dir.read().take_entries().into_iter().next() {
+        Some(entry) => entry,
+        None => return err_box!("expected mkdir journal entry"),
+    };
+    let raft_entry = build_raft_entry(3, 1, entry)?;
+
+    let mut target_conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    target_conf.change_test_meta_dir("journal-previous-term-target");
+    let target_js = JournalSystem::from_conf(&target_conf)?;
+    let target_fs = target_js.fs();
+    let loader = target_js.journal_loader();
+
+    let rt = AsyncRuntime::single();
+    rt.block_on(async {
+        loader.role_change(StateRole::Leader).await?;
+        Ok::<(), RaftError>(())
+    })?;
+
+    let empty_entry = Entry {
+        term: 1,
+        index: 1,
+        ..Default::default()
+    };
+    target_js.append_test_entries(std::slice::from_ref(&empty_entry), 2, 1)?;
+    loader.before_apply_entries(std::slice::from_ref(&empty_entry))?;
+    target_fs.file_status("/")?;
+
+    let conf_change_entry = Entry {
+        term: 1,
+        index: 2,
+        entry_type: EntryType::EntryConfChange.into(),
+        data: vec![1],
+        ..Default::default()
+    };
+    target_js.append_test_entries(std::slice::from_ref(&conf_change_entry), 2, 2)?;
+    loader.before_apply_entries(std::slice::from_ref(&conf_change_entry))?;
+    target_fs.file_status("/")?;
+
+    rt.block_on(async {
+        loader
+            .apply(true, ApplyMsg::new_scan(AppliedIndex::default()))
+            .await?;
+        Ok::<(), RaftError>(())
+    })?;
+    target_fs.file_status("/")?;
+
+    target_js.append_test_entries(std::slice::from_ref(&raft_entry), 2, 3)?;
+    loader.before_apply_entries(std::slice::from_ref(&raft_entry))?;
+    assert!(matches!(
+        target_fs.file_status(path).unwrap_err(),
+        FsError::NotLeaderMaster(_)
+    ));
+
+    rt.block_on(async {
+        loader.apply(true, ApplyMsg::new_entry(raft_entry)).await?;
+        Ok::<(), RaftError>(())
+    })?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match target_fs.file_status(path) {
+            Ok(status) => {
+                assert!(status.is_dir);
+                break;
+            }
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return err_box!(
+                        "previous-term metadata entry was not applied before leader served reads: {}",
+                        error
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
@@ -537,6 +659,9 @@ fn test_apply_snapshot_refuses_empty_over_populated_files() -> CommonResult<()> 
             msg
         );
     }
+
+    fs.mkdir("/after-restore-a", true)?;
+    fs.mkdir("/after-restore-b", true)?;
 
     // Rebuild a populated FS with files: empty checkpoint must be refused.
     fs.mkdir("/with-files", true)?;

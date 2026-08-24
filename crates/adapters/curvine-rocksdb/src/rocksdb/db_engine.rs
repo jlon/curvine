@@ -113,6 +113,13 @@ impl DBEngine {
         Ok(cf_bytes)
     }
 
+    pub fn snapshot_reader(&self) -> DBSnapshotReader<'_> {
+        DBSnapshotReader {
+            engine: self,
+            snapshot: self.db.snapshot(),
+        }
+    }
+
     pub fn batched_multi_get_cf<'a, K, I>(
         &'a self,
         cf: &str,
@@ -334,6 +341,29 @@ impl DBEngine {
         Ok(res)
     }
 
+    /// Reads a batch while preserving one result slot per input key.
+    ///
+    /// Callers that need to distinguish a missing key from the following key's
+    /// value must use this instead of `multi_get_cf`, which intentionally
+    /// filters absent values for its existing bulk-read callers.
+    pub fn multi_get_cf_optional<'a, K, I>(
+        &self,
+        cf: &str,
+        keys: I,
+    ) -> CommonResult<Vec<Option<Vec<u8>>>>
+    where
+        K: AsRef<[u8]> + 'a,
+        I: IntoIterator<Item = &'a K>,
+    {
+        let cf = self.cf(cf)?;
+        let keys_iter = keys.into_iter().map(|key| (cf, key));
+        self.db
+            .multi_get_cf(keys_iter)
+            .into_iter()
+            .map(|value| value.map_err(Into::into))
+            .collect()
+    }
+
     pub fn get_checkpoint_path(&self, id: u64) -> String {
         format!("{}/ck-{}", self.conf.checkpoint_dir, id)
     }
@@ -512,6 +542,85 @@ impl DBEngine {
 
     pub fn conf(&self) -> &DBConf {
         &self.conf
+    }
+}
+
+pub struct DBSnapshotReader<'a> {
+    engine: &'a DBEngine,
+    snapshot: SnapshotWithThreadMode<'a, DB>,
+}
+
+impl DBSnapshotReader<'_> {
+    pub fn get_cf<K>(&self, cf: &str, key: K) -> CommonResult<Option<Vec<u8>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let cf = self.engine.cf(cf)?;
+        let opt = self.engine.conf.create_read_opt();
+        Ok(try_err!(self.snapshot.get_cf_opt(cf, key, opt)))
+    }
+
+    pub fn multi_get_cf<K, I>(
+        &self,
+        cf: &str,
+        keys: I,
+    ) -> CommonResult<Vec<Result<Option<Vec<u8>>, Error>>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        let cf = self.engine.cf(cf)?;
+        let opt = self.engine.conf.create_read_opt();
+        let keys_iter = keys.into_iter().map(|key| (cf, key));
+        Ok(self.snapshot.multi_get_cf_opt(keys_iter, opt))
+    }
+
+    pub fn range_scan<K>(
+        &self,
+        cf: &str,
+        start: K,
+        end: K,
+        total_order_seek: bool,
+    ) -> CommonResult<RocksIterator<'_>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut opt = self.engine.conf.create_read_opt();
+        opt.set_iterate_lower_bound(start.as_ref());
+        opt.set_iterate_upper_bound(end.as_ref());
+        opt.set_total_order_seek(total_order_seek);
+
+        let cf = self.engine.cf(cf)?;
+        let mode = IteratorMode::From(start.as_ref(), Direction::Forward);
+        let iter = self.snapshot.iterator_cf_opt(cf, opt, mode);
+        Ok(RocksIterator { inner: iter })
+    }
+
+    pub fn prefix_scan<K>(&self, cf: &str, prefix: K) -> CommonResult<RocksIterator<'_>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut opt = self.engine.conf.create_read_opt();
+        opt.set_prefix_same_as_start(true);
+
+        let start = prefix.as_ref();
+        let end = RocksUtils::calculate_end_bytes(start);
+        opt.set_iterate_lower_bound(start);
+        opt.set_iterate_upper_bound(end);
+
+        let cf = self.engine.cf(cf)?;
+        let mode = IteratorMode::From(start, Direction::Forward);
+        let iter = self.snapshot.iterator_cf_opt(cf, opt, mode);
+        Ok(RocksIterator { inner: iter })
+    }
+
+    pub fn prefix_scan_total_order<K>(&self, cf: &str, prefix: K) -> CommonResult<RocksIterator<'_>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let start = prefix.as_ref();
+        let end = RocksUtils::calculate_end_bytes(start);
+        self.range_scan(cf, start, end.as_slice(), true)
     }
 }
 

@@ -68,5 +68,6 @@ chrono = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
+fxhash = { workspace = true }
 curvine-fault = { workspace = true, features = ["http-client"] }
 raft = { workspace = true }

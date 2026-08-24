@@ -42,6 +42,10 @@ impl RenameFlags {
         RenameFlags::from_bits_truncate(value)
     }
 
+    pub fn try_new(value: u32) -> Option<Self> {
+        RenameFlags::from_bits(value)
+    }
+
     pub fn value(&self) -> u32 {
         self.bits()
     }
@@ -64,5 +68,9 @@ impl RenameFlags {
 
     pub fn exchange_mode(&self) -> bool {
         *self == RenameFlags::EXCHANGE
+    }
+
+    pub fn is_supported(&self) -> bool {
+        self.is_empty() || *self == RenameFlags::NO_REPLACE || *self == RenameFlags::EXCHANGE
     }
 }

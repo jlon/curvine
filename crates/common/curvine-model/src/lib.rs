@@ -104,6 +104,9 @@ pub use self::open_flags::*;
 mod rename_flags;
 pub use self::rename_flags::*;
 
+mod directory_attributes;
+pub use self::directory_attributes::{DirectoryAttributeDelta, DirectoryAttributes};
+
 mod file_alloc;
 pub use self::file_alloc::*;
 

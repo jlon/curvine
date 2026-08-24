@@ -12,10 +12,64 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use curvine_config::DBConf;
-
+pub use curvine_config::{CfMergeOperator, DBConf};
+use curvine_model::{DirectoryAttributeDelta, DirectoryAttributes};
 use rocksdb::*;
 use std::ffi::c_int;
+
+fn apply_merge_operator(merge_operator: &CfMergeOperator, options: &mut Options) {
+    match merge_operator {
+        CfMergeOperator::DirectoryAttributes => options.set_merge_operator(
+            "curvine-directory-attributes-v1",
+            merge_directory_attributes,
+            merge_directory_attribute_deltas,
+        ),
+    }
+}
+
+fn merge_directory_attributes(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut attributes = match existing {
+        Some(value) => Some(DirectoryAttributes::decode(value)?),
+        None => None,
+    };
+    let mut initial_base = None;
+    for operand in operands {
+        let delta = DirectoryAttributeDelta::decode(operand)?;
+        if attributes.is_none() {
+            let base = delta.base()?;
+            attributes = Some(base);
+            initial_base = Some(base);
+        } else if let Some(base) = initial_base {
+            if let Some(candidate) = delta.base() {
+                if candidate != base {
+                    return None;
+                }
+            }
+        }
+        attributes.as_mut()?.apply(delta)?;
+    }
+    Some(attributes?.encode().to_vec())
+}
+
+fn merge_directory_attribute_deltas(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut combined = existing.and_then(DirectoryAttributeDelta::decode);
+    for operand in operands {
+        let delta = DirectoryAttributeDelta::decode(operand)?;
+        combined = Some(match combined {
+            Some(previous) => previous.combine(delta)?,
+            None => delta,
+        });
+    }
+    Some(combined?.encode().to_vec())
+}
 
 pub trait DBConfExt {
     fn create_cache(&self) -> Cache;
@@ -128,7 +182,11 @@ impl DBConfExt for DBConf {
 
         let mut cfs = Vec::new();
         for family_name in &self.family_list {
-            cfs.push((family_name.to_string(), opts.clone()));
+            let mut cf_opts = opts.clone();
+            if let Some(merge_operator) = self.cf_merge_operators.get(family_name) {
+                apply_merge_operator(merge_operator, &mut cf_opts);
+            }
+            cfs.push((family_name.to_string(), cf_opts));
         }
         cfs
     }

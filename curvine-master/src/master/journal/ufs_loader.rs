@@ -54,7 +54,7 @@ impl UfsLoader {
     }
 
     fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
-        match self.job_manager.get_mnt(path)? {
+        match self.job_manager.get_mnt_for_replay(path)? {
             Some((path, mnt)) if mnt.info.is_fs_mode() => Ok(Some((path, mnt))),
 
             _ => Ok(None),
@@ -82,7 +82,7 @@ impl UfsLoader {
 
     pub async fn submit_export_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         let command = LoadJobCommand::builder(path.clone_uri()).build();
-        let runner = self.job_manager.create_runner();
+        let runner = self.job_manager.create_replay_runner();
         let res = match runner.submit_export_task(command, mnt.info.clone()).await {
             Ok(res) => res,
             Err(e) => {

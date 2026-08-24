@@ -58,3 +58,5 @@ curvine-tests/regression_result
 .agents/skills/*
 !.agents/skills/cv-*/
 .codegraph/
+.debug/
+omo/

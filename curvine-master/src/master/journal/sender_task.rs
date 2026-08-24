@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{JournalBatch, JournalEntry};
+use crate::master::journal::{JournalBatch, JournalEntry, QueuedJournalEntry};
 use crate::master::{Master, MasterMetrics};
 use curvine_config::JournalConf;
 use curvine_core_error::CommonResult;
@@ -21,7 +21,9 @@ use curvine_raft::raft::RaftClient;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, TimeSpent};
 use curvine_runtime::sync::channel::BlockingReceiver;
-use std::sync::mpsc::RecvTimeoutError;
+use std::mem;
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -32,6 +34,7 @@ pub struct SenderTask {
     pub(crate) flush_batch_size: u64,
     pub(crate) last_flush_ms: u64,
     pub(crate) metrics: &'static MasterMetrics,
+    committed: Vec<SyncSender<()>>,
 }
 
 impl SenderTask {
@@ -43,13 +46,14 @@ impl SenderTask {
             flush_batch_size: conf.writer_flush_batch_size,
             last_flush_ms: LocalTime::mills(),
             metrics: Master::get_metrics()?,
+            committed: vec![],
         };
 
         Ok(sender)
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: BlockingReceiver<QueuedJournalEntry>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -63,7 +67,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: BlockingReceiver<JournalEntry>,
+        receiver: BlockingReceiver<QueuedJournalEntry>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -77,30 +81,77 @@ impl SenderTask {
                     return Ok(());
                 }
             };
-            task.handle(event)?;
+            task.handle_with_receiver(event, &receiver)?;
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        let force = if let Some(v) = entry {
-            let force = matches!(v, JournalEntry::Snapshot(_));
-            self.batch.push(v);
-            self.metrics.journal_queue_len.dec();
-            force
-        } else {
-            false
-        };
+    pub fn handle(&mut self, entry: Option<QueuedJournalEntry>) -> FsResult<()> {
+        self.handle_entry(entry, None)
+    }
+
+    fn handle_with_receiver(
+        &mut self,
+        entry: Option<QueuedJournalEntry>,
+        receiver: &BlockingReceiver<QueuedJournalEntry>,
+    ) -> FsResult<()> {
+        self.handle_entry(entry, Some(receiver))
+    }
+
+    fn handle_entry(
+        &mut self,
+        entry: Option<QueuedJournalEntry>,
+        receiver: Option<&BlockingReceiver<QueuedJournalEntry>>,
+    ) -> FsResult<()> {
+        let (force, wait_for_commit) = entry
+            .map(|entry| self.push_entry(entry))
+            .unwrap_or((false, false));
+
+        // A synchronous metadata RPC is waiting for this batch. Submit all work
+        // already queued behind it now, without waiting for more arrivals. This
+        // preserves batching under concurrency while avoiding one flush interval
+        // of added latency for sequential writes.
+        if wait_for_commit {
+            if let Some(receiver) = receiver {
+                self.drain_ready_entries(receiver);
+            }
+        }
 
         let len = self.batch.len() as u64;
         if len == 0 {
             return Ok(());
         }
 
-        if force || len >= self.flush_batch_size || self.flush_interval_elapsed() {
+        if force || wait_for_commit || len >= self.flush_batch_size || self.flush_interval_elapsed()
+        {
             self.flush_pending()?;
         }
 
         Ok(())
+    }
+
+    fn push_entry(&mut self, entry: QueuedJournalEntry) -> (bool, bool) {
+        let force = matches!(entry.entry, JournalEntry::Snapshot(_));
+        let wait_for_commit = entry.committed.is_some();
+        self.batch.push(entry.entry);
+        if let Some(committed) = entry.committed {
+            self.committed.push(committed);
+        }
+        self.metrics.journal_queue_len.dec();
+        (force, wait_for_commit)
+    }
+
+    fn drain_ready_entries(&mut self, receiver: &BlockingReceiver<QueuedJournalEntry>) {
+        while (self.batch.len() as u64) < self.flush_batch_size {
+            match receiver.try_recv() {
+                Ok(entry) => {
+                    let (is_snapshot, _) = self.push_entry(entry);
+                    if is_snapshot {
+                        return;
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
     }
 
     fn flush_interval_elapsed(&self) -> bool {
@@ -125,6 +176,10 @@ impl SenderTask {
         // Scroll to the next batch.
         self.batch.next();
         self.last_flush_ms = LocalTime::mills();
+
+        for committed in mem::take(&mut self.committed) {
+            let _ = committed.send(());
+        }
 
         Ok(())
     }

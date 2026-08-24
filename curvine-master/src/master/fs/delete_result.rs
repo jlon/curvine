@@ -21,6 +21,8 @@ pub struct DeleteResult {
     pub(crate) inodes: u64,
     // Which blocks need to be deleted
     pub(crate) blocks: HashMap<i64, Vec<BlockLocation>>,
+    // File inodes whose metadata changed while removing a subtree.
+    pub(crate) file_ids: Vec<i64>,
 }
 
 impl Default for DeleteResult {
@@ -34,6 +36,7 @@ impl DeleteResult {
         Self {
             inodes: 0,
             blocks: Default::default(),
+            file_ids: Default::default(),
         }
     }
 }

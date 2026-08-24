@@ -30,6 +30,59 @@ pub struct InodePath {
 }
 
 impl InodePath {
+    /// Resolves a path while the caller exclusively owns the namespace tree.
+    ///
+    /// The returned pointers may borrow directory entries, so callers must
+    /// keep the exclusive tree lock until the path is no longer used.
+    pub(crate) fn resolve_exclusive<T: AsRef<str>>(
+        root: InodePtr,
+        path: T,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
+        let components = InodeView::path_components(path.as_ref())?;
+        let name = try_option!(
+            components.last(),
+            "Path {} has no components",
+            path.as_ref()
+        );
+        if name.is_empty() {
+            return err_box!("Path {} is invalid", path.as_ref());
+        }
+
+        let mut inodes = Vec::with_capacity(components.len());
+        let mut current = root;
+        for index in 0..components.len() {
+            if index + 1 == components.len() {
+                let resolved = match current.as_ref() {
+                    FileEntry(entry) => InodePtr::from_owned(try_option!(
+                        store.get_inode(entry.id(), Some(entry.name()))?,
+                        "Failed to load inode {} from store",
+                        entry.id()
+                    )),
+                    _ => InodePtr::from_owned(current.as_ref().clone()),
+                };
+                inodes.push(resolved);
+                break;
+            }
+
+            let child = current
+                .as_ref()
+                .get_child_ptr_exclusive(components[index + 1].as_str());
+            inodes.push(current);
+            let Some(child) = child else {
+                break;
+            };
+            current = child;
+        }
+
+        Ok(Self {
+            path: path.as_ref().to_string(),
+            name: name.to_string(),
+            components,
+            inodes,
+        })
+    }
+
     pub fn resolve<T: AsRef<str>>(
         root: InodePtr,
         path: T,
@@ -47,42 +100,30 @@ impl InodePath {
         }
 
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
-        let mut cur_inode = root;
+        let mut cur_inode = InodePtr::from_owned(root.as_ref().clone());
         let mut index = 0;
 
         while index < components.len() {
-            //make sure resolved_inode is not a FileEntry
-            //if it is a FileEntry, load the complete file data from store
-            let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(f) => {
-                    // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(f.id(), Some(f.name()))? {
-                        Some(full_inode) => InodePtr::from_owned(full_inode),
-                        None => return err_box!("Failed to load inode {} from store", f.id()),
-                    }
-                }
-                _ => cur_inode.clone(),
-            };
-
-            inodes.push(resolved_inode);
-
             if index == components.len() - 1 {
+                let inode = Self::hydrate_inode(cur_inode.as_ref().clone(), store)?;
+                inodes.push(InodePtr::from_owned(inode));
                 break;
             }
 
+            let resolved_inode = Self::hydrate_inode(cur_inode.as_ref().clone(), store)?;
             index += 1;
             let child_name: &str = components[index].as_str();
-            match cur_inode.as_mut() {
-                Dir(d) => {
-                    if let Some(child) = d.get_child_ptr(child_name) {
-                        cur_inode = child;
-                    } else {
-                        // The directory has not been created, so there is no need to search again.
-                        break;
-                    }
+            let child = match &resolved_inode {
+                Dir(d) => d.get_child(child_name),
+                _ => None,
+            };
+            inodes.push(InodePtr::from_owned(resolved_inode));
+            match child {
+                Some(child) => cur_inode = InodePtr::from_owned(child),
+                None => {
+                    // The directory has not been created, so there is no need to search again.
+                    break;
                 }
-
-                _ => break,
             }
         }
 
@@ -94,6 +135,68 @@ impl InodePath {
         };
 
         Ok(inode_path)
+    }
+
+    /// Builds a path from a versioned metadata-reader walk.
+    ///
+    /// The caller must validate the corresponding directory versions while
+    /// holding the inode locks that protect this path before using the result.
+    pub(crate) fn from_views<T: AsRef<str>>(
+        path: T,
+        views: Vec<InodeView>,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
+        let components = InodeView::path_components(path.as_ref())?;
+        let name = try_option!(
+            components.last(),
+            "Path {} has no components",
+            path.as_ref()
+        );
+        if name.is_empty() {
+            return err_box!("Path {} is invalid", path.as_ref());
+        }
+        if views.is_empty() || views.len() > components.len() {
+            return err_box!(
+                "Path {} has {} resolved inode views for {} components",
+                path.as_ref(),
+                views.len(),
+                components.len()
+            );
+        }
+
+        let last_index = views.len() - 1;
+        let inodes = views
+            .into_iter()
+            .enumerate()
+            .map(|(index, inode)| {
+                if index == last_index {
+                    Self::hydrate_inode(inode, store)
+                } else {
+                    Ok(inode)
+                }
+                .map(InodePtr::from_owned)
+            })
+            .collect::<CommonResult<Vec<_>>>()?;
+
+        Ok(Self {
+            path: path.as_ref().to_string(),
+            name: name.to_string(),
+            components,
+            inodes,
+        })
+    }
+
+    fn hydrate_inode(inode: InodeView, store: &InodeStore) -> CommonResult<InodeView> {
+        let FileEntry(entry) = inode else {
+            return Ok(inode);
+        };
+        let mut stored = try_option!(
+            store.get_inode(entry.id(), Some(entry.name()))?,
+            "Failed to load inode {} from store",
+            entry.id()
+        );
+        stored.change_name(entry.name().to_string());
+        Ok(stored)
     }
 
     fn reconstruct_path_for_match(
@@ -109,7 +212,9 @@ impl InodePath {
 
         // Leaf
         match curr_node.as_ref() {
-            File(..) | Dir(..) => path_inodes_rebuild.push(curr_node.clone()),
+            File(..) | Dir(..) => {
+                path_inodes_rebuild.push(InodePtr::from_owned(curr_node.as_ref().clone()))
+            }
             FileEntry(e) => {
                 let resolved_leaf_node = match store.get_inode(e.id(), Some(e.name()))? {
                     Some(full_inode) => InodePtr::from_owned(full_inode),
@@ -195,7 +300,7 @@ impl InodePath {
         // Parent map: current inode id -> (index, parent inode id) for path reconstruction
         let mut parent_map: HashMap<i64, (i64, i64)> = HashMap::new();
         parent_map.insert(ROOT_INODE_ID, (0, EMPTY_PARENT_ID)); // Root has no parent
-        queue.push_back((0, root)); // Start BFS
+        queue.push_back((0, InodePtr::from_owned(root.as_ref().clone()))); // Start BFS
 
         while let Some((curr_index, curr_node)) = queue.pop_front() {
             if curr_index == components_length - 1 {
@@ -221,12 +326,12 @@ impl InodePath {
                             return err_box!("invalid glob pattern: {}", child_name_str);
                         };
                         if let Some(children) = d.get_child_ptr_by_glob_pattern(&glob_pattern) {
-                            for child_ptr in children.iter() {
+                            for child_ptr in children {
                                 parent_map.insert(
                                     child_ptr.as_ref().id(),
                                     (curr_index + 1, curr_node.id()),
                                 );
-                                queue.push_back((curr_index + 1, child_ptr.clone()));
+                                queue.push_back((curr_index + 1, child_ptr));
                             }
                         }
                     } else if let Some(child) = d.get_child_ptr(child_name_str) {

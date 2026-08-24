@@ -17,17 +17,18 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_fs_api::RpcCode;
 use curvine_fs_api::{CurvineURI, Path};
+use curvine_model::ListOptions;
 use curvine_model::MountOptions;
 use curvine_model::ProtoUtils;
 use curvine_model::{
     BlockLocation, BlockReportInfo, BlockReportList, BlockReportStatus, ClientAddress, CommitBlock,
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, LocatedBlock, MkdirOptsBuilder,
-    StorageType, TtlAction, WorkerAddress, WorkerInfo,
+    CreateFileOpts, CreateFileOptsBuilder, DirectoryAttributes, FileAllocOpts, FileLock,
+    LocatedBlock, LockFlags, LockType, MkdirOptsBuilder, OpenFlags, RenameFlags,
+    SetAttrOptsBuilder, StorageType, TtlAction, WorkerAddress, WorkerInfo,
 };
-use curvine_model::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_proto::{
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
+    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, OpenFileRequest, RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -38,7 +39,7 @@ use curvine_rpc::message::ResponseStatus;
 use curvine_runtime::common::LocalTime;
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::Utils;
-use curvine_runtime::runtime::{AsyncRuntime, GroupExecutor, RpcRuntime};
+use curvine_runtime::runtime::{AsyncRuntime, RpcRuntime};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::meta::inode::ttl::InodeTtlExecutor;
@@ -47,8 +48,13 @@ use curvine_server::master::replication::master_replication_manager::MasterRepli
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use prost::Message as ProtoMessage;
 use raft::eraftpb::Entry;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
+
+#[cfg(feature = "fault-injection")]
+use curvine_fault::{FaultRuleBuilder, FaultRuntime};
 
 #[cfg(feature = "fault-injection")]
 use curvine_fault::{FaultRuleBuilder, FaultRuntime};
@@ -236,7 +242,8 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         rt.clone(),
         &conf,
     ));
-    let control_rpc_executor = Arc::new(GroupExecutor::new("master-handler-test", 1, 16));
+    let control_rpc_rt = Arc::new(AsyncRuntime::single());
+    let metadata_read_rt = Arc::new(AsyncRuntime::single());
     MasterHandler::new(
         &conf,
         fs,
@@ -244,7 +251,13 @@ fn new_handler_for_test(test_name: &str) -> MasterHandler {
         None,
         mount_manager,
         JobHandler::new(job_manager),
-        control_rpc_executor,
+        control_rpc_rt,
+        Arc::new(Semaphore::new(1)),
+        Arc::new(Semaphore::new(3)),
+        Some(Arc::new(Semaphore::new(4))),
+        Arc::new(Semaphore::new(2)),
+        metadata_read_rt,
+        Arc::new(Semaphore::new(1)),
         replication_manager,
         rt,
         Master::get_metrics().expect("test master metrics should initialize"),
@@ -307,6 +320,12 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::GetJobStatus,
         RpcCode::CancelJob,
         RpcCode::ReportTask,
+        RpcCode::FileStatus,
+        RpcCode::Exists,
+        RpcCode::ListStatus,
+        RpcCode::ListOptions,
+        RpcCode::GetBlockLocations,
+        RpcCode::GetLock,
         RpcCode::GetMasterInfo,
         RpcCode::GetCvMetadataSnapshotPage,
         RpcCode::GetCvMetadataDeltaPage,
@@ -319,18 +338,71 @@ fn control_plane_requests_use_the_async_handler() {
     }
 
     for code in [
-        RpcCode::GetBlockLocations,
-        RpcCode::ListStatus,
-        RpcCode::ListOptions,
         RpcCode::WorkerHeartbeat,
         RpcCode::WorkerBlockReport,
+        RpcCode::ReportBlockReplicationResult,
     ] {
         let msg = Builder::new_rpc(code).build();
         assert!(handler.is_sync(&msg), "{code:?} must use the sync handler");
+        assert!(
+            handler.get_rt(&msg).is_some(),
+            "{code:?} must use actor runtime"
+        );
+        assert_eq!(
+            handler.request_admission(&msg).unwrap().available_permits(),
+            2,
+            "{code:?} must use control admission"
+        );
     }
+
+    let master_info = Builder::new_rpc(RpcCode::GetMasterInfo).build();
+    assert!(!handler.is_sync(&master_info));
+    assert_eq!(
+        handler
+            .request_admission(&master_info)
+            .unwrap()
+            .available_permits(),
+        3,
+        "GetMasterInfo must use client admission"
+    );
 
     let mkdir = Builder::new_rpc(RpcCode::Mkdir).build();
     assert!(handler.is_sync(&mkdir));
+    assert_eq!(
+        handler
+            .request_admission(&mkdir)
+            .unwrap()
+            .available_permits(),
+        4,
+        "blocking client requests must use blocking admission"
+    );
+
+    let file_status = Builder::new_rpc(RpcCode::FileStatus).build();
+    assert!(!handler.is_sync(&file_status));
+    assert_eq!(
+        handler
+            .request_admission(&file_status)
+            .unwrap()
+            .available_permits(),
+        3,
+        "async client requests must use client admission"
+    );
+
+    let read_open = Builder::new_rpc(RpcCode::OpenFile)
+        .proto_header(OpenFileRequest {
+            flags: OpenFlags::new_read_only().value(),
+            ..Default::default()
+        })
+        .build();
+    assert!(!handler.is_sync(&read_open));
+
+    let write_open = Builder::new_rpc(RpcCode::OpenFile)
+        .proto_header(OpenFileRequest {
+            flags: OpenFlags::new_create().value(),
+            ..Default::default()
+        })
+        .build();
+    assert!(handler.is_sync(&write_open));
 }
 
 #[test]
@@ -378,6 +450,7 @@ fn block_report_for_non_file_inode_schedules_worker_delete() -> CommonResult<()>
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            full_report_start: false,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -406,6 +479,7 @@ fn block_report_for_writing_non_file_inode_defers_worker_delete() -> CommonResul
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            full_report_start: false,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -434,6 +508,7 @@ fn block_report_for_writing_missing_inode_defers_worker_delete() -> CommonResult
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: false,
+            full_report_start: false,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -462,6 +537,7 @@ fn full_block_report_for_writing_missing_inode_schedules_worker_delete() -> Comm
             cluster_id: "curvine".into(),
             worker_id: 0,
             full_report: true,
+            full_report_start: false,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 block_id,
@@ -506,6 +582,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            full_report_start: false,
             total_len: 0,
             blocks: vec![
                 BlockReportInfo::new(
@@ -534,6 +611,7 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            full_report_start: false,
             total_len: 1,
             blocks: vec![BlockReportInfo::new(
                 first.block.id,
@@ -546,188 +624,17 @@ fn full_block_report_reconcile_removes_stale_location_async() -> CommonResult<()
     )?;
 
     for _ in 0..50 {
-        let blocks = fs.get_block_locations(path)?;
-        let stale = blocks
-            .block_locs
-            .iter()
-            .find(|block| block.block.id == second.block.id)
-            .expect("second block metadata should remain");
-        if stale.locs.is_empty() {
+        if fs.get_block_locations_by_id(second.block.id)?.is_empty() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let blocks = fs.get_block_locations(path)?;
     panic!(
         "stale worker location for block {} was not reconciled: {:?}",
-        second.block.id, blocks
+        second.block.id,
+        fs.get_block_locations_by_id(second.block.id)?
     );
-}
-
-fn create_ufs_backed_cache_file(
-    fs: &MasterFilesystem,
-    path: &str,
-    ttl_action: TtlAction,
-) -> CommonResult<(curvine_model::FileStatus, LocatedBlock)> {
-    let client = ClientAddress::default();
-    let status = fs.create_with_opts(
-        path,
-        CreateFileOptsBuilder::new().ttl_action(ttl_action).build(),
-        OpenFlags::new_create(),
-    )?;
-    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
-    fs.complete_file(
-        path,
-        None,
-        status.block_size,
-        vec![full_commit(&block, status.block_size)],
-        &client.client_name,
-        false,
-        None,
-    )?;
-    fs.set_attr(path, SetAttrOptsBuilder::new().ufs_mtime(12_345).build())?;
-
-    Ok((fs.file_status(path)?, block))
-}
-
-#[test]
-fn lost_worker_invalidates_unreadable_ufs_cache_but_preserves_source_metadata() -> CommonResult<()>
-{
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "lost-worker-cache-invalidation");
-    let path = "/cached-file";
-    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
-
-    assert!(before.cv_valid(None));
-    assert!(before.ufs_exists());
-
-    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
-
-    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
-    assert!(cleanup.replication_block_ids.is_empty());
-
-    let after = fs.file_status(path)?;
-    assert!(!after.cv_exists());
-    assert!(after.ufs_exists());
-    assert!(!after.cv_valid(None));
-    assert_eq!(
-        after.storage_policy.ufs_mtime,
-        before.storage_policy.ufs_mtime
-    );
-    assert_eq!(after.len, before.len);
-
-    let blocks = fs.get_block_locations(path)?;
-    assert!(blocks.block_locs.is_empty());
-    Ok(())
-}
-
-#[test]
-fn lost_worker_cache_invalidation_replays_on_follower() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let (leader, journal_system, loader, _follower_journal_system, follower) =
-        setup_pair("lost-worker-cache-invalidation");
-    let path = "/cached-file";
-    let (_, block) = create_ufs_backed_cache_file(&leader, path, TtlAction::Delete)?;
-
-    let cleanup = leader.delete_locations(block.locs[0].worker_id)?;
-    assert!(cleanup.replication_block_ids.is_empty());
-
-    let entries = journal_system.fs().fs_dir.read().take_entries();
-    assert!(entries
-        .iter()
-        .any(|entry| matches!(entry, JournalEntry::CacheInvalidation(_))));
-    apply_entries(&loader, &entries, 1)?;
-
-    let leader_status = leader.file_status(path)?;
-    let follower_status = follower.file_status(path)?;
-    assert_eq!(
-        follower_status.storage_policy.state,
-        leader_status.storage_policy.state
-    );
-    assert_eq!(
-        follower_status.storage_policy.ufs_mtime,
-        leader_status.storage_policy.ufs_mtime
-    );
-    assert_eq!(follower_status.len, leader_status.len);
-    assert!(!follower_status.cv_valid(None));
-    assert!(follower_status.ufs_exists());
-    assert!(follower.get_block_locations(path)?.block_locs.is_empty());
-    Ok(())
-}
-
-#[test]
-fn lost_worker_keeps_cache_valid_when_a_replica_survives() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "lost-worker-cache-surviving-replica");
-    let path = "/cached-file";
-    let (_, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Delete)?;
-
-    let mut replica_worker = WorkerInfo::default();
-    replica_worker.address.worker_id = 101;
-    fs.add_test_worker(replica_worker);
-    fs.fs_dir
-        .read()
-        .add_block_location(block.block.id, BlockLocation::with_id(101))?;
-
-    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
-
-    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
-    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
-
-    let after = fs.file_status(path)?;
-    assert!(after.cv_valid(None));
-    let blocks = fs.get_block_locations(path)?;
-    assert_eq!(blocks.block_locs.len(), 1);
-    assert_eq!(blocks.block_locs[0].locs[0].worker_id, 101);
-    Ok(())
-}
-
-#[test]
-fn lost_worker_keeps_ufs_backed_fs_mode_file_for_replica_recovery() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "lost-worker-fs-mode-replica-recovery");
-    let path = "/ufs-backed-file";
-    let (before, block) = create_ufs_backed_cache_file(&fs, path, TtlAction::Free)?;
-
-    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
-
-    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
-    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
-
-    let after = fs.file_status(path)?;
-    assert_eq!(after.storage_policy.state, before.storage_policy.state);
-    assert!(after.cv_valid(None));
-    Ok(())
-}
-
-#[test]
-fn lost_worker_does_not_invalidate_curvine_only_file() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "lost-worker-curvine-only");
-    let path = "/curvine-only";
-    let client = ClientAddress::default();
-    let status = fs.create(path, false)?;
-    let block = fs.add_block(path, None, client.clone(), vec![], vec![], 0, None)?;
-    fs.complete_file(
-        path,
-        None,
-        status.block_size,
-        vec![full_commit(&block, status.block_size)],
-        &client.client_name,
-        false,
-        None,
-    )?;
-
-    let cleanup = fs.delete_locations(block.locs[0].worker_id)?;
-
-    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
-    assert_eq!(cleanup.replication_block_ids, vec![block.block.id]);
-
-    let after = fs.file_status(path)?;
-    assert!(after.cv_exists());
-    assert!(!after.ufs_exists());
-    Ok(())
 }
 
 #[test]
@@ -773,6 +680,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            full_report_start: false,
             total_len: 0,
             blocks: vec![
                 BlockReportInfo::new(
@@ -803,6 +711,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            full_report_start: false,
             total_len: 2,
             blocks: vec![BlockReportInfo::new(
                 first.block.id,
@@ -819,6 +728,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: false,
+            full_report_start: false,
             total_len: 0,
             blocks: vec![BlockReportInfo::new(
                 second.block.id,
@@ -835,6 +745,7 @@ fn incremental_report_invalidates_incomplete_full_report_session() -> CommonResu
             cluster_id: "curvine".into(),
             worker_id: 100,
             full_report: true,
+            full_report_start: false,
             total_len: 2,
             blocks: vec![BlockReportInfo::new(
                 third.block.id,
@@ -1012,6 +923,30 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 }
 
 #[test]
+fn directory_attributes_survive_rocksdb_restore() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("directory-attributes-{}", Utils::rand_str(6));
+    let (root_before, parent_before) = {
+        let fs = new_fs(true, &test_name);
+        fs.mkdir("/parent/first", true)?;
+        fs.mkdir("/parent/second", false)?;
+        fs.delete("/parent/first", false)?;
+        (fs.file_status("/")?, fs.file_status("/parent")?)
+    };
+
+    let fs = new_fs(false, &test_name);
+    fs.restore_from_rocksdb()?;
+    let root_after = fs.file_status("/")?;
+    let parent_after = fs.file_status("/parent")?;
+
+    assert_eq!(root_after.mtime, root_before.mtime);
+    assert_eq!(root_after.nlink, root_before.nlink);
+    assert_eq!(parent_after.mtime, parent_before.mtime);
+    assert_eq!(parent_after.nlink, parent_before.nlink);
+    Ok(())
+}
+
+#[test]
 fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let test_name = format!("restore-full-{}", Utils::rand_str(6));
@@ -1035,6 +970,254 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
     drop(fs);
     js.shutdown();
 
+    Ok(())
+}
+
+#[test]
+fn test_exchange_parent_attributes_survive_rocksdb_reopen() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("exchange-parent-attrs-{}", Utils::rand_str(6));
+    let expected = {
+        let fs = new_fs(true, &test_name);
+        fs.mkdir("/left/dir_entry", true)?;
+        fs.mkdir("/right", true)?;
+        fs.create("/right/file_entry", false)?;
+        std::thread::sleep(Duration::from_millis(2));
+        fs.rename(
+            "/left/dir_entry",
+            "/right/file_entry",
+            RenameFlags::EXCHANGE,
+        )?;
+        let left = fs.file_status("/left")?;
+        let right = fs.file_status("/right")?;
+        let expected = (left.mtime, left.nlink, right.mtime, right.nlink);
+        drop(fs);
+        expected
+    };
+
+    let fs = new_fs(false, &test_name);
+    fs.restore_from_rocksdb()?;
+    let left = fs.file_status("/left")?;
+    let right = fs.file_status("/right")?;
+    assert_eq!((left.mtime, left.nlink, right.mtime, right.nlink), expected);
+    assert!(!fs.file_status("/left/dir_entry")?.is_dir);
+    assert!(fs.file_status("/right/file_entry")?.is_dir);
+    Ok(())
+}
+
+#[test]
+fn metadata_replica_reader_tracks_namespace_updates_and_restore() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("metadata-replica-{}", Utils::rand_str(6));
+    let fs = new_fs(true, &test_name);
+
+    fs.mkdir("/source", true)?;
+    fs.mkdir("/target", true)?;
+    let created = fs.create("/source/file", false)?;
+    assert_eq!(fs.file_status("/source/file")?.id, created.id);
+    assert_eq!(fs.list_status("/source")?.len(), 1);
+
+    assert!(fs.rename("/source/file", "/target/file", RenameFlags::NO_REPLACE)?);
+    assert!(!fs.exists("/source/file")?);
+    assert_eq!(fs.file_status("/target/file")?.id, created.id);
+    let listed = fs.list_options("/target", ListOptions::with_limit(1))?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "file");
+
+    fs.restore_from_rocksdb()?;
+    assert!(fs.exists("/target/file")?);
+    assert_eq!(fs.file_status("/target/file")?.id, created.id);
+
+    assert!(fs.delete("/target/file", false)?);
+    assert!(!fs.exists("/target/file")?);
+    assert!(fs.list_status("/target")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn metadata_status_cache_tracks_file_mutations_and_hard_links() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("metadata-status-cache-{}", Utils::rand_str(6));
+    let fs = new_fs(true, &test_name);
+
+    fs.create("/source/file", true)?;
+    let initial = fs.file_status("/source/file")?;
+
+    let mtime = initial.mtime.saturating_add(1);
+    let updated = fs.set_attr(
+        "/source/file",
+        SetAttrOptsBuilder::new().mtime(mtime).build(),
+    )?;
+    assert_eq!(updated.mtime, mtime);
+    assert_eq!(fs.file_status("/source/file")?.mtime, mtime);
+
+    fs.link("/source/file", "/links/alias")?;
+    let source = fs.file_status("/source/file")?;
+    let alias = fs.file_status("/links/alias")?;
+    assert_eq!(source.id, alias.id);
+    assert_eq!(source.nlink, 2);
+    assert_eq!(alias.nlink, 2);
+    assert_eq!(alias.name, "alias");
+
+    assert!(fs.delete("/links/alias", false)?);
+    assert_eq!(fs.file_status("/source/file")?.nlink, 1);
+
+    fs.mkdir("/target", false)?;
+    assert!(fs.rename("/source/file", "/target/renamed", RenameFlags::NO_REPLACE)?);
+    assert_eq!(fs.file_status("/target/renamed")?.name, "renamed");
+
+    fs.mkdir("/directory", false)?;
+    let initial_directory = fs.file_status("/directory")?;
+    fs.create("/directory/child", false)?;
+    let directory = fs.file_status("/directory")?;
+    assert_eq!(directory.children_num, 1);
+    assert!(directory.mtime >= initial_directory.mtime);
+
+    fs.set_attr(
+        "/directory",
+        SetAttrOptsBuilder::new().owner("directory_owner").build(),
+    )?;
+    let updated_directory = fs.file_status("/directory")?;
+    assert_eq!(updated_directory.owner, "directory_owner");
+    assert_eq!(
+        updated_directory.ctime(),
+        fs.file_status("/directory")?.ctime()
+    );
+
+    fs.create("/cached-source", true)?;
+    fs.mkdir("/cached-tree", false)?;
+    fs.link("/cached-source", "/cached-tree/alias")?;
+    assert_eq!(fs.file_status("/cached-source")?.nlink, 2);
+    assert!(fs.delete("/cached-tree", true)?);
+    assert_eq!(fs.file_status("/cached-source")?.nlink, 1);
+
+    fs.restore_from_rocksdb()?;
+    let restored = fs.file_status("/target/renamed")?;
+    assert_eq!(restored.id, initial.id);
+    assert_eq!(restored.mtime, mtime);
+    assert_eq!(restored.nlink, 1);
+    Ok(())
+}
+
+#[test]
+fn metadata_file_cache_invalidates_block_report_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "metadata-file-cache-block-report");
+    let path = "/cached-block.log";
+    fs.create(path, false)?;
+
+    let block = fs.add_block(
+        path,
+        None,
+        ClientAddress::default(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let worker_id = block.locs[0].worker_id;
+
+    // Populate the immutable inode cache before the worker changes its location.
+    assert!(!fs.get_block_locations(path)?.block_locs[0].has_spdk);
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id,
+            full_report: true,
+            full_report_start: false,
+            total_len: 1,
+            blocks: vec![BlockReportInfo::new(
+                block.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::SpdkDisk,
+                block.block.len,
+            )],
+        },
+        None,
+    )?;
+    assert!(fs.get_block_locations(path)?.block_locs[0].has_spdk);
+
+    let cleanup = fs.delete_locations(worker_id)?;
+    assert_eq!(cleanup.removed_block_ids, vec![block.block.id]);
+    assert!(fs.get_block_locations(path).is_err());
+    Ok(())
+}
+
+#[test]
+fn metadata_replica_reader_preserves_large_directory_order_after_updates() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("metadata-replica-large-{}", Utils::rand_str(6));
+    let fs = new_fs(true, &test_name);
+    fs.mkdir("/directory", true)?;
+
+    // Cross the bounded pending-edge threshold so listing exercises both the
+    // merged ordered index and a live delta.
+    for index in 0..4097 {
+        fs.create(format!("/directory/file-{index:04}"), false)?;
+    }
+
+    let first_page = fs.list_options("/directory", ListOptions::with_limit(3))?;
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|status| status.name.as_str())
+            .collect::<Vec<_>>(),
+        ["file-0000", "file-0001", "file-0002"]
+    );
+
+    assert!(fs.delete("/directory/file-1024", false)?);
+    let page_after_delete = fs.list_options(
+        "/directory",
+        ListOptions {
+            limit: Some(3),
+            start_after: Some("file-1023".to_string()),
+        },
+    )?;
+    assert_eq!(
+        page_after_delete
+            .iter()
+            .map(|status| status.name.as_str())
+            .collect::<Vec<_>>(),
+        ["file-1025", "file-1026", "file-1027"]
+    );
+
+    fs.create("/directory/file-1024", false)?;
+    let restored_page = fs.list_options(
+        "/directory",
+        ListOptions {
+            limit: Some(3),
+            start_after: Some("file-1023".to_string()),
+        },
+    )?;
+    assert_eq!(
+        restored_page
+            .iter()
+            .map(|status| status.name.as_str())
+            .collect::<Vec<_>>(),
+        ["file-1024", "file-1025", "file-1026"]
+    );
+    assert_eq!(fs.file_status("/directory")?.children_num, 4097);
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.list_status("/directory")?.len(), 4097);
+    Ok(())
+}
+
+#[test]
+fn metadata_replica_reader_invalidates_cached_deleted_directory() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let test_name = format!("metadata-replica-cache-{}", Utils::rand_str(6));
+    let fs = new_fs(true, &test_name);
+
+    fs.create("/cached/directory/file", true)?;
+    let first = fs.file_status("/cached/directory/file")?;
+    assert!(fs.delete("/cached/directory", true)?);
+    assert!(!fs.exists("/cached/directory/file")?);
+
+    let recreated = fs.create("/cached/directory/file", true)?;
+    assert_ne!(first.id, recreated.id);
+    assert_eq!(fs.file_status("/cached/directory/file")?.id, recreated.id);
     Ok(())
 }
 
@@ -1091,75 +1274,30 @@ fn mkdir_inherits_setgid_parent_group_and_mode() -> CommonResult<()> {
 }
 
 #[test]
-fn create_file_inherits_setgid_parent_group() -> CommonResult<()> {
+fn mkdir_inherits_setgid_after_parent_set_attr() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "create-file-setgid-inherit");
+    let fs = new_fs(true, "mkdir-setgid-after-setattr");
+    fs.mkdir("/parent", true)?;
 
-    let parent_opts = MkdirOptsBuilder::new()
-        .owner("parent-owner".to_string())
-        .group("parent-group".to_string())
-        .mode(0o2775)
-        .build();
-    fs.mkdir_with_opts("/parent", parent_opts)?;
-
-    let file_opts = CreateFileOptsBuilder::new()
-        .owner("file-owner".to_string())
-        .group("file-group".to_string())
-        .build();
-    fs.create_with_opts("/parent/file", file_opts, OpenFlags::new_create())?;
-
-    let file = fs.file_status("/parent/file")?;
-    assert_eq!("parent-group", file.group);
-    assert_eq!(0, file.mode & 0o2000);
-
-    Ok(())
-}
-
-#[test]
-fn mkdir_recursive_parents_persist_owner_group() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "mkdir-recursive-owner-group");
-
-    let opts = MkdirOptsBuilder::new()
-        .create_parent(true)
-        .owner("cli-owner".to_string())
-        .group("cli-group".to_string())
-        .build();
-    fs.mkdir_with_opts("/owner/parent/child", opts)?;
-
-    for path in ["/owner", "/owner/parent", "/owner/parent/child"] {
-        let status = fs.file_status(path)?;
-        assert_eq!("cli-owner", status.owner);
-        assert_eq!("cli-group", status.group);
-    }
-
-    Ok(())
-}
-
-#[test]
-fn create_file_recursive_parents_persist_owner_group() -> CommonResult<()> {
-    let _serial = master_fs_test_serial();
-    let fs = new_fs(true, "create-file-recursive-owner-group");
-
-    let opts = CreateFileOptsBuilder::new()
-        .create_parent(true)
-        .owner("cli-owner".to_string())
-        .group("cli-group".to_string())
-        .build();
-    fs.create_with_opts(
-        "/owner/parent/file",
-        opts,
-        OpenFlags::new_create().set_overwrite(true),
+    fs.set_attr(
+        "/parent",
+        SetAttrOptsBuilder::new()
+            .group("parent-group".to_string())
+            .mode(0o2775)
+            .build(),
+    )?;
+    fs.mkdir_with_opts(
+        "/parent/child",
+        MkdirOptsBuilder::new()
+            .group("child-group".to_string())
+            .mode(0o775)
+            .build(),
     )?;
 
-    for path in ["/owner", "/owner/parent"] {
-        let status = fs.file_status(path)?;
-        assert_eq!("cli-owner", status.owner);
-        assert_eq!("cli-group", status.group);
-    }
-    let file_status = fs.file_status("/owner/parent/file")?;
-    assert_eq!("cli-owner", file_status.owner);
-    assert_eq!("cli-group", file_status.group);
+    let child = fs.file_status("/parent/child")?;
+    assert_eq!("parent-group", child.group);
+    assert_eq!(0o2000, child.mode & 0o2000);
+    assert_eq!(0o775, child.mode & 0o777);
 
     Ok(())
 }
@@ -1388,6 +1526,29 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
         file_parent_nlink + 1
     );
 
+    fs.create("/a/unsupported_src", true)?;
+    let err = fs
+        .rename(
+            "/a/unsupported_src",
+            "/a/unsupported_dst",
+            RenameFlags::WHITEOUT,
+        )
+        .expect_err("whiteout must not degrade into a normal rename");
+    assert!(matches!(err, FsError::Unsupported(_)));
+    assert!(fs.exists("/a/unsupported_src")?);
+    assert!(!fs.exists("/a/unsupported_dst")?);
+
+    let err = fs
+        .rename(
+            "/a/unsupported_src",
+            "/a/unsupported_dst",
+            RenameFlags::EXCHANGE | RenameFlags::NO_REPLACE,
+        )
+        .expect_err("rename exchange combinations must be rejected");
+    assert!(matches!(err, FsError::Unsupported(_)));
+    assert!(fs.exists("/a/unsupported_src")?);
+    assert!(!fs.exists("/a/unsupported_dst")?);
+
     // src symlink, dst symlink -> overwrite existing symlink and keep dst deletable.
     fs.symlink("nobody", "/a/symbolic", false, 0o777)?;
     fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;
@@ -1399,6 +1560,11 @@ fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
     fs.rename("/a/symbolic", "/a/asymbolic", RenameFlags::empty())?;
     assert!(!fs.exists("/a/symbolic")?);
     assert!(fs.exists("/a/asymbolic")?);
+    assert_eq!(
+        fs.file_status("/a/asymbolic")?.target.as_deref(),
+        Some("object")
+    );
+    assert!(fs.exists("/a/object")?);
     fs.delete("/a/asymbolic", false)?;
     assert!(!fs.exists("/a/asymbolic")?);
     fs.delete("/a/object", false)?;
@@ -1575,6 +1741,32 @@ fn test_hardlink_to_dangling_symlink_inode() -> CommonResult<()> {
 }
 
 #[test]
+fn list_options_respects_start_after_and_limit() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "list-options-page");
+    fs.create("/page/a.log", true)?;
+    fs.create("/page/b.log", true)?;
+    fs.create("/page/c.log", true)?;
+    fs.create("/page/d.log", true)?;
+    fs.create("/page/e.log", true)?;
+
+    let page = fs.list_options(
+        "/page",
+        ListOptions {
+            limit: Some(2),
+            start_after: Some("b.log".to_string()),
+        },
+    )?;
+
+    let names = page
+        .iter()
+        .map(|status| status.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["c.log", "d.log"]);
+    Ok(())
+}
+
+#[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "link_test");
@@ -1583,6 +1775,7 @@ fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     fs.print_tree();
     fs.link("/a/b/file.log", "/a/b/file2.log")?;
     assert!(fs.exists("/a/b/file2.log")?);
+    assert_eq!(fs.file_status("/a/b/file2.log")?.name, "file2.log");
     fs.print_tree();
 
     fs.link("/a/b/file.log", "/a/d/file.log")?;
@@ -1631,6 +1824,188 @@ fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     //let nlink_t = fs.file_status("/a/b/file3.log")?.nlink;
     //assert_eq!(nlink_t, 2);
 
+    Ok(())
+}
+
+#[test]
+fn rename_between_hard_links_keeps_both_directory_entries() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "rename-hard-link-same-inode");
+
+    fs.create("/source", true)?;
+    fs.link("/source", "/alias")?;
+    let source = fs.file_status("/source")?;
+    let alias = fs.file_status("/alias")?;
+    assert_eq!(source.id, alias.id);
+    assert_eq!(source.nlink, 2);
+
+    assert!(!fs.rename("/source", "/alias", RenameFlags::empty())?);
+    let err = fs
+        .rename("/source", "/alias", RenameFlags::NO_REPLACE)
+        .expect_err("RENAME_NOREPLACE must reject an existing hard-link path");
+    assert!(matches!(err, FsError::FileAlreadyExists(_)));
+    let source = fs.file_status("/source")?;
+    let alias = fs.file_status("/alias")?;
+    assert_eq!(source.id, alias.id);
+    assert_eq!(source.nlink, 2);
+    assert_eq!(alias.nlink, 2);
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/alias")?.nlink, 2);
+
+    fs.mkdir("/left", false)?;
+    fs.mkdir("/right", false)?;
+    fs.create("/left/source", false)?;
+    fs.link("/left/source", "/right/alias")?;
+    let err = fs
+        .rename("/left/source", "/right/alias", RenameFlags::NO_REPLACE)
+        .expect_err("RENAME_NOREPLACE must reject an existing cross-parent hard-link path");
+    assert!(matches!(err, FsError::FileAlreadyExists(_)));
+    assert_eq!(
+        fs.file_status("/left/source")?.id,
+        fs.file_status("/right/alias")?.id
+    );
+    Ok(())
+}
+
+#[test]
+fn rename_directory_between_parents_updates_nlink() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "rename-directory-nlink");
+
+    fs.mkdir("/source/child", true)?;
+    fs.mkdir("/destination", false)?;
+    assert_eq!(fs.file_status("/source")?.nlink, 3);
+    assert_eq!(fs.file_status("/destination")?.nlink, 2);
+
+    assert!(fs.rename(
+        "/source/child",
+        "/destination/child",
+        RenameFlags::NO_REPLACE,
+    )?);
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/destination")?.nlink, 3);
+
+    fs.mkdir("/source/next", false)?;
+    fs.mkdir("/destination/replaced", false)?;
+    assert_eq!(fs.file_status("/source")?.nlink, 3);
+    assert_eq!(fs.file_status("/destination")?.nlink, 4);
+    assert!(fs.rename(
+        "/source/next",
+        "/destination/replaced",
+        RenameFlags::empty(),
+    )?);
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/destination")?.nlink, 4);
+
+    fs.mkdir("/destination/left", false)?;
+    fs.mkdir("/destination/right", false)?;
+    assert_eq!(fs.file_status("/destination")?.nlink, 6);
+    assert!(fs.rename(
+        "/destination/left",
+        "/destination/right",
+        RenameFlags::empty(),
+    )?);
+    assert_eq!(fs.file_status("/destination")?.nlink, 5);
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/destination")?.nlink, 5);
+    Ok(())
+}
+
+#[test]
+fn rename_hard_link_preserves_backing_inode() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "rename-hard-link-backing-inode");
+
+    fs.create("/source", true)?;
+    fs.link("/source", "/alias")?;
+    fs.rename("/alias", "/renamed", RenameFlags::NO_REPLACE)?;
+
+    let source = fs.file_status("/source")?;
+    let renamed = fs.file_status("/renamed")?;
+    assert_eq!(source.id, renamed.id);
+    assert_eq!(source.name, "source");
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(source.nlink, 2);
+    assert_eq!(renamed.nlink, 2);
+
+    fs.restore_from_rocksdb()?;
+    let source = fs.file_status("/source")?;
+    let renamed = fs.file_status("/renamed")?;
+    assert_eq!(source.id, renamed.id);
+    assert_eq!(source.name, "source");
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(source.nlink, 2);
+    assert_eq!(renamed.nlink, 2);
+    Ok(())
+}
+
+#[test]
+fn hard_link_chain_and_unlink_keep_live_nlink_consistent() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "hard-link-chain-live-nlink");
+
+    fs.create("/source", true)?;
+    fs.link("/source", "/alias")?;
+    fs.link("/alias", "/second")?;
+    assert_eq!(fs.file_status("/source")?.nlink, 3);
+    assert_eq!(fs.file_status("/alias")?.nlink, 3);
+    assert_eq!(fs.file_status("/second")?.nlink, 3);
+
+    fs.delete("/alias", false)?;
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/second")?.nlink, 2);
+
+    fs.delete("/second", false)?;
+    assert_eq!(fs.file_status("/source")?.nlink, 1);
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.file_status("/source")?.nlink, 1);
+    Ok(())
+}
+
+#[test]
+fn forced_symlink_rewrite_updates_live_and_restored_target() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "forced-symlink-rewrite-target");
+
+    fs.symlink("target-a", "/link", false, 0o777)?;
+    assert_eq!(fs.file_status("/link")?.target.as_deref(), Some("target-a"));
+
+    fs.symlink("target-b", "/link", true, 0o777)?;
+    assert_eq!(fs.file_status("/link")?.target.as_deref(), Some("target-b"));
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.file_status("/link")?.target.as_deref(), Some("target-b"));
+    Ok(())
+}
+
+#[test]
+fn forced_symlink_rewrite_preserves_hard_link_alias() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "forced-symlink-rewrite-hard-link");
+
+    fs.symlink("target-a", "/link", false, 0o777)?;
+    fs.link("/link", "/alias")?;
+
+    fs.symlink("target-b", "/link", true, 0o777)?;
+    let link = fs.file_status("/link")?;
+    let alias = fs.file_status("/alias")?;
+    assert_eq!(link.target.as_deref(), Some("target-b"));
+    assert_eq!(alias.target.as_deref(), Some("target-a"));
+    assert_ne!(link.id, alias.id);
+    assert_eq!(link.nlink, 1);
+    assert_eq!(alias.nlink, 1);
+
+    fs.restore_from_rocksdb()?;
+    assert_eq!(fs.file_status("/link")?.target.as_deref(), Some("target-b"));
+    assert_eq!(
+        fs.file_status("/alias")?.target.as_deref(),
+        Some("target-a")
+    );
     Ok(())
 }
 
@@ -1923,6 +2298,718 @@ fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) ->
 }
 
 #[test]
+fn test_auto_snapshot_entry_after_journal_threshold() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-auto-snapshot"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 1,
+            writer_channel_size: 8,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-auto-snapshot"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.mkdir("/snapshot-trigger", false)?;
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    let JournalEntry::Snapshot(_) = &entries[1] else {
+        panic!(
+            "expected Snapshot entry after threshold, got {:?}",
+            entries[1]
+        );
+    };
+    assert!(entries[1].op_id() > entries[0].op_id());
+    let checkpoint_path = js
+        .fs()
+        .fs_dir
+        .read()
+        .get_checkpoint_path(entries[1].op_id());
+    assert!(std::path::Path::new(&checkpoint_path).exists());
+    Ok(())
+}
+
+#[test]
+fn checkpoint_restores_hot_directory_attributes() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "checkpoint-directory-attributes");
+    fs.mkdir("/hot", true)?;
+    for index in 0..256 {
+        let path = format!("/hot/child-{index:04}");
+        fs.mkdir(&path, false)?;
+        fs.delete(&path, false)?;
+    }
+
+    let checkpoint = fs.fs_dir.read().create_checkpoint(1)?;
+    fs.fs_dir.write().restore(&checkpoint, 0)?;
+
+    let status = fs.file_status("/hot")?;
+    assert_eq!(status.children_num, 0);
+    assert_eq!(status.nlink, 2);
+    Ok(())
+}
+
+#[test]
+fn checkpoint_keeps_empty_directory_attributes_sparse() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "checkpoint-empty-directory-attributes");
+    fs.mkdir("/empty", false)?;
+
+    let before = fs.file_status("/empty")?;
+    let checkpoint = fs.fs_dir.read().create_checkpoint(1)?;
+    assert_eq!(
+        fs.fs_dir
+            .read()
+            .get_rocks_store()
+            .get_directory_attributes(before.id)?,
+        None
+    );
+
+    fs.fs_dir.write().restore(&checkpoint, 0)?;
+    let after = fs.file_status("/empty")?;
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.nlink, before.nlink);
+    Ok(())
+}
+
+#[test]
+fn checkpoint_restore_initializes_empty_directory_attributes_on_first_child() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "checkpoint-empty-directory-first-child");
+    fs.mkdir("/empty", false)?;
+
+    let checkpoint = fs.fs_dir.read().create_checkpoint(1)?;
+    fs.fs_dir.write().restore(&checkpoint, 0)?;
+    fs.mkdir("/empty/child", false)?;
+
+    let second_checkpoint = fs.fs_dir.read().create_checkpoint(2)?;
+    fs.fs_dir.write().restore(&second_checkpoint, 0)?;
+
+    let status = fs.file_status("/empty")?;
+    assert_eq!(status.children_num, 1);
+    assert_eq!(status.nlink, 3);
+    assert!(fs.exists("/empty/child")?);
+    Ok(())
+}
+
+#[test]
+fn rename_empty_directory_persists_directory_attributes() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "rename-empty-directory-attributes");
+    fs.mkdir("/source", false)?;
+    fs.rename("/source", "/renamed", RenameFlags::empty())?;
+
+    let status = fs.file_status("/renamed")?;
+    let attributes = fs
+        .fs_dir
+        .read()
+        .get_rocks_store()
+        .get_directory_attributes(status.id)?;
+    assert_eq!(
+        attributes,
+        Some(DirectoryAttributes::new(
+            status.mtime,
+            status.ctime(),
+            status.nlink as u32,
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn cross_parent_rename_preserves_directory_attributes_after_restore() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "cross-parent-rename-directory-attributes");
+    fs.mkdir("/source/empty", true)?;
+    fs.mkdir("/target", false)?;
+    fs.rename("/source/empty", "/target/renamed", RenameFlags::empty())?;
+    fs.mkdir("/target/renamed/child", false)?;
+
+    fs.fs_dir.write().restore_from_rocksdb()?;
+
+    let status = fs.file_status("/target/renamed")?;
+    assert_eq!(status.children_num, 1);
+    assert_eq!(status.nlink, 3);
+    assert!(fs.exists("/target/renamed/child")?);
+    Ok(())
+}
+
+#[test]
+fn test_single_entry_journal_permit_uses_one_queue_slot() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-journal-single-slot"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 1,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-single-slot"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+
+    fs.mkdir("/single-slot", false)?;
+
+    let err = fs.mkdir("/queue-full", false).unwrap_err();
+    assert!(err.to_string().contains("journal writer queue is full"));
+    assert!(matches!(
+        fs.file_status("/queue-full").unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    Ok(())
+}
+
+#[test]
+fn test_namespace_write_fails_before_mutation_when_journal_queue_is_full() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-journal-full"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 3,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-full"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+
+    let mut blocked_path = None;
+    for index in 0..16 {
+        let path = format!("/queued-{index}");
+        match fs.mkdir(&path, false) {
+            Ok(_) => {}
+            Err(err) => {
+                assert!(err.to_string().contains("journal writer queue is full"));
+                blocked_path = Some(path);
+                break;
+            }
+        }
+    }
+    let blocked_path = blocked_path.expect("journal writer queue should become full");
+
+    let err = fs.file_status(&blocked_path).unwrap_err();
+    assert!(matches!(err, FsError::FileNotFound(_)));
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert!(entries
+        .iter()
+        .all(|entry| matches!(entry, JournalEntry::Mkdir(_))));
+    Ok(())
+}
+
+#[test]
+fn test_mount_commit_failure_does_not_mutate_mount_table() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-mount-journal-full"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 4,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-mount-full"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    let mnt_mgr = js.mount_manager();
+    let mnt_opt = MountOptions::builder().build();
+    fs.mkdir("/mnt", true)?;
+    let mut queue_full = false;
+    let mut filler_success = 0usize;
+    for id in 1..16 {
+        let cv_path = format!("/filler-{}", id);
+        let ufs_path = format!("oss://filler-{}/", id);
+        let filler = mnt_opt.clone().to_info(id, &cv_path, &ufs_path);
+        if fs.commit_mount(filler).is_err() {
+            queue_full = true;
+            break;
+        }
+        filler_success += 1;
+    }
+    assert!(queue_full, "test setup should fill the journal queue");
+
+    let err = mnt_mgr
+        .mount(None, "/mnt", "oss://bucket/", &mnt_opt)
+        .unwrap_err();
+    assert!(err.to_string().contains("journal writer queue is full"));
+
+    let mount_path = Path::from_str("/mnt")?;
+    assert!(mnt_mgr.get_mount_info(&mount_path)?.is_none());
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 1 + filler_success);
+    Ok(())
+}
+
+#[test]
+fn test_link_with_created_parents_reserves_enough_journal_permits() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: true,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir("master-fs-test/meta-link-journal-permits"),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: true,
+            snapshot_entries: 0,
+            writer_channel_size: 6,
+            journal_dir: Utils::test_sub_dir("master-fs-test/journal-link-permits"),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let js = JournalSystem::from_conf(&conf)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
+    fs.create("/source.log", true)?;
+    js.fs().fs_dir.read().take_entries();
+
+    fs.link("/source.log", "/links/nested/source.log")?;
+
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(entries[0], JournalEntry::Mkdir(_)));
+    assert!(matches!(entries[1], JournalEntry::Mkdir(_)));
+    assert!(matches!(entries[2], JournalEntry::Link(_)));
+    assert!(fs.file_status("/links/nested/source.log").is_ok());
+    Ok(())
+}
+
+#[test]
+fn test_delete_locations_removes_worker_block_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "delete-locations-batched");
+    fs.create("/location-cleanup.log", true)?;
+    let client = ClientAddress {
+        client_name: "delete-locations-test".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    let located = fs.add_block(
+        "/location-cleanup.log",
+        None,
+        client,
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/location-cleanup.log",
+        None,
+        located.block.len,
+        vec![commit],
+        "delete-locations-test",
+        false,
+        None,
+    )?;
+    let before = fs.get_block_locations("/location-cleanup.log")?;
+    assert_eq!(before.block_locs.len(), 1);
+
+    let deleted = fs.delete_locations(100)?;
+    assert!(deleted.removed_block_ids.contains(&located.block.id));
+    let err = fs.get_block_locations("/location-cleanup.log").unwrap_err();
+    assert!(err.to_string().contains("Lost"));
+    fs.add_block_location(
+        located.block.id,
+        BlockLocation::new(100, located.block.storage_type),
+    )?;
+    let restored = fs.get_block_locations("/location-cleanup.log")?;
+    assert_eq!(restored.block_locs.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_block_report_ignores_missing_block_locations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "block-report-missing-block");
+    let missing_block_id = InodeId::create_block_id(900_001, 0)?;
+
+    let stale = BlockReportList {
+        cluster_id: "curvine".into(),
+        worker_id: 100,
+        full_report: false,
+        full_report_start: false,
+        total_len: 0,
+        blocks: vec![BlockReportInfo::new(
+            missing_block_id,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        )],
+    };
+
+    let result = fs.block_report(stale, None)?;
+    assert_eq!(result.delete_blocks, vec![missing_block_id]);
+    assert!(fs.get_block_locations_by_id(missing_block_id)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_full_block_report_does_not_delete_locations_committed_after_report_start(
+) -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-candidate-race");
+    let client = ClientAddress {
+        client_name: "full-report-race".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    let first_status = fs.create("/old.log", true)?;
+    let first = fs.add_block("/old.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let first_commit = CommitBlock {
+        block_id: first.block.id,
+        block_len: first_status.block_size,
+        locations: first
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, first.block.storage_type))
+            .collect(),
+    };
+    let second = fs.add_block(
+        "/old.log",
+        None,
+        client.clone(),
+        vec![first_commit.clone()],
+        vec![],
+        first_status.block_size,
+        Some(first.block.clone()),
+    )?;
+    let second_commit = CommitBlock {
+        block_id: second.block.id,
+        block_len: second.block.len,
+        locations: second
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, second.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/old.log",
+        None,
+        first_status.block_size + second.block.len,
+        vec![second_commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: true,
+            total_len: 0,
+            blocks: vec![],
+        },
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: false,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                first.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                0,
+            )],
+        },
+        None,
+    )?;
+
+    fs.create("/new.log", true)?;
+    let new_block = fs.add_block("/new.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let new_commit = CommitBlock {
+        block_id: new_block.block.id,
+        block_len: new_block.block.len,
+        locations: new_block
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, new_block.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/new.log",
+        None,
+        new_block.block.len,
+        vec![new_commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: false,
+            total_len: 2,
+            blocks: vec![BlockReportInfo::new(
+                second.block.id,
+                BlockReportStatus::Finalized,
+                StorageType::Disk,
+                0,
+            )],
+        },
+        None,
+    )?;
+
+    assert!(result.delete_blocks.is_empty());
+    assert_eq!(fs.get_block_locations("/new.log")?.block_locs.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn test_full_block_report_finish_ignores_newer_generation() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "full-block-report-generation-race");
+    let client = ClientAddress {
+        client_name: "full-report-generation".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    fs.create("/generation-race.log", true)?;
+    let located = fs.add_block(
+        "/generation-race.log",
+        None,
+        client.clone(),
+        vec![],
+        vec![],
+        0,
+        None,
+    )?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/generation-race.log",
+        None,
+        located.block.len,
+        vec![commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: true,
+            total_len: 0,
+            blocks: vec![],
+        },
+        None,
+    )?;
+
+    let mut blocks = vec![BlockReportInfo::new(
+        located.block.id,
+        BlockReportStatus::Finalized,
+        StorageType::Disk,
+        0,
+    )];
+    for id in 10_000_000..10_020_000 {
+        blocks.push(BlockReportInfo::new(
+            InodeId::create_block_id(id, 0)?,
+            BlockReportStatus::Finalized,
+            StorageType::Disk,
+            0,
+        ));
+    }
+    let total_len = blocks.len() as u64;
+
+    let keep_starting = Arc::new(AtomicBool::new(true));
+    let sent_start = Arc::new(AtomicBool::new(false));
+    let start_fs = fs.clone();
+    let start_flag = Arc::clone(&keep_starting);
+    let sent_flag = Arc::clone(&sent_start);
+    let start_thread = std::thread::spawn(move || {
+        while start_flag.load(Ordering::Acquire) {
+            let _ = start_fs.block_report(
+                BlockReportList {
+                    cluster_id: "curvine".into(),
+                    worker_id: 100,
+                    full_report: true,
+                    full_report_start: true,
+                    total_len: 0,
+                    blocks: vec![],
+                },
+                None,
+            );
+            sent_flag.store(true, Ordering::Release);
+        }
+    });
+
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: false,
+            total_len,
+            blocks,
+        },
+        None,
+    )?;
+    keep_starting.store(false, Ordering::Release);
+    start_thread.join().expect("start thread should not panic");
+
+    assert!(sent_start.load(Ordering::Acquire));
+    assert!(
+        !result.delete_blocks.contains(&located.block.id),
+        "a newer full report generation must not let an older finish delete live block locations"
+    );
+    assert_eq!(
+        fs.get_block_locations("/generation-race.log")?
+            .block_locs
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn test_legacy_full_block_report_after_worker_start_reconciles_stale_locations() -> CommonResult<()>
+{
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "legacy-full-block-report-start");
+    let client = ClientAddress {
+        client_name: "legacy-full-report".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+
+    fs.create("/stale.log", true)?;
+    let located = fs.add_block("/stale.log", None, client.clone(), vec![], vec![], 0, None)?;
+    let commit = CommitBlock {
+        block_id: located.block.id,
+        block_len: located.block.len,
+        locations: located
+            .locs
+            .iter()
+            .map(|worker| BlockLocation::new(worker.worker_id, located.block.storage_type))
+            .collect(),
+    };
+    fs.complete_file(
+        "/stale.log",
+        None,
+        located.block.len,
+        vec![commit],
+        &client.client_name,
+        false,
+        None,
+    )?;
+
+    fs.begin_full_block_report(100);
+    let result = fs.block_report(
+        BlockReportList {
+            cluster_id: "curvine".into(),
+            worker_id: 100,
+            full_report: true,
+            full_report_start: false,
+            total_len: 0,
+            blocks: vec![],
+        },
+        None,
+    )?;
+
+    assert!(result.delete_blocks.is_empty());
+    for _ in 0..50 {
+        if fs.get_block_locations_by_id(located.block.id)?.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "stale location for block {} was not reconciled",
+        located.block.id
+    );
+}
+
+#[test]
 fn test_idempotent_mkdir() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
@@ -1999,6 +3086,60 @@ fn test_idempotent_exchange_rename() -> CommonResult<()> {
 }
 
 #[test]
+fn test_idempotent_rename_link_and_forced_symlink() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let (fs, js, loader, _js2, fs2) = setup_pair("rename-link-symlink");
+
+    fs.mkdir("/source/child", true)?;
+    fs.mkdir("/destination", false)?;
+    fs.rename(
+        "/source/child",
+        "/destination/child",
+        RenameFlags::NO_REPLACE,
+    )?;
+
+    fs.create("/file", true)?;
+    fs.link("/file", "/alias")?;
+    fs.rename("/alias", "/renamed", RenameFlags::NO_REPLACE)?;
+
+    fs.symlink("target-a", "/link", false, 0o777)?;
+    fs.link("/link", "/link-alias")?;
+    fs.symlink("target-b", "/link", true, 0o777)?;
+
+    replay_all_then_duplicate_last(&js, &loader)?;
+    assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
+    assert_eq!(fs.file_status("/source")?.nlink, 2);
+    assert_eq!(fs2.file_status("/source")?.nlink, 2);
+    assert_eq!(fs.file_status("/destination")?.nlink, 3);
+    assert_eq!(fs2.file_status("/destination")?.nlink, 3);
+    assert_eq!(fs.file_status("/file")?.nlink, 2);
+    assert_eq!(fs2.file_status("/file")?.nlink, 2);
+    assert_eq!(fs.file_status("/renamed")?.id, fs.file_status("/file")?.id);
+    assert_eq!(
+        fs2.file_status("/renamed")?.id,
+        fs2.file_status("/file")?.id
+    );
+    assert_eq!(fs.file_status("/renamed")?.nlink, 2);
+    assert_eq!(fs2.file_status("/renamed")?.nlink, 2);
+    assert_eq!(fs.file_status("/link")?.target.as_deref(), Some("target-b"));
+    assert_eq!(
+        fs.file_status("/link-alias")?.target.as_deref(),
+        Some("target-a")
+    );
+    assert_eq!(fs.file_status("/link-alias")?.nlink, 1);
+    assert_eq!(
+        fs2.file_status("/link")?.target.as_deref(),
+        Some("target-b")
+    );
+    assert_eq!(
+        fs2.file_status("/link-alias")?.target.as_deref(),
+        Some("target-a")
+    );
+    assert_eq!(fs2.file_status("/link-alias")?.nlink, 1);
+    Ok(())
+}
+
+#[test]
 fn test_idempotent_free() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("free");
@@ -2017,8 +3158,14 @@ fn test_idempotent_set_attr() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-attr");
     fs.mkdir("/data", false)?;
+    let before = fs.file_status("/data")?;
     let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
-    fs.set_attr("/data", opts)?;
+    let status = fs.set_attr("/data", opts)?;
+    assert_eq!(status.owner, "test_owner");
+    let current = fs.file_status("/data")?;
+    assert_eq!(current.owner, "test_owner");
+    assert!(status.ctime() >= before.ctime());
+    assert_eq!(current.ctime(), status.ctime());
     replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash()?, fs2.sum_hash()?);
     Ok(())
@@ -2368,6 +3515,36 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
 }
 
 #[test]
+fn lock_operations_reject_partial_paths() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "lock-partial-path");
+    fs.create("/lockfile.log", true)?;
+
+    let lock = FileLock {
+        client_id: "client1".to_string(),
+        owner_id: 1,
+        lock_type: LockType::WriteLock,
+        lock_flags: LockFlags::Plock,
+        start: 0,
+        end: 100,
+        ..Default::default()
+    };
+
+    assert!(matches!(
+        fs.get_lock("/lockfile.log/missing", lock.clone())
+            .unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+    assert!(matches!(
+        fs.set_lock("/lockfile.log/missing", lock.clone())
+            .unwrap_err(),
+        FsError::FileNotFound(_)
+    ));
+    assert!(fs.get_lock("/lockfile.log", lock)?.is_none());
+    Ok(())
+}
+
+#[test]
 fn resize_rejects_extreme_file_size() {
     let _serial = master_fs_test_serial();
     let fs = new_fs(true, "resize-extreme");
@@ -2529,6 +3706,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                full_report_start: false,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2562,6 +3740,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                full_report_start: false,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2595,6 +3774,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: block.locs[0].worker_id,
                 full_report: true,
+                full_report_start: false,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2639,6 +3819,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: 100,
                 full_report: true,
+                full_report_start: false,
                 total_len: 1,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,
@@ -2656,6 +3837,7 @@ fn located_block_has_spdk_reflects_worker_reported_storage_type() -> CommonResul
                 cluster_id: "curvine".into(),
                 worker_id: 200,
                 full_report: false,
+                full_report_start: false,
                 total_len: 0,
                 blocks: vec![BlockReportInfo::new(
                     block.block.id,

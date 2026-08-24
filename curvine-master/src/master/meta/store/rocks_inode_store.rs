@@ -14,11 +14,14 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
-use curvine_core_error::CommonResult;
-use curvine_model::{BlockLocation, FileLock, MountInfo};
-use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_core_error::{err_box, try_option, CommonError, CommonResult};
+use curvine_error::FsError;
+use curvine_model::{
+    BlockLocation, DirectoryAttributeDelta, DirectoryAttributes, FileLock, FileStatus, MountInfo,
+};
 use curvine_rocksdb::{
-    DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB,
+    CfMergeOperator, DBConf, DBEngine, DBIteratorWithThreadMode, DBPinnableSlice, DBSnapshotReader,
+    Error, RocksIterator, RocksUtils, WriteBatchWithTransaction, DB,
 };
 use curvine_runtime::common::SerdeUtils as Serde;
 use std::collections::HashMap;
@@ -33,9 +36,14 @@ impl RocksInodeStore {
     pub const CF_BLOCK: &'static str = "block";
     pub const CF_LOCATION: &'static str = "location";
     pub const CF_COMMON: &'static str = "common";
+    pub const CF_DIR_ATTRS: &'static str = "dir_attrs";
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    pub const PREFIX_SCHEMA: u8 = 0x03;
+
+    const DIRECTORY_ATTRIBUTE_SCHEMA: u8 = 0x01;
+    const DIRECTORY_ATTRIBUTE_SCHEMA_VERSION: u8 = 0x01;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -44,7 +52,9 @@ impl RocksInodeStore {
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
-            .add_cf(Self::CF_COMMON);
+            .add_cf(Self::CF_COMMON)
+            .add_cf(Self::CF_DIR_ATTRS)
+            .set_cf_merge_operator(Self::CF_DIR_ATTRS, CfMergeOperator::DirectoryAttributes);
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
     }
@@ -67,6 +77,12 @@ impl RocksInodeStore {
         };
 
         Ok(InodeChildrenIter { inner: iter })
+    }
+
+    pub fn snapshot(&self) -> RocksInodeStoreSnapshot<'_> {
+        RocksInodeStoreSnapshot {
+            reader: self.db.snapshot_reader(),
+        }
     }
 
     // Get all location information for all block ids.
@@ -106,9 +122,119 @@ impl RocksInodeStore {
 
             Some(v) => {
                 let inode: InodeView = Serde::deserialize(&v)?;
+                if inode.is_dir() {
+                    if let Some(attributes) = self.get_directory_attributes(inode.id())? {
+                        inode.set_directory_attributes(attributes);
+                    }
+                }
                 Ok(Some(inode))
             }
         }
+    }
+
+    pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
+        let bytes = self
+            .db
+            .get_cf(Self::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        bytes
+            .map(|bytes| {
+                DirectoryAttributes::decode(&bytes).ok_or_else(|| {
+                    CommonError::from(format!("invalid directory attributes for inode {id}"))
+                })
+            })
+            .transpose()
+    }
+
+    pub fn initialize_root_directory_attributes(&self) -> CommonResult<()> {
+        use crate::master::meta::inode::ROOT_INODE_ID;
+
+        if self.get_directory_attributes(ROOT_INODE_ID)?.is_none() {
+            let mut batch = self.new_batch();
+            batch.write_directory_attributes(ROOT_INODE_ID, DirectoryAttributes::new(0, 0, 2))?;
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn directory_attribute_ids(&self) -> CommonResult<Vec<i64>> {
+        self.db
+            .bulk_scan(Self::CF_DIR_ATTRS)?
+            .map(|entry| {
+                let (key, _) = entry?;
+                if key.len() != std::mem::size_of::<i64>() {
+                    return err_box!("invalid directory attribute key length {}", key.len());
+                }
+                let bytes: [u8; std::mem::size_of::<i64>()] = key[..]
+                    .try_into()
+                    .map_err(|_| CommonError::from("invalid directory attribute key"))?;
+                Ok(i64::from_le_bytes(bytes))
+            })
+            .collect()
+    }
+
+    pub fn directory_attributes(&self) -> CommonResult<HashMap<i64, DirectoryAttributes>> {
+        self.db
+            .scan(Self::CF_DIR_ATTRS)?
+            .map(|entry| {
+                let (key, value) = entry?;
+                if key.len() != std::mem::size_of::<i64>() {
+                    return err_box!("invalid directory attribute key length {}", key.len());
+                }
+                let bytes: [u8; std::mem::size_of::<i64>()] = key[..]
+                    .try_into()
+                    .map_err(|_| CommonError::from("invalid directory attribute key"))?;
+                let attributes = DirectoryAttributes::decode(&value)
+                    .ok_or_else(|| CommonError::from("invalid directory attribute record"))?;
+                Ok((i64::from_le_bytes(bytes), attributes))
+            })
+            .collect()
+    }
+
+    pub fn directory_attributes_for_ids(
+        &self,
+        mut ids: Vec<i64>,
+    ) -> CommonResult<HashMap<i64, DirectoryAttributes>> {
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let keys = ids
+            .iter()
+            .map(|id| RocksUtils::i64_to_bytes(*id))
+            .collect::<Vec<_>>();
+        let values = self
+            .db
+            .multi_get_cf_optional(Self::CF_DIR_ATTRS, keys.iter())?;
+
+        ids.into_iter()
+            .zip(values)
+            .filter_map(|(id, value)| value.map(|value| (id, value)))
+            .map(|(id, value)| {
+                let attributes = DirectoryAttributes::decode(&value).ok_or_else(|| {
+                    CommonError::from(format!("invalid directory attributes for inode {id}"))
+                })?;
+                Ok((id, attributes))
+            })
+            .collect()
+    }
+
+    pub fn directory_attributes_migrated(&self) -> CommonResult<bool> {
+        let key = [Self::PREFIX_SCHEMA, Self::DIRECTORY_ATTRIBUTE_SCHEMA];
+        let version = self.db.get_cf(Self::CF_COMMON, key)?;
+        Ok(version.is_some_and(|version| {
+            version.as_slice() == [Self::DIRECTORY_ATTRIBUTE_SCHEMA_VERSION]
+        }))
+    }
+
+    pub fn mark_directory_attributes_migrated(&self) -> CommonResult<()> {
+        let key = [Self::PREFIX_SCHEMA, Self::DIRECTORY_ATTRIBUTE_SCHEMA];
+        self.db.put_cf(
+            Self::CF_COMMON,
+            key,
+            [Self::DIRECTORY_ATTRIBUTE_SCHEMA_VERSION],
+        )
     }
 
     pub fn batched_multi_get_inodes<'a, K, I>(
@@ -122,6 +248,100 @@ impl RocksInodeStore {
     {
         self.db
             .batched_multi_get_cf(Self::CF_INODES, keys, sorted_input)
+    }
+
+    pub fn batched_file_statuses(
+        &self,
+        parent_path: &str,
+        children: Vec<&InodeView>,
+    ) -> CommonResult<Vec<FileStatus>> {
+        self.batched_file_statuses_with_missing(parent_path, children, false)
+    }
+
+    pub fn batched_file_statuses_skip_missing(
+        &self,
+        parent_path: &str,
+        children: Vec<&InodeView>,
+    ) -> CommonResult<Vec<FileStatus>> {
+        self.batched_file_statuses_with_missing(parent_path, children, true)
+    }
+
+    fn batched_file_statuses_with_missing(
+        &self,
+        parent_path: &str,
+        children: Vec<&InodeView>,
+        skip_missing: bool,
+    ) -> CommonResult<Vec<FileStatus>> {
+        if children.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut statuses = (0..children.len()).map(|_| None).collect::<Vec<_>>();
+        let mut file_entries = Vec::with_capacity(children.len());
+        for (index, child) in children.iter().enumerate() {
+            if child.is_file_entry() {
+                file_entries.push((index, RocksUtils::i64_to_bytes(child.id())));
+            } else {
+                statuses[index] =
+                    Some(child.to_file_status(&Self::child_path(parent_path, child.name()))?);
+            }
+        }
+
+        if file_entries.is_empty() {
+            return Ok(statuses.into_iter().flatten().collect());
+        }
+
+        let values =
+            self.batched_multi_get_inodes(file_entries.iter().map(|entry| &entry.1), false)?;
+        for (index, value) in values.into_iter().enumerate() {
+            let child_index = try_option!(
+                file_entries.get(index),
+                "batched_file_statuses: missing file entry for batch result index {}",
+                index
+            )
+            .0;
+            let child = try_option!(
+                children.get(child_index),
+                "batched_file_statuses: child index {} out of range, list len {}",
+                child_index,
+                children.len()
+            );
+            let bytes = match value? {
+                Some(bytes) => bytes,
+                None => {
+                    if skip_missing {
+                        continue;
+                    }
+                    return Err(FsError::file_not_found(Self::child_path(
+                        parent_path,
+                        child.name(),
+                    ))
+                    .into());
+                }
+            };
+            let mut inode: InodeView = Serde::deserialize(bytes.as_ref())?;
+            if inode.id() != child.id() {
+                return err_box!(
+                    "batched_file_statuses: inode id mismatch for path {} (expected {}, got {})",
+                    Self::child_path(parent_path, child.name()),
+                    child.id(),
+                    inode.id()
+                );
+            }
+            inode.change_name(child.name().to_owned());
+            statuses[child_index] =
+                Some(inode.to_file_status(&Self::child_path(parent_path, child.name()))?);
+        }
+
+        Ok(statuses.into_iter().flatten().collect())
+    }
+
+    fn child_path(parent_path: &str, name: &str) -> String {
+        if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        }
     }
 
     pub fn iter_cf<'a: 'b, 'b>(
@@ -158,6 +378,22 @@ impl RocksInodeStore {
         }
 
         Ok(block_ids)
+    }
+
+    pub fn apply_block_locations(
+        &self,
+        locations: Vec<(bool, i64, BlockLocation)>,
+    ) -> CommonResult<()> {
+        let mut batch = self.new_batch();
+        for (add, id, loc) in locations {
+            if add {
+                batch.add_location(id, &loc)?;
+            } else {
+                batch.delete_location(id, loc.worker_id)?;
+            }
+        }
+
+        batch.commit()
     }
 
     pub fn get_block_ids(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
@@ -239,6 +475,169 @@ impl RocksInodeStore {
     }
 }
 
+pub struct RocksInodeStoreSnapshot<'a> {
+    reader: DBSnapshotReader<'a>,
+}
+
+impl RocksInodeStoreSnapshot<'_> {
+    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        let mut inode = self.get_inode_raw(id)?;
+        if let Some(inode) = &mut inode {
+            self.hydrate_directory_attributes(inode)?;
+        }
+        Ok(inode)
+    }
+
+    pub fn get_inode_raw(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        let bytes = self
+            .reader
+            .get_cf(RocksInodeStore::CF_INODES, RocksUtils::i64_to_bytes(id))?;
+        bytes
+            .map(|bytes| Serde::deserialize::<InodeView>(&bytes))
+            .transpose()
+    }
+
+    pub fn get_inodes<I>(&self, ids: I) -> CommonResult<Vec<Option<InodeView>>>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let mut inodes = self.get_inodes_raw(ids)?;
+        let directory_ids = inodes
+            .iter()
+            .flatten()
+            .filter(|inode| inode.is_dir())
+            .map(InodeView::id)
+            .collect::<Vec<_>>();
+        if directory_ids.is_empty() {
+            return Ok(inodes);
+        }
+
+        let values = self.reader.multi_get_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            directory_ids.iter().map(|id| RocksUtils::i64_to_bytes(*id)),
+        )?;
+        for (inode, value) in inodes
+            .iter_mut()
+            .flatten()
+            .filter(|inode| inode.is_dir())
+            .zip(values)
+        {
+            if let Some(bytes) = value? {
+                let attributes = DirectoryAttributes::decode(&bytes).ok_or_else(|| {
+                    CommonError::from(format!(
+                        "invalid directory attributes for inode {}",
+                        inode.id()
+                    ))
+                })?;
+                inode.set_directory_attributes(attributes);
+            }
+        }
+        Ok(inodes)
+    }
+
+    pub fn get_inodes_raw<I>(&self, ids: I) -> CommonResult<Vec<Option<InodeView>>>
+    where
+        I: IntoIterator<Item = i64>,
+    {
+        let keys = ids
+            .into_iter()
+            .map(RocksUtils::i64_to_bytes)
+            .collect::<Vec<_>>();
+        let values = self.reader.multi_get_cf(RocksInodeStore::CF_INODES, keys)?;
+        let mut inodes = Vec::with_capacity(values.len());
+
+        for value in values {
+            let bytes = value?;
+            let inode = bytes
+                .map(|bytes| Serde::deserialize::<InodeView>(&bytes))
+                .transpose()?;
+            inodes.push(inode);
+        }
+
+        Ok(inodes)
+    }
+
+    pub fn get_child_id(&self, parent_id: i64, name: &str) -> CommonResult<Option<i64>> {
+        let key = RocksUtils::i64_str_to_bytes(parent_id, name);
+        let bytes = self.reader.get_cf(RocksInodeStore::CF_EDGES, key)?;
+        bytes
+            .map(|bytes| RocksUtils::i64_from_bytes(&bytes))
+            .transpose()
+    }
+
+    pub fn get_directory_attributes(&self, id: i64) -> CommonResult<Option<DirectoryAttributes>> {
+        let bytes = self
+            .reader
+            .get_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))?;
+        bytes
+            .map(|bytes| {
+                DirectoryAttributes::decode(&bytes).ok_or_else(|| {
+                    CommonError::from(format!("invalid directory attributes for inode {id}"))
+                })
+            })
+            .transpose()
+    }
+
+    pub fn hydrate_directory_attributes(&self, inode: &mut InodeView) -> CommonResult<()> {
+        if inode.is_dir() {
+            if let Some(attributes) = self.get_directory_attributes(inode.id())? {
+                inode.set_directory_attributes(attributes);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_child_ids(
+        &self,
+        parent_id: i64,
+        start_after: Option<&str>,
+        limit: Option<usize>,
+    ) -> CommonResult<Vec<(String, i64)>> {
+        let parent_prefix = RocksUtils::i64_to_bytes(parent_id);
+        let start = match start_after {
+            Some(name) => RocksUtils::i64_str_to_bytes(parent_id, name),
+            None => parent_prefix.to_vec(),
+        };
+        let end = RocksUtils::calculate_end_bytes(&parent_prefix);
+        let iter = self
+            .reader
+            .range_scan(RocksInodeStore::CF_EDGES, &start, &end, false)?;
+        let limit = limit.unwrap_or(usize::MAX);
+        let mut children = Vec::new();
+
+        for item in iter {
+            if children.len() >= limit {
+                break;
+            }
+
+            let (key, value) = item?;
+            let (edge_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key)?;
+            if edge_parent_id != parent_id {
+                continue;
+            }
+            if matches!(start_after, Some(start_after) if child_name.as_str() <= start_after) {
+                continue;
+            }
+
+            children.push((child_name, RocksUtils::i64_from_bytes(&value)?));
+        }
+
+        Ok(children)
+    }
+
+    pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        let prefix = RocksUtils::i64_to_bytes(block_id);
+        let iter = self.reader.prefix_scan(RocksInodeStore::CF_BLOCK, prefix)?;
+
+        let mut locations = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            locations.push(Serde::deserialize::<BlockLocation>(&bytes.1)?);
+        }
+        Ok(locations)
+    }
+}
+
 pub struct InodeChildrenIter<'a> {
     inner: RocksIterator<'a>,
 }
@@ -297,6 +696,16 @@ impl<'a> InodeWriteBatch<'a> {
         Ok(())
     }
 
+    fn merge_cf<K, V>(&mut self, cf: &str, key: K, value: V) -> CommonResult<()>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let cf = self.db.cf(cf)?;
+        self.batch.merge_cf(cf, key, value);
+        Ok(())
+    }
+
     pub fn add_location(&mut self, id: i64, loc: &BlockLocation) -> CommonResult<()> {
         // store with the key of  (block_id, worker_id)
         let key = RocksUtils::i64_u32_to_bytes(id, loc.worker_id);
@@ -314,6 +723,34 @@ impl<'a> InodeWriteBatch<'a> {
         let key = RocksUtils::i64_to_bytes(inode.id());
         let value = Serde::serialize(inode)?;
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
+    }
+
+    pub fn write_directory_attributes(
+        &mut self,
+        id: i64,
+        attributes: DirectoryAttributes,
+    ) -> CommonResult<()> {
+        self.put_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            RocksUtils::i64_to_bytes(id),
+            attributes.encode(),
+        )
+    }
+
+    pub fn merge_directory_attributes(
+        &mut self,
+        id: i64,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        self.merge_cf(
+            RocksInodeStore::CF_DIR_ATTRS,
+            RocksUtils::i64_to_bytes(id),
+            delta.encode(),
+        )
+    }
+
+    pub fn delete_directory_attributes(&mut self, id: i64) -> CommonResult<()> {
+        self.delete_cf(RocksInodeStore::CF_DIR_ATTRS, RocksUtils::i64_to_bytes(id))
     }
 
     // Add an edge to identify the subordinate relationship between inodes

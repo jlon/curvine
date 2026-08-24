@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use curvine_core_error::CommonResult;
-use curvine_rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
+use curvine_model::{DirectoryAttributeDelta, DirectoryAttributes};
+use curvine_rocksdb::{CfMergeOperator, DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_runtime::common::{FileUtils, Utils};
 
 // Rocksdb database core function test
@@ -62,6 +63,79 @@ fn test_rocksdb_checkpoint_and_restore_functionality() -> CommonResult<()> {
     assert!(db.get("k2".as_bytes())?.is_none());
 
     Ok(())
+}
+
+#[test]
+fn directory_attribute_merge_preserves_legacy_operand_order() -> CommonResult<()> {
+    let base_dir =
+        Utils::test_sub_dir(format!("rocks-directory-attributes-{}", Utils::rand_str(6)));
+    let conf = DBConf::new(&base_dir)
+        .add_cf("directory_attributes")
+        .set_cf_merge_operator("directory_attributes", CfMergeOperator::DirectoryAttributes);
+    let base = DirectoryAttributes::new(10, 10, 2);
+    let legacy = legacy_directory_delta(15, 15, 1);
+    let current = DirectoryAttributeDelta::new(20, 20, 1);
+
+    {
+        let db = DBEngine::new(conf.clone(), true)?;
+        let cf = db.cf("directory_attributes")?;
+
+        db.put_cf("directory_attributes", b"existing", base.encode())?;
+        db.db().merge_cf(cf, b"existing", legacy)?;
+        db.db().merge_cf(cf, b"existing", current.encode())?;
+
+        db.db()
+            .merge_cf(cf, b"current-first", current.with_base(base).encode())?;
+        db.db().merge_cf(cf, b"current-first", legacy)?;
+
+        db.db().merge_cf(cf, b"legacy-first", legacy)?;
+        db.db()
+            .merge_cf(cf, b"legacy-first", current.with_base(base).encode())?;
+
+        assert_eq!(
+            read_directory_attributes(&db, b"existing")?,
+            Some(DirectoryAttributes::new(20, 20, 4))
+        );
+        assert_eq!(
+            read_directory_attributes(&db, b"current-first")?,
+            Some(DirectoryAttributes::new(20, 20, 4))
+        );
+        assert!(read_directory_attributes(&db, b"legacy-first").is_err());
+    }
+
+    let db = DBEngine::new(conf, false)?;
+    assert_eq!(
+        read_directory_attributes(&db, b"existing")?,
+        Some(DirectoryAttributes::new(20, 20, 4))
+    );
+    assert_eq!(
+        read_directory_attributes(&db, b"current-first")?,
+        Some(DirectoryAttributes::new(20, 20, 4))
+    );
+    assert!(read_directory_attributes(&db, b"legacy-first").is_err());
+    Ok(())
+}
+
+fn legacy_directory_delta(mtime: i64, ctime: i64, nlink_delta: i32) -> [u8; 24] {
+    let mut bytes = [0; 24];
+    bytes[..4].copy_from_slice(b"CDD1");
+    bytes[4..12].copy_from_slice(&mtime.to_le_bytes());
+    bytes[12..20].copy_from_slice(&ctime.to_le_bytes());
+    bytes[20..24].copy_from_slice(&nlink_delta.to_le_bytes());
+    bytes
+}
+
+fn read_directory_attributes(
+    db: &DBEngine,
+    key: &[u8],
+) -> CommonResult<Option<DirectoryAttributes>> {
+    db.get_cf("directory_attributes", key)?
+        .map(|value| {
+            DirectoryAttributes::decode(&value).ok_or_else(|| {
+                curvine_core_error::CommonError::from("invalid directory attributes")
+            })
+        })
+        .transpose()
 }
 
 fn to_vec(iter: RocksIterator) -> Vec<String> {

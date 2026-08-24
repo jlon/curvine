@@ -19,9 +19,10 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use curvine_core_error::{err_box, CommonResult};
+use curvine_core_error::{err_box, CommonError, CommonResult};
 use curvine_model::{
-    FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction, INTERNAL_CTIME_XATTR,
+    DirectoryAttributeDelta, DirectoryAttributes, FileStatus, FileType, SetAttrOpts, StoragePolicy,
+    TtlAction, INTERNAL_CTIME_XATTR,
 };
 use curvine_runtime::common::SerdeUtils;
 use curvine_runtime::common::{LocalTime, Utils};
@@ -177,7 +178,7 @@ impl InodeView {
         path.starts_with(PATH_SEPARATOR)
     }
 
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
+    pub fn get_child(&self, name: &str) -> Option<InodeView> {
         match self {
             File(_) => None,
             Dir(d) => d.get_child(name),
@@ -193,22 +194,39 @@ impl InodeView {
         }
     }
 
-    // Test and print for use. Memory copying occurs.
-    pub fn children(&self) -> Vec<&InodeView> {
-        let mut vec = Vec::with_capacity(8);
-        if let Dir(d) = self {
-            for item in d.children_iter() {
-                vec.push(item)
-            }
+    pub(crate) fn get_child_ptr_exclusive(&self, name: &str) -> Option<InodePtr> {
+        match self {
+            File(_) => None,
+            Dir(directory) => directory.get_child_ptr_exclusive(name),
+            FileEntry(_) => None,
         }
+    }
 
-        vec
+    pub(crate) fn set_directory_children_handle(
+        &mut self,
+        children: std::sync::Arc<crate::master::meta::inode::DirectoryChildren>,
+    ) -> CommonResult<()> {
+        match self {
+            Dir(directory) => {
+                directory.set_children_handle(children);
+                Ok(())
+            }
+            _ => err_box!("inode {} is not a directory", self.name()),
+        }
+    }
+
+    // Test and print for use. Memory copying occurs.
+    pub fn children(&self) -> Vec<InodeView> {
+        match self {
+            Dir(d) => d.children_vec(),
+            _ => vec![],
+        }
     }
 
     pub fn child_len(&self) -> usize {
         match self {
             File(_) => 0,
-            Dir(d) => d.children_iter().len(),
+            Dir(d) => d.children_len(),
             FileEntry(..) => 0,
         }
     }
@@ -262,35 +280,32 @@ impl InodeView {
         }
     }
 
-    pub fn incr_nlink(&mut self, ctime: i64) {
+    pub fn incr_nlink(&mut self, ctime: i64) -> CommonResult<()> {
         match self {
             File(f) => {
-                f.nlink += 1;
+                f.nlink = f
+                    .nlink
+                    .checked_add(1)
+                    .ok_or_else(|| CommonError::from("file nlink overflow"))?;
                 f.update_ctime(ctime);
+                Ok(())
             }
-            Dir(d) => {
-                d.nlink += 1;
-                d.update_ctime(ctime);
-            }
-            FileEntry(..) => (),
+            Dir(d) => d.incr_nlink(ctime),
+            FileEntry(..) => Ok(()),
         }
     }
 
-    pub fn dec_nlink(&mut self, ctime: i64) {
+    pub fn dec_nlink(&mut self, ctime: i64) -> CommonResult<()> {
         match self {
             File(f) => {
                 if f.nlink > 0 {
                     f.nlink -= 1;
                     f.update_ctime(ctime);
                 }
+                Ok(())
             }
-            Dir(d) => {
-                if d.nlink > 0 {
-                    d.nlink -= 1;
-                    d.update_ctime(ctime);
-                }
-            }
-            FileEntry(..) => (),
+            Dir(d) => d.dec_nlink(ctime),
+            FileEntry(..) => Ok(()),
         }
     }
 
@@ -434,16 +449,25 @@ impl InodeView {
     }
 
     pub fn set_attr(&mut self, opts: SetAttrOpts) -> CommonResult<()> {
-        if let Some(owner) = opts.owner {
-            self.acl_mut()?.owner = owner;
+        let ctime = opts
+            .add_x_attr
+            .get(INTERNAL_CTIME_XATTR)
+            .and_then(|value| value.as_slice().try_into().ok())
+            .map(i64::from_le_bytes);
+        if let Some(owner) = opts.owner.as_ref() {
+            self.acl_mut()?.owner = owner.clone();
         }
 
-        if let Some(group) = opts.group {
-            self.acl_mut()?.group = group;
+        if let Some(group) = opts.group.as_ref() {
+            self.acl_mut()?.group = group.clone();
         }
 
         if let Some(mode) = opts.mode {
             self.acl_mut()?.mode = mode;
+        }
+
+        if let Dir(directory) = self {
+            directory.update_inheritance(opts.group.as_deref(), opts.mode);
         }
 
         // Handle time modifications
@@ -458,7 +482,7 @@ impl InodeView {
         if let Some(mtime) = opts.mtime {
             match self {
                 File(f) => f.mtime = mtime,
-                Dir(d) => d.mtime = mtime,
+                Dir(d) => d.set_mtime(mtime),
                 _ => (),
             }
         }
@@ -484,6 +508,12 @@ impl InodeView {
             }
         }
 
+        if let Some(ctime) = ctime {
+            if let Dir(directory) = &mut *self {
+                directory.update_ctime(ctime);
+            }
+        }
+
         if let Some(ufs_mtime) = opts.ufs_mtime {
             if self.is_file() {
                 self.storage_policy_mut()?.save_ufs(ufs_mtime);
@@ -491,6 +521,59 @@ impl InodeView {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn directory_attributes(&self) -> Option<DirectoryAttributes> {
+        match self {
+            Dir(directory) => Some(directory.directory_attributes()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_directory_attributes(&self, attributes: DirectoryAttributes) {
+        if let Dir(directory) = self {
+            directory.set_directory_attributes(attributes);
+        }
+    }
+
+    pub(crate) fn apply_directory_attribute_delta(
+        &self,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<()> {
+        match self {
+            Dir(directory) => directory.apply_directory_attribute_delta(delta),
+            _ => err_box!("directory attributes require a directory inode"),
+        }
+    }
+
+    pub(crate) fn updated_directory_attributes(
+        &self,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<DirectoryAttributes> {
+        match self {
+            Dir(directory) => directory.updated_directory_attributes(delta),
+            _ => err_box!("directory attributes require a directory inode"),
+        }
+    }
+
+    pub(crate) fn directory_attribute_delta(
+        &self,
+        delta: DirectoryAttributeDelta,
+    ) -> CommonResult<DirectoryAttributeDelta> {
+        match self {
+            Dir(directory) => Ok(directory.directory_attribute_delta(delta)),
+            _ => err_box!("directory attributes require a directory inode"),
+        }
+    }
+
+    pub(crate) fn mark_directory_attributes_persisted(&self) {
+        if let Dir(directory) = self {
+            directory.mark_directory_attributes_persisted();
+        }
+    }
+
+    pub(crate) fn has_persisted_directory_attributes(&self) -> bool {
+        matches!(self, Dir(directory) if directory.has_persisted_directory_attributes())
     }
 
     pub fn to_file_status(&self, path: &str) -> CommonResult<FileStatus> {
@@ -522,6 +605,7 @@ impl InodeView {
 
             Dir(d) => {
                 let acl = &d.features.acl;
+                let children_len = d.children_len();
                 Ok(FileStatus {
                     id: self.id(),
                     path: path.to_owned(),
@@ -529,9 +613,9 @@ impl InodeView {
                     is_dir: true,
                     mtime: self.mtime(),
                     atime: self.atime(),
-                    children_num: self.child_len() as i32,
+                    children_num: children_len as i32,
                     is_complete: false,
-                    len: d.children_len() as i64,
+                    len: children_len as i64,
                     replicas: 0,
                     block_size: 0,
                     file_type: FileType::Dir,
@@ -591,7 +675,7 @@ impl InodeView {
     pub fn sum_hash(&self) -> CommonResult<u128> {
         let mut res: u128 = 0;
         let mut stack = LinkedList::new();
-        stack.push_back(self);
+        stack.push_back(self.clone());
 
         while let Some(v) = stack.pop_front() {
             let bytes = SerdeUtils::serialize(&v)?;
@@ -713,10 +797,10 @@ mod tests {
         inode.update_mtime(3);
         assert_eq!(inode.ctime(), 3);
 
-        inode.incr_nlink(4);
+        inode.incr_nlink(4).unwrap();
         assert_eq!(inode.ctime(), 4);
 
-        inode.dec_nlink(5);
+        inode.dec_nlink(5).unwrap();
         assert_eq!(inode.ctime(), 5);
     }
 

@@ -4465,3 +4465,25 @@ mod tests {
         assert!(MasterFilesystem::validate_alloc_capacity(20, 2, &opts, 0).is_ok());
     }
 }
+
+/// Bridge between the namespace-internal delete summary and the wire-level
+/// model type, accepting both owned and borrowed values.
+trait AsModelDelete {
+    fn as_model_delete(&self) -> DeleteResult;
+}
+
+impl AsModelDelete for FsDeleteResult {
+    fn as_model_delete(&self) -> DeleteResult {
+        DeleteResult {
+            inodes: self.inodes,
+            bytes: 0,
+            blocks: self.blocks.clone(),
+        }
+    }
+}
+
+impl AsModelDelete for &FsDeleteResult {
+    fn as_model_delete(&self) -> DeleteResult {
+        (*self).as_model_delete()
+    }
+}

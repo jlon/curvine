@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::DeleteResult;
+use curvine_model::DeleteResult;
 use curvine_model::{DeleteBlockCmd, WorkerCommand};
 use std::collections::{HashMap, HashSet};
 

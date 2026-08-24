@@ -15,7 +15,7 @@
 use clap::Parser;
 use curvine_core_error::CommonResult;
 use curvine_job_client::{JobMasterClient, TransferClient};
-use curvine_model::{JobTaskState, TransferState};
+use curvine_model::TransferState;
 
 use crate::util::*;
 
@@ -60,10 +60,7 @@ impl LoadStatusCommand {
         loop {
             let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
             println!("{}", status);
-            if matches!(
-                status.state,
-                JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
-            ) {
+            if status.state.is_finish() {
                 break;
             }
             tokio::time::sleep(duration).await;

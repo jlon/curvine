@@ -34,12 +34,11 @@ use curvine_error::FsError;
 use curvine_fs_api::{FileSystem, ListStream, Path};
 use curvine_fs_api::{StateReader, StateWriter};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, RenameFlags,
-    SetAttrOpts,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags,
+    RenameFlags, SetAttrOpts,
 };
 use curvine_runtime::common::FastHashMap;
 use curvine_runtime::sync::{AsyncMutex, AsyncSharedMap, AtomicCounter, RwLockHashMap};
-use curvine_sys::RawPtr;
 use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
@@ -442,7 +441,7 @@ impl NodeState {
             };
             status.id = ino as i64;
             let handle = self
-                .insert_handle_with_writer(ino, Some(RawPtr::from_owned(reader)), None, status)
+                .insert_handle_with_writer(ino, Some(Arc::new(reader)), None, status)
                 .await;
             return Ok(handle);
         }
@@ -475,7 +474,7 @@ impl NodeState {
                 None
             } else {
                 let reader = self.new_reader(path).await?;
-                Some(RawPtr::from_owned(reader))
+                Some(Arc::new(reader))
             }
         } else {
             None
@@ -494,7 +493,7 @@ impl NodeState {
     async fn insert_handle_with_writer(
         &self,
         ino: u64,
-        reader: Option<RawPtr<FuseReader>>,
+        reader: Option<Arc<FuseReader>>,
         writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Arc<FileHandle> {
@@ -678,12 +677,12 @@ impl NodeState {
     pub fn complete_deferred_delete(
         &self,
         ino: u64,
-        delete_result: Result<(), FsError>,
+        delete_result: Result<DeleteResult, FsError>,
     ) -> FuseResult<()> {
         // Keep the mark observable after failure; reclaiming it without another
         // FUSE request would need a background retry, which is not yet implemented.
         match delete_result {
-            Ok(()) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
+            Ok(_) | Err(FsError::FileNotFound(_)) => self.clear_mark_delete(ino),
             Err(e) => Err(e.into()),
         }
     }
@@ -693,6 +692,7 @@ impl NodeState {
             let dir = self.dir_read();
             dir.get_path_name(parent, name)?
         };
+        let _guard = self.lock_path(&path).await;
 
         let ino = {
             let dir = self.dir_read();
@@ -705,7 +705,7 @@ impl NodeState {
         // not failed by ENOENT on a stale name.
         let Some(ino) = ino else {
             return match self.fs.delete(&path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => Ok(()),
+                Ok(_) | Err(FsError::FileNotFound(_)) => Ok(()),
                 Err(e) => Err(e.into()),
             };
         };
@@ -728,7 +728,7 @@ impl NodeState {
                     .await?;
             }
             match self.fs.delete(&path, false).await {
-                Ok(()) | Err(FsError::FileNotFound(_)) => (),
+                Ok(_) | Err(FsError::FileNotFound(_)) => (),
                 Err(e) => {
                     self.restore_unlink_state(rollback)?;
                     return Err(e.into());
@@ -753,7 +753,7 @@ impl NodeState {
         }
 
         match self.fs.delete(&path, false).await {
-            Ok(()) => (),
+            Ok(_) => (),
             Err(FsError::FileNotFound(_)) => (),
             Err(e) => {
                 self.restore_unlink_state(rollback)?;
@@ -1016,7 +1016,22 @@ impl NodeState {
         None
     }
 
+    fn unlinked_status(&self, ino: u64) -> Option<FileStatus> {
+        let dir = self.dir_read();
+        dir.get_inode(ino, None)
+            .filter(|inode| inode.is_unlinked())
+            .map(|inode| inode.clone_status())
+    }
+
     pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        // An unlinked inode can remain addressable by nodeid until the kernel
+        // releases its lookup/open references. Its former path no longer exists.
+        if name.is_none() {
+            if let Some(status) = self.unlinked_status(ino) {
+                return Ok(status);
+            }
+        }
+
         if let Some(status) = self.get_cached_status(ino, name, false)? {
             return Ok(status);
         }
@@ -1026,6 +1041,25 @@ impl NodeState {
 
         self.cache_resolved_status(ino, name, &status);
 
+        Ok(status)
+    }
+
+    pub async fn fs_stat_guarded(&self, ino: u64) -> FuseResult<FileStatus> {
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+        if let Some(status) = self.get_cached_status(ino, None, false)? {
+            return Ok(status);
+        }
+
+        let path = self.get_path(ino)?;
+        let _guard = self.lock_path(&path).await;
+        if let Some(status) = self.unlinked_status(ino) {
+            return Ok(status);
+        }
+
+        let status = self.fs.get_status(&path).await?;
+        self.cache_resolved_status(ino, None, &status);
         Ok(status)
     }
 
@@ -1620,6 +1654,53 @@ mod test {
             .get_cached_status(FUSE_ROOT_ID, None, false)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn guarded_fs_stat_observes_concurrent_directory_unlink() {
+        let rt = Arc::new(AsyncRuntime::single());
+        rt.block_on(async {
+            let mut conf = ClusterConf::default();
+            conf.fuse.enable_meta_cache = true;
+            conf.fuse.metrics_enabled = false;
+            let fs = UnifiedFileSystem::with_rt(conf, rt.clone()).unwrap();
+            let state = Arc::new(NodeState::new(fs).unwrap());
+
+            let ino = {
+                let mut dir = state.dir_write();
+                let mut status = FileStatus::with_name(42, "gone".to_string(), true);
+                status.mode = 0o755;
+                status.nlink = 2;
+                let ino = dir.lookup(FUSE_ROOT_ID, "gone", status, true).unwrap().ino;
+                dir.get_inode_mut_check(ino, None).unwrap().invalid_cache();
+                ino
+            };
+
+            let path = state.get_path(ino).unwrap();
+            let guard = state.lock_path(&path).await;
+            let task_state = state.clone();
+            let stat_task = tokio::spawn(async move { task_state.fs_stat_guarded(ino).await });
+            tokio::task::yield_now().await;
+
+            state
+                .dir_write()
+                .unlink(FUSE_ROOT_ID, "gone", false)
+                .unwrap();
+            drop(guard);
+
+            let status = stat_task.await.unwrap().unwrap();
+            assert!(status.is_dir);
+            assert_eq!(status.mode, 0o755);
+            assert_eq!(status.nlink, 1);
+            assert_eq!(
+                state
+                    .dir_read()
+                    .get_inode_check(ino, None)
+                    .unwrap()
+                    .n_lookup,
+                1
+            );
+        });
     }
 
     #[test]

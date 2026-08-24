@@ -26,17 +26,19 @@ use curvine_fs_api::Path;
 use curvine_fs_api::RpcCode;
 use curvine_model::ProtoUtils;
 use curvine_model::{
-    CreateFileOpts, DeleteBlockCmd, FileBlocks, FileLock, FileStatus, FreeResult, HeartbeatStatus,
-    ListOptions, MasterInfo, OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
+    CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict, CreateFileOpts, DeleteBlockCmd,
+    DeleteResult, FileBlocks, FileStatus, FilesystemInfo, FreeResult, HeartbeatStatus, ListOptions,
+    OpenFlags, RenameFlags, WorkerCommand, WorkerInfo,
 };
 use curvine_net::net::ConnState;
 use curvine_proto::*;
 use curvine_rpc::handler::MessageHandler;
 use curvine_rpc::message::Message;
-use curvine_runtime::runtime::{RpcRuntime, Runtime};
+use curvine_runtime::runtime::{GroupExecutor, Runtime};
+use dashmap::DashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -46,15 +48,22 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
-    pub(crate) control_rpc_rt: Arc<Runtime>,
-    pub(crate) control_rpc_admission: Arc<Semaphore>,
-    pub(crate) client_request_admission: Arc<Semaphore>,
-    pub(crate) client_blocking_admission: Option<Arc<Semaphore>>,
-    pub(crate) control_request_admission: Arc<Semaphore>,
-    pub(crate) metadata_read_rt: Arc<Runtime>,
-    pub(crate) metadata_read_admission: Arc<Semaphore>,
+    pub(crate) control_rpc_executor: Arc<GroupExecutor>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
     pub(crate) actor_rt: Arc<Runtime>,
+    // Master's own version + compatibility contract, built once at startup.
+    // GetFilesystemInfo backs statfs and is called frequently, so we reuse
+    // this instead of recomputing component_version() on every call.
+    master_compatibility: ServerCompatibilityInfoProto,
+    // Compatibility policy derived from the master configuration. Used to
+    // evaluate worker heartbeats and client handshakes with diagnose/enforce
+    // semantics (lenient diagnose by default).
+    compatibility_policy: CompatibilityPolicy,
+    // Last compatibility verdict warned about per peer (worker id / client
+    // address). Diagnose-mode warnings are deduped so a persistently
+    // incompatible or legacy peer does not spam identical warnings on every
+    // heartbeat or statfs call.
+    compat_warned: DashMap<String, CompatibilityVerdict>,
 }
 
 impl MasterHandler {
@@ -66,18 +75,21 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
-        control_rpc_rt: Arc<Runtime>,
-        control_rpc_admission: Arc<Semaphore>,
-        client_request_admission: Arc<Semaphore>,
-        client_blocking_admission: Option<Arc<Semaphore>>,
-        control_request_admission: Arc<Semaphore>,
-        metadata_read_rt: Arc<Runtime>,
-        metadata_read_admission: Arc<Semaphore>,
+        control_rpc_executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
     ) -> Self {
         metrics.active_connections.inc();
+        // Build the master's compatibility payload once; GetFilesystemInfo can
+        // be hot (statfs) and the underlying version metadata is immutable.
+        let master_version = curvine_sys::version::component_version("master");
+        // The advertised contract and the enforcement policy both come from
+        // the configured compatibility section; defaults are lenient diagnose
+        // with no bounds, so old components are never rejected by default.
+        let compatibility_policy = conf.master.compatibility.to_policy();
+        let master_compatibility =
+            ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
         Self {
             fs,
             retry_cache,
@@ -86,15 +98,12 @@ impl MasterHandler {
             conn_state,
             mount_manager,
             job_handler,
-            control_rpc_rt,
-            control_rpc_admission,
-            client_request_admission,
-            client_blocking_admission,
-            control_request_admission,
-            metadata_read_rt,
-            metadata_read_admission,
+            control_rpc_executor,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
+            master_compatibility,
+            compatibility_policy,
+            compat_warned: DashMap::new(),
         }
     }
 
@@ -214,21 +223,6 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    async fn async_file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: GetFileStatusRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(header.path.to_string()), None);
-        let fs = self.fs.clone();
-        let status = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || fs.file_status(&header.path),
-        )
-        .await?;
-        ctx.response(GetFileStatusResponse {
-            status: ProtoUtils::file_status_to_pb(status),
-        })
-    }
-
     pub fn exists(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: ExistsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
@@ -238,22 +232,9 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    async fn async_exists(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: ExistsRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(header.path.to_string()), None);
-        let fs = self.fs.clone();
-        let exists = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || fs.exists(&header.path),
-        )
-        .await?;
-        ctx.response(ExistsResponse { exists })
-    }
-
-    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<bool> {
+    pub fn delete0(&self, req_id: i64, header: DeleteRequest) -> FsResult<DeleteResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(true);
+            return Ok(DeleteResult::default());
         }
 
         let path = Path::from_str(&header.path)?;
@@ -271,8 +252,10 @@ impl MasterHandler {
         let header: DeleteRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        self.delete0(ctx.msg.req_id(), header)?;
-        let rep_header = DeleteResponse::default();
+        let res = self.delete0(ctx.msg.req_id(), header)?;
+        let rep_header = DeleteResponse {
+            res: Some(ProtoUtils::delete_res_to_pb(res)),
+        };
         ctx.response(rep_header)
     }
 
@@ -299,15 +282,7 @@ impl MasterHandler {
         if self.check_is_retry(req_id)? {
             return Ok(true);
         }
-        let flags = RenameFlags::try_new(header.flags).ok_or_else(|| {
-            FsError::invalid_argument(format!("invalid rename flags: {:#x}", header.flags))
-        })?;
-        if !flags.is_supported() {
-            return Err(FsError::unsupported(format!(
-                "unsupported rename flags: {:#x}",
-                header.flags
-            )));
-        }
+        let flags = RenameFlags::new(header.flags);
         let res = self.fs.rename(&header.src, &header.dst, flags);
         self.set_req_cache(req_id, res)
     }
@@ -337,24 +312,6 @@ impl MasterHandler {
 
     fn process_list_status(fs: MasterFilesystem, path: String) -> FsResult<Vec<FileStatus>> {
         fs.list_status(&path)
-    }
-
-    async fn async_list_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: ListStatusRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(header.path.to_string()), None);
-        let fs = self.fs.clone();
-        let list = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || Self::process_list_status(fs, header.path),
-        )
-        .await?;
-        ctx.response(ListStatusResponse {
-            statuses: list
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
-        })
     }
 
     // The add block internally determines whether it is a retry request.
@@ -516,75 +473,62 @@ impl MasterHandler {
         fs.get_block_locations(path)
     }
 
-    async fn async_get_block_locations(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let req: GetBlockLocationsRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(req.path.to_string()), None);
-        let fs = self.fs.clone();
-        let blocks = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || Self::process_get_block_locations(fs, req.path),
-        )
-        .await?;
-        let rep_header = GetBlockLocationsResponse {
-            blocks: ProtoUtils::file_blocks_to_pb(blocks),
-        };
-        ctx.response(rep_header)
-    }
-
-    async fn async_open_file_read(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: OpenFileRequest = ctx.parse_header()?;
-        let flags = OpenFlags::new(header.flags);
-        if !flags.read_only() {
-            return err_box!("mutable OpenFile request was dispatched as a metadata read");
-        }
-        let audit_path = format!("{}:{}", flags.access_mark(), header.path);
-        ctx.set_audit(Some(audit_path), None);
-        let fs = self.fs.clone();
-        let blocks = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || Self::process_get_block_locations(fs, header.path),
-        )
-        .await?;
-        ctx.response(OpenFileResponse {
-            file_blocks: ProtoUtils::file_blocks_to_pb(blocks),
-        })
-    }
-
-    async fn run_master_rpc_task<T, F>(
-        rt: Arc<Runtime>,
-        admission: Arc<Semaphore>,
-        task: F,
-    ) -> FsResult<T>
+    async fn run_master_rpc_task<T, F>(executor: Arc<GroupExecutor>, task: F) -> FsResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> FsResult<T> + Send + 'static,
     {
-        let permit = admission
-            .acquire_owned()
-            .await
-            .map_err(|_| FsError::common("master RPC executor has stopped"))?;
-        rt.spawn_blocking(move || {
-            let _permit = permit;
-            panic::catch_unwind(AssertUnwindSafe(task))
-                .unwrap_or_else(|_| err_box!("master RPC task panicked"))
-        })
-        .await
-        .map_err(|error| FsError::common(format!("master RPC executor stopped: {error}")))?
+        let (tx, rx) = oneshot::channel();
+        executor.try_spawn(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| err_box!("master control RPC task panicked"));
+            let _ = tx.send(result);
+        })?;
+        rx.await?
     }
 
-    async fn async_get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetMasterInfoRequest = ctx.parse_header()?;
+    async fn async_get_filesystem_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: GetFilesystemInfoRequest = ctx.parse_header()?;
+        // GetFilesystemInfo backs statfs and is called frequently. Only
+        // evaluate the compatibility policy when the result can actually be
+        // acted upon (enforce mode, configured bounds/blocklist, or the client
+        // reported component_info); otherwise a legacy client would hit a
+        // MissingInfo verdict and log a warning on every statfs call.
+        if self
+            .compatibility_policy
+            .should_evaluate(req.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "client",
+                &format!("client:{}", self.client_ip()),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_client(req.component_info.as_ref()),
+                self.metrics,
+            )?;
+        }
         let fs = self.fs.clone();
-        let info = Self::run_master_rpc_task(
-            self.control_rpc_rt.clone(),
-            self.control_rpc_admission.clone(),
-            move || Self::process_get_master_info(fs),
-        )
+        let info = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            Self::process_get_filesystem_info(fs)
+        })
         .await?;
-        let rep_header = ProtoUtils::master_info_to_pb(info);
+        let rep_header = Self::build_filesystem_info_response(info, &self.master_compatibility);
         ctx.response(rep_header)
+    }
+
+    /// Build the GetFilesystemInfo response, attaching the master's own version
+    /// and the default (lenient) compatibility contract on the reserved 1000+
+    /// field range. Legacy clients that do not know the field simply skip it,
+    /// so this never breaks older peers. The compatibility payload is built
+    /// once at handler construction and reused across requests.
+    fn build_filesystem_info_response(
+        info: FilesystemInfo,
+        master_compatibility: &ServerCompatibilityInfoProto,
+    ) -> GetFilesystemInfoResponse {
+        let mut rep_header = ProtoUtils::filesystem_info_to_pb(info);
+        rep_header.compatibility = Some(master_compatibility.clone());
+        rep_header
     }
 
     async fn async_get_cv_metadata_snapshot_page(
@@ -594,28 +538,24 @@ impl MasterHandler {
         let req: GetCvMetadataSnapshotPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-snapshot".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || {
-                let page = fs.cv_metadata_snapshot_page(
-                    req.page_token,
-                    req.page_size.unwrap_or(10_000) as usize,
-                )?;
-                Ok(GetCvMetadataSnapshotPageResponse {
-                    entries: page
-                        .entries
-                        .into_iter()
-                        .map(|entry| CvMetadataSnapshotEntryProto {
-                            status: ProtoUtils::file_status_to_pb(entry.status),
-                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                        })
-                        .collect(),
-                    next_page_token: page.next_page_token,
-                    epoch: page.epoch,
-                })
-            },
-        )
+        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            let page = fs.cv_metadata_snapshot_page(
+                req.page_token,
+                req.page_size.unwrap_or(10_000) as usize,
+            )?;
+            Ok(GetCvMetadataSnapshotPageResponse {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(|entry| CvMetadataSnapshotEntryProto {
+                        status: ProtoUtils::file_status_to_pb(entry.status),
+                        blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token,
+                epoch: page.epoch,
+            })
+        })
         .await?;
         ctx.response(response)
     }
@@ -627,50 +567,165 @@ impl MasterHandler {
         let req: GetCvMetadataDeltaPageRequest = ctx.parse_header()?;
         ctx.set_audit(Some("cv-metadata-delta".to_string()), None);
         let fs = self.fs.clone();
-        let response = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || {
-                let page = fs.cv_metadata_delta_page(
-                    req.from_epoch,
-                    req.target_epoch,
-                    req.page_token,
-                    req.page_size.unwrap_or(10_000) as usize,
-                )?;
-                Ok(GetCvMetadataDeltaPageResponse {
-                    entries: page
-                        .entries
-                        .into_iter()
-                        .map(|entry| CvMetadataDeltaEntryProto {
-                            path: entry.path,
-                            entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
-                                status: ProtoUtils::file_status_to_pb(entry.status),
-                                blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
-                            }),
-                        })
-                        .collect(),
-                    next_page_token: page.next_page_token,
-                    from_epoch: page.from_epoch,
-                    to_epoch: page.to_epoch,
-                    full_snapshot_required: page.full_snapshot_required,
-                })
-            },
-        )
+        let response = Self::run_master_rpc_task(self.control_rpc_executor.clone(), move || {
+            let page = fs.cv_metadata_delta_page(
+                req.from_epoch,
+                req.target_epoch,
+                req.page_token,
+                req.page_size.unwrap_or(10_000) as usize,
+            )?;
+            Ok(GetCvMetadataDeltaPageResponse {
+                entries: page
+                    .entries
+                    .into_iter()
+                    .map(|entry| CvMetadataDeltaEntryProto {
+                        path: entry.path,
+                        entry: entry.entry.map(|entry| CvMetadataSnapshotEntryProto {
+                            status: ProtoUtils::file_status_to_pb(entry.status),
+                            blocks: entry.blocks.map(ProtoUtils::file_blocks_to_pb),
+                        }),
+                    })
+                    .collect(),
+                next_page_token: page.next_page_token,
+                from_epoch: page.from_epoch,
+                to_epoch: page.to_epoch,
+                full_snapshot_required: page.full_snapshot_required,
+            })
+        })
         .await?;
         ctx.response(response)
     }
 
-    fn process_get_master_info(fs: MasterFilesystem) -> FsResult<MasterInfo> {
-        fs.master_info()
+    fn process_get_filesystem_info(fs: MasterFilesystem) -> FsResult<FilesystemInfo> {
+        fs.filesystem_info()
     }
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
+        // Evaluate the compatibility policy only when the result can actually
+        // be acted upon (enforce mode, configured bounds/blocklist, or the
+        // worker reported component_info); otherwise a legacy worker would hit
+        // a MissingInfo verdict and log a warning on every heartbeat.
+        if self
+            .compatibility_policy
+            .should_evaluate(header.component_info.is_some())
+        {
+            Self::check_peer_compatibility(
+                "worker",
+                &format!("worker:{}", header.worker_id),
+                &self.compat_warned,
+                self.compatibility_policy.mode,
+                self.compatibility_policy
+                    .check_worker(header.component_info.as_ref()),
+                self.metrics,
+            )?;
+        }
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
         ctx.response(rep_header)
+    }
+
+    /// Evaluate a compatibility verdict against the configured mode.
+    ///
+    /// - `diagnose` (default): log a warning for non-compatible peers and
+    ///   allow the request, so old components are never rejected without
+    ///   explicit configuration.
+    /// - `enforce`: reject with an explicit error describing the actual peer
+    ///   version, the expected bound and the upgrade suggestion.
+    ///
+    /// Diagnose-mode warnings are deduped per peer: a persistently
+    /// incompatible or legacy peer (heartbeats run every few seconds, statfs
+    /// every call) warns on the first occurrence and again only when its
+    /// verdict changes, so repeated identical warnings do not flood
+    /// operational logs.
+    fn check_peer_compatibility(
+        peer: &str,
+        dedup_key: &str,
+        warned: &DashMap<String, CompatibilityVerdict>,
+        mode: CompatibilityMode,
+        verdict: CompatibilityVerdict,
+        metrics: &MasterMetrics,
+    ) -> FsResult<()> {
+        // Record the compatibility verdict as a metric. Only one verdict
+        // label per peer is active at a time, so set the current label to 1
+        // and clear every other label for the peer; otherwise a peer whose
+        // verdict changes over time leaves stale series stuck at 1.
+        let verdict_label = Self::verdict_label(&verdict);
+        let is_worker = dedup_key.starts_with("worker:");
+        for label in Self::VERDICT_LABELS {
+            let active = if label == verdict_label { 1 } else { 0 };
+            if is_worker {
+                let worker_id = &dedup_key["worker:".len()..];
+                metrics
+                    .compat_worker_verdict
+                    .with_label_values(&[worker_id, label])
+                    .set(active);
+            } else {
+                metrics
+                    .compat_client_verdict
+                    .with_label_values(&[dedup_key, label])
+                    .set(active);
+            }
+        }
+
+        if !verdict.rejects(mode) {
+            if !verdict.is_compatible() {
+                // Warn on the first occurrence and whenever the verdict
+                // changes for this peer; suppress identical repeats.
+                let changed = warned
+                    .get(dedup_key)
+                    .map(|last| *last != verdict)
+                    .unwrap_or(true);
+                if changed {
+                    warned.insert(dedup_key.to_string(), verdict.clone());
+                    log::warn!("{} compatibility: {}", peer, verdict.describe());
+                }
+            } else {
+                // The peer is compatible again; forget the previous warning so
+                // a future incompatibility is surfaced.
+                warned.remove(dedup_key);
+            }
+            return Ok(());
+        }
+        // Enforce-mode rejection: record the counter and return the error.
+        metrics
+            .compat_enforce_rejected_total
+            .with_label_values(&[peer, verdict_label])
+            .inc();
+        err_box!(
+            "{} rejected by compatibility policy: {}; upgrade the {} or set master.compatibility.mode = \"diagnose\" to allow it",
+            peer,
+            verdict.describe(),
+            peer
+        )
+    }
+
+    /// All verdict label values for the compat_*_verdict gauge vectors, kept
+    /// in sync with [`Self::verdict_label`]. Only one label per peer is active
+    /// at a time: recording a verdict sets the current label to 1 and clears
+    /// every other label for that peer.
+    const VERDICT_LABELS: [&str; 6] = [
+        "compatible",
+        "missing_info",
+        "blocked",
+        "protocol_mismatch",
+        "version_too_old",
+        "version_unknown",
+    ];
+
+    /// Short human-readable label for a compatibility verdict, used as a
+    /// Prometheus label value in compat_*_verdict and compat_enforce_rejected_total.
+    fn verdict_label(verdict: &CompatibilityVerdict) -> &'static str {
+        match verdict {
+            CompatibilityVerdict::Compatible => "compatible",
+            CompatibilityVerdict::MissingInfo => "missing_info",
+            CompatibilityVerdict::Blocked(_) => "blocked",
+            CompatibilityVerdict::ProtocolMismatch { .. } => "protocol_mismatch",
+            CompatibilityVerdict::VersionTooOld { .. } => "version_too_old",
+            CompatibilityVerdict::VersionUnknown { .. } => "version_unknown",
+        }
     }
 
     fn process_worker_heartbeat(
@@ -703,6 +758,7 @@ impl MasterHandler {
             header.software_version,
             u64::try_from(header.fs_ctime).unwrap_or_default(),
             ProtoUtils::storage_info_list_from_pb(header.storages),
+            header.component_info,
         )?;
         Ok(cmds)
     }
@@ -738,39 +794,6 @@ impl MasterHandler {
         match &self.conn_state {
             None => "",
             Some(v) => &v.remote_addr.hostname,
-        }
-    }
-
-    fn ensure_active(&self, code: RpcCode) -> FsResult<()> {
-        if self.fs.master_monitor.is_active() {
-            Ok(())
-        } else {
-            Err(FsError::not_leader_master(code, self.client_ip()))
-        }
-    }
-
-    fn is_read_only_open(msg: &Message) -> bool {
-        msg.parse_header::<OpenFileRequest>()
-            .map(|header| OpenFlags::new(header.flags).read_only())
-            .unwrap_or(false)
-    }
-
-    fn requires_active_after_response(msg: &Message) -> bool {
-        match RpcCode::from(msg.code()) {
-            RpcCode::OpenFile => Self::is_read_only_open(msg),
-            RpcCode::FileStatus
-            | RpcCode::Exists
-            | RpcCode::ListStatus
-            | RpcCode::ListOptions
-            | RpcCode::GetBlockLocations
-            | RpcCode::GetLock
-            | RpcCode::GetMountTable
-            | RpcCode::GetMountInfo
-            | RpcCode::GetJobStatus
-            | RpcCode::GetMasterInfo
-            | RpcCode::GetCvMetadataSnapshotPage
-            | RpcCode::GetCvMetadataDeltaPage => true,
-            _ => false,
         }
     }
 
@@ -925,35 +948,11 @@ impl MasterHandler {
         let lock = ProtoUtils::file_lock_from_pb(header.lock);
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let conflict = Self::process_get_lock(self.fs.clone(), header.path, lock)?;
+        let conflict = self.fs.get_lock(header.path, lock)?;
         let rep_header = GetLockResponse {
             conflict: conflict.map(ProtoUtils::file_lock_to_pb),
         };
         ctx.response(rep_header)
-    }
-
-    fn process_get_lock(
-        fs: MasterFilesystem,
-        path: String,
-        lock: FileLock,
-    ) -> FsResult<Option<FileLock>> {
-        fs.get_lock(path, lock)
-    }
-
-    async fn async_get_lock(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: GetLockRequest = ctx.parse_header()?;
-        let lock = ProtoUtils::file_lock_from_pb(header.lock);
-        ctx.set_audit(Some(header.path.to_string()), None);
-        let fs = self.fs.clone();
-        let conflict = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || Self::process_get_lock(fs, header.path, lock),
-        )
-        .await?;
-        ctx.response(GetLockResponse {
-            conflict: conflict.map(ProtoUtils::file_lock_to_pb),
-        })
     }
 
     pub fn set_lock(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -999,29 +998,6 @@ impl MasterHandler {
         fs.list_options(&path, opts)
     }
 
-    async fn async_list_options(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: ListOptionsRequest = ctx.parse_header()?;
-        if header.options.limit.unwrap_or(0) < 0 {
-            return err_box!("list options limit must be greater than 0");
-        }
-        let opts = ProtoUtils::list_options_from_pb(header.options);
-        let audit_path = format!("{}[{}]", header.path, opts);
-        ctx.set_audit(Some(audit_path), None);
-        let fs = self.fs.clone();
-        let list = Self::run_master_rpc_task(
-            self.metadata_read_rt.clone(),
-            self.metadata_read_admission.clone(),
-            move || Self::process_list_options(fs, header.path, opts),
-        )
-        .await?;
-        ctx.response(ListOptionsResponse {
-            statuses: list
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
-        })
-    }
-
     fn record_rpc_observability(&self, ctx: &RpcContext<'_>, response: &FsResult<Message>) {
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
@@ -1052,25 +1028,13 @@ impl MessageHandler for MasterHandler {
 
     fn is_sync(&self, msg: &Message) -> bool {
         let code = RpcCode::from(msg.code());
-        if code == RpcCode::OpenFile {
-            return msg
-                .parse_header::<OpenFileRequest>()
-                .map(|header| !OpenFlags::new(header.flags).read_only())
-                .unwrap_or(false);
-        }
         !matches!(
             code,
             RpcCode::SubmitJob
                 | RpcCode::GetJobStatus
                 | RpcCode::CancelJob
                 | RpcCode::ReportTask
-                | RpcCode::FileStatus
-                | RpcCode::Exists
-                | RpcCode::ListStatus
-                | RpcCode::ListOptions
-                | RpcCode::GetBlockLocations
-                | RpcCode::GetLock
-                | RpcCode::GetMasterInfo
+                | RpcCode::GetFilesystemInfo
                 | RpcCode::GetCvMetadataSnapshotPage
                 | RpcCode::GetCvMetadataDeltaPage
         )
@@ -1136,23 +1100,15 @@ impl MessageHandler for MasterHandler {
 
                 RpcCode::ReportBlockReplicationResult => {
                     if let Some(ref replication_service) = self.replication_handler {
-                        replication_service.handle(msg)
+                        return replication_service.handle(msg);
                     } else {
-                        Err(FsError::common("Replication service not initialized"))
+                        return Err(FsError::common("Replication service not initialized"));
                     }
                 }
 
                 // Unsupported request
                 _ => err_box!("Unsupported operation"),
             }
-        };
-        let response = if Self::requires_active_after_response(msg) {
-            response.and_then(|message| {
-                self.ensure_active(ctx.code)?;
-                Ok(message)
-            })
-        } else {
-            response
         };
 
         self.record_rpc_observability(ctx, &response);
@@ -1181,22 +1137,15 @@ impl MessageHandler for MasterHandler {
         let ctx = &mut rpc_context;
         let code = RpcCode::from(msg.code());
 
-        let res = if let Err(error) = self.ensure_active(ctx.code) {
-            Err(error)
+        let res = if !self.fs.master_monitor.is_active() {
+            Err(FsError::not_leader_master(ctx.code, self.client_ip()))
         } else {
             match code {
                 RpcCode::SubmitJob => self.job_handler.submit_job(ctx).await,
                 RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
                 RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
                 RpcCode::ReportTask => self.job_handler.task_report(ctx),
-                RpcCode::OpenFile => self.async_open_file_read(ctx).await,
-                RpcCode::FileStatus => self.async_file_status(ctx).await,
-                RpcCode::Exists => self.async_exists(ctx).await,
-                RpcCode::ListStatus => self.async_list_status(ctx).await,
-                RpcCode::ListOptions => self.async_list_options(ctx).await,
-                RpcCode::GetBlockLocations => self.async_get_block_locations(ctx).await,
-                RpcCode::GetLock => self.async_get_lock(ctx).await,
-                RpcCode::GetMasterInfo => self.async_get_master_info(ctx).await,
+                RpcCode::GetFilesystemInfo => self.async_get_filesystem_info(ctx).await,
                 RpcCode::GetCvMetadataSnapshotPage => {
                     self.async_get_cv_metadata_snapshot_page(ctx).await
                 }
@@ -1204,14 +1153,6 @@ impl MessageHandler for MasterHandler {
 
                 v => err_box!("unsupported operation {:?}", v),
             }
-        };
-        let res = if Self::requires_active_after_response(&msg) {
-            res.and_then(|message| {
-                self.ensure_active(ctx.code)?;
-                Ok(message)
-            })
-        } else {
-            res
         };
 
         self.record_rpc_observability(ctx, &res);
@@ -1226,29 +1167,11 @@ impl MessageHandler for MasterHandler {
         let code = RpcCode::from(msg.code());
         if matches!(
             code,
-            RpcCode::WorkerHeartbeat
-                | RpcCode::WorkerBlockReport
-                | RpcCode::ReportBlockReplicationResult
+            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetFilesystemInfo
         ) {
             Some(&self.actor_rt)
         } else {
             None
-        }
-    }
-
-    fn request_admission(&self, msg: &Message) -> Option<Arc<Semaphore>> {
-        let code = RpcCode::from(msg.code());
-        if matches!(
-            code,
-            RpcCode::WorkerHeartbeat
-                | RpcCode::WorkerBlockReport
-                | RpcCode::ReportBlockReplicationResult
-        ) {
-            Some(self.control_request_admission.clone())
-        } else if self.is_sync(msg) {
-            self.client_blocking_admission.clone()
-        } else {
-            Some(self.client_request_admission.clone())
         }
     }
 }
@@ -1280,18 +1203,29 @@ mod tests {
             rpc_port: 1234,
             web_port: 5678,
         };
+        let component_info = curvine_proto::ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("24c848719b5b4fea74519d91cbe462bb49761b36".to_string()),
+            git_tag: Some("v0.4.0-alpha".to_string()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec!["transfer".to_string()],
+        };
         let header = WorkerHeartbeatRequest {
             status: HeartbeatStatus::Running.into(),
             cluster_id: conf.cluster_id.clone(),
             address: ProtoUtils::worker_address_to_pb(&address),
             software_version: "0.1.0-test".to_string(),
             fs_ctime: 123_456,
+            component_info: Some(component_info.clone()),
             ..Default::default()
         };
 
         MasterHandler::process_worker_heartbeat(fs.clone(), header).unwrap();
 
-        let info = fs.master_info().unwrap();
+        let info = fs.filesystem_info().unwrap();
         let worker = info
             .live_workers
             .iter()
@@ -1299,5 +1233,364 @@ mod tests {
             .unwrap();
         assert_eq!(worker.software_version, "0.1.0-test");
         assert_eq!(worker.startup_time_ms, 123_456);
+        // Structured version metadata survives heartbeat -> WorkerInfo ->
+        // WorkerInfoProto (filesystem_info) -> WorkerInfo round trip.
+        assert_eq!(worker.component_info, Some(component_info));
+    }
+
+    #[test]
+    fn build_filesystem_info_response_attaches_master_compatibility() {
+        let info = FilesystemInfo {
+            active_master: "master-0".to_string(),
+            inode_dir_num: 3,
+            inode_file_num: 5,
+            block_num: 7,
+            capacity: 1000,
+            available: 500,
+            fs_used: 300,
+            non_fs_used: 200,
+            ..Default::default()
+        };
+
+        // Derive expectations from component_version("master") so the test stays
+        // stable across BUILD_VERSION overrides and future protocol bumps.
+        let master_version = curvine_sys::version::component_version("master");
+        let master_compatibility = ProtoUtils::default_master_compatibility_to_pb(&master_version);
+
+        let rep = MasterHandler::build_filesystem_info_response(info, &master_compatibility);
+
+        assert_eq!(rep.active_master, "master-0");
+        assert_eq!(rep.inode_file_num, 5);
+        let compat = rep
+            .compatibility
+            .expect("master must advertise compatibility");
+        assert_eq!(compat.server.component.as_deref(), Some("master"));
+        assert_eq!(
+            compat.server.release_version.as_deref(),
+            Some(master_version.release_version.as_str())
+        );
+        assert_eq!(
+            compat.server.protocol_version,
+            Some(master_version.protocol_version)
+        );
+        assert_eq!(
+            compat.compatibility_mode,
+            CompatibilityModeProto::Diagnose as i32
+        );
+        assert!(compat.blocked_versions.is_empty());
+    }
+
+    #[test]
+    fn diagnose_warnings_are_deduped_per_peer() {
+        // A persistently incompatible worker must not re-log the same warning
+        // on every heartbeat: only a verdict change emits a new warning.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let warned = DashMap::new();
+        let verdict = policy.check_worker(Some(&ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        }));
+
+        // First occurrence warns and records the verdict.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone(),
+            test_metrics()
+        )
+        .is_ok());
+        assert!(warned.contains_key("worker:7"));
+
+        // Identical verdict on a later heartbeat does not warn again but is
+        // still allowed.
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict.clone(),
+            test_metrics()
+        )
+        .is_ok());
+
+        // A different incompatible verdict for the same peer warns again.
+        let different = CompatibilityVerdict::ProtocolMismatch {
+            peer: 2,
+            min: 1,
+            max: 1,
+        };
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            different.clone(),
+            test_metrics()
+        )
+        .is_ok());
+        assert_eq!(warned.get("worker:7").as_deref(), Some(&different));
+
+        // A separate peer is tracked independently.
+        assert!(!warned.contains_key("worker:8"));
+    }
+
+    #[test]
+    fn diagnose_mode_allows_incompatible_worker_heartbeat() {
+        // Configure a minimum worker version so the peer is genuinely
+        // incompatible (below the bound): diagnose mode must still allow the
+        // request (logging a warning) instead of rejecting it. A legacy worker
+        // without component_info is also allowed.
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Diagnose,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        assert_eq!(
+            verdict,
+            CompatibilityVerdict::VersionTooOld {
+                peer: "0.1.0".to_string(),
+                min: "0.2.0".to_string()
+            }
+        );
+        let warned = DashMap::new();
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict,
+            test_metrics()
+        )
+        .is_ok());
+
+        // Legacy worker (no component_info): MissingInfo, allowed in diagnose.
+        let verdict = policy.check_worker(None);
+        assert!(MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict,
+            test_metrics()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn enforce_mode_rejects_incompatible_worker_heartbeat() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:7",
+            &warned,
+            policy.mode,
+            verdict,
+            test_metrics(),
+        )
+        .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("rejected by compatibility policy"), "{msg}");
+        assert!(msg.contains("0.1.0"), "{msg}");
+    }
+
+    #[test]
+    fn enforce_mode_rejects_legacy_client_without_component_info() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            ..Default::default()
+        };
+        let verdict = policy.check_client(None);
+        let warned = DashMap::new();
+        let err = MasterHandler::check_peer_compatibility(
+            "client",
+            "client:127.0.0.1",
+            &warned,
+            policy.mode,
+            verdict,
+            test_metrics(),
+        )
+        .unwrap_err();
+        assert!(format!("{}", err).contains("client rejected"));
+    }
+
+    #[test]
+    fn compatibility_metrics_record_verdicts_and_rejections() {
+        // Worker verdicts are recorded per peer in compat_worker_verdict and
+        // enforce-mode rejections bump compat_enforce_rejected_total.
+        let metrics = test_metrics();
+
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            ..Default::default()
+        };
+        let incompatible = ComponentInfoProto {
+            release_version: Some("0.1.0".to_string()),
+            protocol_version: Some(1),
+            ..sample_component_info()
+        };
+        let verdict = policy.check_worker(Some(&incompatible));
+        let warned = DashMap::new();
+
+        // A compatible worker records the compatible verdict. Unique peer ids
+        // keep this test isolated: metrics are process-global and other tests
+        // also exercise worker:7 / worker:8 concurrently.
+        MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:700",
+            &warned,
+            CompatibilityMode::Diagnose,
+            CompatibilityVerdict::Compatible,
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["700", "compatible"])
+                .get(),
+            1
+        );
+
+        // When a peer's verdict changes, the previous label must be cleared:
+        // only one label per peer is active at a time.
+        MasterHandler::check_peer_compatibility(
+            "worker",
+            "worker:700",
+            &warned,
+            CompatibilityMode::Diagnose,
+            CompatibilityVerdict::VersionTooOld {
+                peer: "0.1.0".to_string(),
+                min: "0.2.0".to_string(),
+            },
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["700", "version_too_old"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["700", "compatible"])
+                .get(),
+            0
+        );
+
+        // An enforce-mode rejection (too-old worker) bumps the counter and
+        // records the verdict gauge. A unique component label keeps this test
+        // isolated from other tests that also land in the version_too_old
+        // series (metrics are process-global and tests run in parallel).
+        let before = metrics
+            .compat_enforce_rejected_total
+            .with_label_values(&["worker-test", "version_too_old"])
+            .get();
+        let err = MasterHandler::check_peer_compatibility(
+            "worker-test",
+            "worker:701",
+            &warned,
+            policy.mode,
+            verdict,
+            metrics,
+        )
+        .unwrap_err();
+        assert!(format!("{}", err).contains("rejected by compatibility policy"));
+        assert_eq!(
+            metrics
+                .compat_enforce_rejected_total
+                .with_label_values(&["worker-test", "version_too_old"])
+                .get(),
+            before + 1
+        );
+        assert_eq!(
+            metrics
+                .compat_worker_verdict
+                .with_label_values(&["701", "version_too_old"])
+                .get(),
+            1
+        );
+
+        // Client verdicts use the client gauge.
+        MasterHandler::check_peer_compatibility(
+            "client",
+            "client:10.0.0.1",
+            &warned,
+            CompatibilityMode::Diagnose,
+            CompatibilityVerdict::MissingInfo,
+            metrics,
+        )
+        .unwrap();
+        assert_eq!(
+            metrics
+                .compat_client_verdict
+                .with_label_values(&["client:10.0.0.1", "missing_info"])
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn compatibility_to_pb_reflects_policy() {
+        let policy = CompatibilityPolicy {
+            mode: CompatibilityMode::Enforce,
+            min_worker_version: Some("0.2.0".parse().unwrap()),
+            blocked_versions: vec!["0.2.5".parse().unwrap()],
+            ..Default::default()
+        };
+        let master_version = curvine_sys::version::component_version("master");
+        let pb = ProtoUtils::compatibility_to_pb(&master_version, &policy);
+        assert_eq!(
+            pb.compatibility_mode,
+            CompatibilityModeProto::Enforce as i32
+        );
+        assert_eq!(pb.min_worker_version.as_deref(), Some("0.2.0"));
+        assert_eq!(pb.blocked_versions, vec!["0.2.5".to_string()]);
+    }
+
+    fn sample_component_info() -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some("worker".to_string()),
+            release_version: Some("0.4.0-alpha".to_string()),
+            git_commit: Some("24c848719b5b4fea74519d91cbe462bb49761b36".to_string()),
+            git_tag: Some("v0.4.0-alpha".to_string()),
+            git_branch: Some("main".to_string()),
+            protocol_version: Some(1),
+            min_protocol_version: Some(1),
+            capabilities: vec!["transfer".to_string()],
+        }
+    }
+
+    /// Shared metrics instance for compatibility metric tests.
+    fn test_metrics() -> &'static MasterMetrics {
+        Master::init_test_metrics();
+        Master::get_metrics().unwrap()
     }
 }

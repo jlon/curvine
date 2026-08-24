@@ -24,6 +24,12 @@ pub use self::fs_writer_base::FsWriterBase;
 mod fs_writer;
 pub use self::fs_writer::FsWriter;
 
+mod handshake;
+pub use self::handshake::MasterHandshake;
+
+mod worker_precheck;
+pub use self::worker_precheck::WorkerPrecheck;
+
 mod fs_context;
 pub use self::fs_context::FsContext;
 

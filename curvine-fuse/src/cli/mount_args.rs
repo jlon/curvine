@@ -298,16 +298,12 @@ impl FuseMountArgs {
         }
 
         if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(",") {
-                let tmp: Vec<&str> = node.split(":").collect();
-                if tmp.len() != 2 {
-                    return err_box!("wrong format master_addrs {}", master_addrs);
+            let vec = match InetAddr::parse_list(master_addrs) {
+                Ok(vec) => vec,
+                Err(e) => {
+                    return err_box!("wrong format master_addrs {}: {}", master_addrs, e);
                 }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1].parse()?;
-                vec.push(InetAddr::new(hostname, port));
-            }
+            };
             conf.client.master_addrs = vec;
         }
 
@@ -320,23 +316,19 @@ impl FuseMountArgs {
         }
 
         conf.fuse.init()?;
+        conf.fuse.normalize_fuse_opts()?;
 
         Ok(conf)
     }
 
     pub fn default_mnt_opts() -> Vec<String> {
         if cfg!(feature = "fuse3") {
-            vec![
-                "allow_other".to_string(),
-                "async".to_string(),
-                "auto_unmount".to_string(),
-            ]
+            vec!["allow_other".to_string(), "async".to_string()]
         } else {
             vec![
                 "allow_other".to_string(),
                 "async".to_string(),
                 "big_write".to_string(),
-                "max_write=131072".to_string(),
             ]
         }
     }
@@ -347,10 +339,11 @@ mod tests {
     use super::FuseMountArgs;
     use clap::Parser;
     use curvine_config::ClusterConf;
+    use curvine_core_error::CommonResult;
     use curvine_runtime::common::Utils;
     use std::fs;
 
-    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+    fn try_get_conf(config: &str, extra_args: &[&str]) -> CommonResult<ClusterConf> {
         let conf_path = Utils::temp_file();
         fs::write(&conf_path, config).expect("write test config");
 
@@ -360,23 +353,27 @@ mod tests {
         let result = args.get_conf();
         let _ = fs::remove_file(&conf_path);
 
-        result.expect("load mount configuration")
+        result
+    }
+
+    fn get_conf(config: &str, extra_args: &[&str]) -> ClusterConf {
+        try_get_conf(config, extra_args).expect("load mount configuration")
     }
 
     #[test]
     fn get_conf_preserves_config_fuse_opts_without_cli_override() {
         let conf = get_conf(
-            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\", \"ro\"]\n",
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\", \"ro\"]\n",
             &[],
         );
 
-        assert_eq!(conf.fuse.fuse_opts, vec!["allow_root", "ro"]);
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other", "ro"]);
     }
 
     #[test]
     fn get_conf_cli_fuse_opts_replace_config_fuse_opts() {
         let conf = get_conf(
-            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_root\"]\n",
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\"]\n",
             &["--options", "ro"],
         );
 
@@ -384,10 +381,101 @@ mod tests {
     }
 
     #[test]
+    fn get_conf_cli_fuse_opts_replace_unsupported_config_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"auto_unmount\"]\n",
+            &["--options", "allow_other"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other"]);
+    }
+
+    #[test]
+    fn get_conf_rejects_unsupported_config_fuse_opts_without_cli_override() {
+        let err = try_get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"auto_unmount\"]\n",
+            &[],
+        )
+        .expect_err("unsupported config option must fail at the FUSE boundary");
+
+        assert!(err.to_string().contains("auto_unmount"));
+    }
+
+    #[test]
+    fn get_conf_accepts_positive_vfs_options() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\n",
+            &["--options", "rw,dev,suid,exec,atime"],
+        );
+
+        assert_eq!(
+            conf.fuse.fuse_opts,
+            vec!["rw", "dev", "suid", "exec", "atime"]
+        );
+    }
+
+    #[test]
+    fn get_conf_rejects_rw_when_readonly_is_enabled() {
+        let err = try_get_conf(
+            "[fuse]\nio_threads = 1\n",
+            &["--readonly", "--options", "rw"],
+        )
+        .expect_err("rw must conflict with --readonly");
+
+        let message = err.to_string();
+        assert!(message.contains("rw"), "unexpected error: {message}");
+        assert!(message.contains("readonly"), "unexpected error: {message}");
+        assert!(message.contains("conflict"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn get_conf_rejects_conflicting_vfs_option_pairs() {
+        for options in [
+            "ro,rw",
+            "rw,ro",
+            "nodev,dev",
+            "dev,nodev",
+            "nosuid,suid",
+            "suid,nosuid",
+            "noexec,exec",
+            "exec,noexec",
+            "noatime,atime",
+            "atime,noatime",
+        ] {
+            let err = try_get_conf("[fuse]\nio_threads = 1\n", &["--options", options])
+                .expect_err("opposite VFS options must conflict");
+            let message = err.to_string();
+            for option in options.split(',') {
+                assert!(message.contains(option), "unexpected error: {message}");
+            }
+            assert!(message.contains("conflict"), "unexpected error: {message}");
+        }
+    }
+
+    #[test]
     fn get_conf_uses_default_fuse_opts_when_no_source_provides_any() {
         let conf = get_conf("[fuse]\nio_threads = 1\n", &[]);
 
         assert_eq!(conf.fuse.fuse_opts, FuseMountArgs::default_mnt_opts());
+    }
+
+    #[test]
+    fn get_conf_normalizes_comma_separated_cli_fuse_opts() {
+        let conf = get_conf(
+            "[fuse]\nio_threads = 1\nfuse_opts = [\"allow_other\"]\n",
+            &["--options", "allow_other,nodev"],
+        );
+
+        assert_eq!(conf.fuse.fuse_opts, vec!["allow_other", "nodev"]);
+    }
+
+    #[test]
+    fn default_fuse3_options_do_not_include_auto_unmount() {
+        if cfg!(feature = "fuse3") {
+            assert!(!FuseMountArgs::default_mnt_opts()
+                .iter()
+                .any(|option| option == "auto_unmount"));
+        }
     }
 
     #[test]
@@ -411,6 +499,34 @@ mod tests {
             err.to_string().contains("fuse.io_threads must be > 0"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn get_conf_includes_parse_error_for_invalid_master_addrs() {
+        let conf_path = Utils::temp_file();
+        fs::write(&conf_path, "[fuse]\nio_threads = 1\n").expect("write test config");
+
+        let args = FuseMountArgs::try_parse_from([
+            "curvine-fuse",
+            "--conf",
+            &conf_path,
+            "--master-addrs",
+            "host-a:8995, host-b:not-a-port",
+        ])
+        .expect("parse mount arguments");
+        let result = args.get_conf();
+        let _ = fs::remove_file(&conf_path);
+
+        let err = result.expect_err("invalid master_addrs must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong format master_addrs host-a:8995, host-b:not-a-port"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("invalid digit found in string"),
+            "parse error should be included: {msg}"
         );
     }
 }

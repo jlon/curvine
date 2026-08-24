@@ -14,7 +14,7 @@
 
 use crate::{FsError, FsResult};
 use curvine_rpc::server::ServerConf;
-use curvine_runtime::common::DurationUnit;
+use curvine_runtime::common::{DurationUnit, LogConf};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ pub enum TransferStoreType {
     Memory,
     Sqlite,
     Mysql,
+    Postgres,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ pub struct TransferConf {
     pub hostname: String,
     pub rpc_port: u16,
     pub web_port: u16,
+    pub log: LogConf,
     #[serde(skip, default = "TransferConf::default_io_threads")]
     pub io_threads: usize,
     #[serde(skip, default = "TransferConf::default_worker_threads")]
@@ -52,6 +54,11 @@ pub struct TransferConf {
     #[serde(skip)]
     pub allow_submit_with_stale_snapshot: bool,
     pub max_running_transfers: usize,
+    /// Maximum number of distinct auto-cache requests waiting for or performing submission.
+    /// This includes requests waiting for a `client_submit_concurrency` permit.
+    pub client_pending_queue_size: usize,
+    /// Maximum number of client-side auto-cache submissions running concurrently.
+    pub client_submit_concurrency: usize,
     #[serde(skip, default = "TransferConf::default_max_tasks_per_transfer")]
     pub max_tasks_per_transfer: usize,
     #[serde(
@@ -103,6 +110,7 @@ impl TransferConf {
     pub const DEFAULT_TASK_REPORT_QUEUE_SIZE: usize = 10_000;
     pub const DEFAULT_TASK_PROBE_CONCURRENCY: usize = 64;
     pub const DEFAULT_CLIENT_PENDING_QUEUE_SIZE: usize = 1024;
+    pub const DEFAULT_CLIENT_SUBMIT_CONCURRENCY: usize = 64;
     pub const DEFAULT_CLEANUP_BATCH_SIZE: usize = 1000;
     pub const DEFAULT_RPC_PORT: u16 = 9010;
     pub const DEFAULT_WEB_PORT: u16 = 9011;
@@ -113,8 +121,21 @@ impl TransferConf {
     pub const DEFAULT_TASK_MAX_RETRIES: usize = 3;
 
     pub fn init(&mut self) -> FsResult<()> {
+        self.hostname = self.hostname.trim().to_string();
+        let had_configured_endpoints = !self.endpoints.is_empty();
+        self.endpoints = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty())
+            .collect();
         self.infer_store_url();
         if self.endpoints.is_empty() {
+            if had_configured_endpoints {
+                return Err(FsError::common(
+                    "transfer.endpoints must contain host:port values; whitespace-only entries are invalid",
+                ));
+            }
             self.endpoints
                 .push(format!("{}:{}", self.hostname, self.rpc_port));
         }
@@ -127,7 +148,7 @@ impl TransferConf {
             DurationUnit::from_str(&self.terminal_retention_str)?.as_duration();
         if !self.store_url.is_empty() && self.effective_store_type() == TransferStoreType::Auto {
             return Err(FsError::common(
-                "transfer.store_url must use memory://, sqlite://, or mysql://",
+                "transfer.store_url must use memory://, sqlite://, mysql://, postgres://, or postgresql://",
             ));
         }
         match self.effective_store_type() {
@@ -141,14 +162,34 @@ impl TransferConf {
                     "transfer.store_url=mysql:// requires a database URL",
                 ));
             }
+            TransferStoreType::Postgres if self.postgres_store_url().is_empty() => {
+                return Err(FsError::common(
+                    "transfer.store_url=postgres:// requires a database URL",
+                ));
+            }
             _ => {}
         }
-        if self.enabled && self.effective_store_type() == TransferStoreType::Mysql {
-            self.validate_mysql_store()?;
+        if self.enabled
+            && matches!(
+                self.effective_store_type(),
+                TransferStoreType::Mysql | TransferStoreType::Postgres
+            )
+        {
+            self.validate_production_store()?;
         }
         if self.max_running_transfers == 0 {
             return Err(FsError::common(
                 "transfer.max_running_transfers must be greater than 0",
+            ));
+        }
+        if self.client_pending_queue_size == 0 {
+            return Err(FsError::common(
+                "transfer.client_pending_queue_size must be greater than 0",
+            ));
+        }
+        if self.client_submit_concurrency == 0 {
+            return Err(FsError::common(
+                "transfer.client_submit_concurrency must be greater than 0",
             ));
         }
         if self.ufs_max_concurrency_per_endpoint == 0 {
@@ -183,6 +224,7 @@ impl TransferConf {
             TransferStoreType::Memory => "memory://".to_string(),
             TransferStoreType::Sqlite => format!("sqlite://{}", self.sqlite_path),
             TransferStoreType::Mysql => self.mysql_url.clone(),
+            TransferStoreType::Postgres => String::new(),
             TransferStoreType::Auto => String::new(),
         };
     }
@@ -195,6 +237,10 @@ impl TransferConf {
                 TransferStoreType::Sqlite
             } else if self.store_url.starts_with("mysql://") {
                 TransferStoreType::Mysql
+            } else if self.store_url.starts_with("postgres://")
+                || self.store_url.starts_with("postgresql://")
+            {
+                TransferStoreType::Postgres
             } else {
                 TransferStoreType::Auto
             };
@@ -220,7 +266,11 @@ impl TransferConf {
         }
     }
 
-    fn validate_mysql_store(&self) -> FsResult<()> {
+    pub fn postgres_store_url(&self) -> &str {
+        &self.store_url
+    }
+
+    fn validate_production_store(&self) -> FsResult<()> {
         if self.allow_submit_with_stale_snapshot {
             return Err(FsError::common(
                 "production transfer forbids transfer.allow_submit_with_stale_snapshot=true",
@@ -288,7 +338,11 @@ impl TransferConf {
     }
 
     pub fn client_pending_queue_size(&self) -> usize {
-        Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE
+        self.client_pending_queue_size
+    }
+
+    pub fn client_submit_concurrency(&self) -> usize {
+        self.client_submit_concurrency
     }
 
     pub fn cleanup_batch_size(&self) -> usize {
@@ -325,6 +379,10 @@ impl Default for TransferConf {
             hostname: "localhost".to_string(),
             rpc_port: Self::DEFAULT_RPC_PORT,
             web_port: Self::DEFAULT_WEB_PORT,
+            log: LogConf {
+                file_name: "transfer.log".to_string(),
+                ..Default::default()
+            },
             io_threads: Self::DEFAULT_IO_THREADS,
             worker_threads: Self::DEFAULT_WORKER_THREADS,
             instance_id: String::new(),
@@ -333,6 +391,8 @@ impl Default for TransferConf {
             mysql_url: String::new(),
             allow_submit_with_stale_snapshot: false,
             max_running_transfers: 64,
+            client_pending_queue_size: Self::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: Self::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
             max_tasks_per_transfer: Self::DEFAULT_MAX_TASKS_PER_TRANSFER,
             ufs_max_concurrency_per_endpoint: Self::DEFAULT_UFS_MAX_CONCURRENCY_PER_ENDPOINT,
             task_max_retries: Self::DEFAULT_TASK_MAX_RETRIES,
@@ -367,6 +427,72 @@ mod tests {
         assert_eq!(conf.effective_store_type(), TransferStoreType::Sqlite);
         assert_eq!(conf.store_url, "sqlite://data/transfer/transfer.db");
         assert_eq!(conf.endpoints, vec!["localhost:9010"]);
+        assert_eq!(conf.rpc_port, TransferConf::DEFAULT_RPC_PORT);
+        assert_eq!(conf.web_port, TransferConf::DEFAULT_WEB_PORT);
+        assert_eq!(conf.log.file_name, "transfer.log");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_endpoints() {
+        let mut conf = TransferConf {
+            endpoints: vec![" ".to_string()],
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(
+            err.contains("transfer.endpoints must contain host:port values"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_dedicated_log_configuration() {
+        let conf: TransferConf = toml::from_str(
+            r#"
+                log = { level = "debug", log_dir = "stdout", file_name = "transfer-test.log" }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(conf.log.file_name, "transfer-test.log");
+    }
+
+    #[test]
+    fn parses_client_pending_queue_size() {
+        let mut conf: TransferConf = toml::from_str(
+            r#"
+                client_pending_queue_size = 2048
+                client_submit_concurrency = 128
+            "#,
+        )
+        .unwrap();
+        conf.init().unwrap();
+
+        assert_eq!(conf.client_pending_queue_size(), 2048);
+        assert_eq!(conf.client_submit_concurrency(), 128);
+    }
+
+    #[test]
+    fn rejects_zero_client_pending_queue_size() {
+        let mut conf = TransferConf {
+            client_pending_queue_size: 0,
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(err.contains("transfer.client_pending_queue_size must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_zero_client_submit_concurrency() {
+        let mut conf = TransferConf {
+            client_submit_concurrency: 0,
+            ..Default::default()
+        };
+
+        let err = conf.init().unwrap_err().to_string();
+        assert!(err.contains("transfer.client_submit_concurrency must be greater than 0"));
     }
 
     #[test]
@@ -400,7 +526,7 @@ mod tests {
 
         let mut invalid = TransferConf {
             enabled: true,
-            store_url: "postgres://transfer".to_string(),
+            store_url: "unsupported://transfer".to_string(),
             ..Default::default()
         };
         let err = invalid.init().unwrap_err().to_string();

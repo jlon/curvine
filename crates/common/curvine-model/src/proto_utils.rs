@@ -16,6 +16,7 @@ use crate::proto::*;
 use crate::state::*;
 use crate::worker_info::TransferWorkerCapabilities;
 use curvine_core_error::{try_err, CommonResult};
+use curvine_sys::version::ComponentVersion;
 use prost::bytes::BytesMut;
 use prost::Message;
 use std::fmt::Debug;
@@ -303,8 +304,8 @@ impl ProtoUtils {
         }
     }
 
-    pub fn master_info_to_pb(src: MasterInfo) -> GetMasterInfoResponse {
-        let mut pb = GetMasterInfoResponse {
+    pub fn filesystem_info_to_pb(src: FilesystemInfo) -> GetFilesystemInfoResponse {
+        let mut pb = GetFilesystemInfoResponse {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
             inode_dir_num: src.inode_dir_num,
@@ -315,6 +316,8 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            allocatable_capacity: Some(src.allocatable_capacity),
+            allocatable_available: Some(src.allocatable_available),
             ..Default::default()
         };
 
@@ -354,6 +357,7 @@ impl ProtoUtils {
             transfer_attempt_safe_output: Some(src.transfer_capabilities.attempt_safe_output),
             transfer_source_read_plan: Some(src.transfer_capabilities.source_read_plan),
             software_version: Some(src.software_version),
+            component_info: src.component_info,
             startup_time_ms: Some(src.startup_time_ms),
             storage_map: Default::default(),
         };
@@ -366,8 +370,8 @@ impl ProtoUtils {
         pb
     }
 
-    pub fn master_info_from_pb(src: GetMasterInfoResponse) -> MasterInfo {
-        MasterInfo {
+    pub fn filesystem_info_from_pb(src: GetFilesystemInfoResponse) -> FilesystemInfo {
+        FilesystemInfo {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
             inode_dir_num: src.inode_dir_num,
@@ -378,11 +382,65 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            // Legacy masters omit the allocatable fields; fall back to the
+            // aggregate capacity/available so statfs never regresses below the
+            // pre-fix behavior (which summed all non-lost workers).
+            allocatable_capacity: src.allocatable_capacity.unwrap_or(src.capacity),
+            allocatable_available: src.allocatable_available.unwrap_or(src.available),
             live_workers: Self::worker_info_from_pb(src.live_workers),
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
             lost_workers: Self::worker_info_from_pb(src.lost_workers),
         }
+    }
+
+    /// Convert a structured component version into its wire representation for
+    /// handshake metadata (component_info / compatibility payloads).
+    pub fn component_version_to_pb(src: &ComponentVersion) -> ComponentInfoProto {
+        ComponentInfoProto {
+            component: Some(src.component.clone()),
+            release_version: Some(src.release_version.clone()),
+            git_commit: Some(src.git_commit.clone()),
+            git_tag: Some(src.git_tag.clone()),
+            git_branch: Some(src.git_branch.clone()),
+            protocol_version: Some(src.protocol_version),
+            min_protocol_version: Some(src.min_protocol_version),
+            capabilities: src.capabilities.clone(),
+        }
+    }
+
+    /// Build the default compatibility contract a master advertises during the
+    /// GetFilesystemInfo handshake: the master's own version plus a lenient
+    /// diagnose policy. Legacy peers without the field keep working untouched.
+    pub fn default_master_compatibility_to_pb(
+        src: &ComponentVersion,
+    ) -> ServerCompatibilityInfoProto {
+        ServerCompatibilityInfoProto {
+            server: Self::component_version_to_pb(src),
+            compatibility_mode: CompatibilityModeProto::Diagnose as i32,
+            ..Default::default()
+        }
+    }
+
+    /// Build the compatibility contract a server advertises from its own
+    /// version and the configured compatibility policy. The advertised mode,
+    /// minimum bounds and blocked versions mirror the policy so peers learn
+    /// what the server accepts; the protocol version range stays a product
+    /// contract carried by the server's own version.
+    pub fn compatibility_to_pb(
+        src: &ComponentVersion,
+        policy: &crate::CompatibilityPolicy,
+    ) -> ServerCompatibilityInfoProto {
+        let mut pb = Self::default_master_compatibility_to_pb(src);
+        pb.compatibility_mode = policy.mode.to_proto() as i32;
+        pb.min_worker_version = policy.min_worker_version.as_ref().map(|v| v.to_string());
+        pb.min_client_version = policy.min_client_version.as_ref().map(|v| v.to_string());
+        pb.blocked_versions = policy
+            .blocked_versions
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        pb
     }
 
     pub fn worker_info_from_pb(workers: Vec<WorkerInfoProto>) -> Vec<WorkerInfo> {
@@ -754,6 +812,14 @@ impl ProtoUtils {
             inodes: res.inodes,
             bytes: res.bytes,
         }
+    }
+
+    pub fn delete_res_from_pb(res: FreeResultProto) -> DeleteResult {
+        Self::free_res_from_pb(res).into()
+    }
+
+    pub fn delete_res_to_pb(res: DeleteResult) -> FreeResultProto {
+        Self::free_res_to_pb(res.into())
     }
 }
 

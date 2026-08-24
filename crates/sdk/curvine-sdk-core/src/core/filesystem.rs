@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use curvine_config::ClusterConf;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, Path};
-use curvine_model::{FreeResult, MountInfo, MountOptions, SetAttrOpts};
+use curvine_model::{DeleteResult, FreeResult, MountInfo, MountOptions, SetAttrOpts};
 use curvine_runtime::runtime::RpcRuntime;
 
 pub struct LibFilesystem {
@@ -58,7 +58,7 @@ impl LibFilesystem {
             .block_on(async { self.inner().rename(&src_path, &dst_path).await })
     }
 
-    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<()> {
+    pub fn delete(&self, path: impl AsRef<str>, recursive: bool) -> FsResult<DeleteResult> {
         let path = Path::from_str(path)?;
         self.rt()
             .block_on(async { self.inner().delete(&path, recursive).await })
@@ -116,9 +116,16 @@ impl LibFilesystem {
         ))
     }
 
-    pub fn get_master_info(&self) -> FsResult<BytesMut> {
+    pub fn get_filesystem_info(&self) -> FsResult<BytesMut> {
         self.rt()
-            .block_on(async { self.inner().get_master_info_bytes().await })
+            .block_on(async { self.inner().get_filesystem_info_bytes().await })
+    }
+
+    #[deprecated(
+        note = "renamed to get_filesystem_info; returns whole-filesystem stats, not master-process info"
+    )]
+    pub fn get_master_info(&self) -> FsResult<BytesMut> {
+        self.get_filesystem_info()
     }
 
     pub fn get_mount_info(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {

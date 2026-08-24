@@ -27,6 +27,7 @@ fn create_test_worker_address(worker_id: u32) -> WorkerAddressProto {
 #[test]
 fn test_block_write_request_round_trip_without_pipeline_stream() {
     let request = BlockWriteRequest {
+        component_info: None,
         block: create_test_block(),
         off: 0,
         block_size: 64 * 1024 * 1024,
@@ -53,6 +54,7 @@ fn test_block_write_request_round_trip_with_pipeline_stream() {
     let pipeline_stream = vec![create_test_worker_address(2), create_test_worker_address(3)];
 
     let request = BlockWriteRequest {
+        component_info: None,
         block: create_test_block(),
         off: 0,
         block_size: 64 * 1024 * 1024,
@@ -165,6 +167,7 @@ fn test_block_write_response_round_trip_with_pipeline_status() {
 #[test]
 fn test_default_values() {
     let request = BlockWriteRequest {
+        component_info: None,
         block: create_test_block(),
         off: 0,
         block_size: 64 * 1024 * 1024,

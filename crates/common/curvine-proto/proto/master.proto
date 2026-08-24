@@ -89,7 +89,9 @@ message DeleteRequest {
     required bool recursive = 2;
 }
 
-message DeleteResponse {}
+message DeleteResponse {
+    optional FreeResultProto res = 1;
+}
 
 message FreeRequest {
     required string path = 1;
@@ -207,12 +209,14 @@ message GetBlockLocationsResponse {
     required FileBlocksProto blocks = 1;
 }
 
-// Request master profile information.
-message GetMasterInfoRequest {
-
+// Request filesystem-wide information (statfs backend).
+message GetFilesystemInfoRequest {
+    // Structured version of the requesting client (handshake). Cross-cutting
+    // protocol metadata on the reserved 1000+ range; legacy clients omit it.
+    optional ComponentInfoProto component_info = 1000;
 }
 
-message GetMasterInfoResponse {
+message GetFilesystemInfoResponse {
     required string active_master = 1;
     repeated string journal_nodes = 2;
 
@@ -229,6 +233,16 @@ message GetMasterInfoResponse {
     repeated WorkerInfoProto blacklist_workers = 12;
     repeated WorkerInfoProto decommission_workers = 13;
     repeated WorkerInfoProto lost_workers = 14;
+
+    // Capacity/available eligible for new writes (Live workers only). Absent
+    // on legacy masters; clients fall back to `capacity`/`available`.
+    optional int64 allocatable_capacity = 15 [default = 0];
+    optional int64 allocatable_available = 16 [default = 0];
+
+    // Default compatibility contract offered by this master (handshake).
+    // Cross-cutting protocol metadata on the reserved 1000+ range; legacy
+    // masters omit it and clients treat the absence as a legacy peer.
+    optional ServerCompatibilityInfoProto compatibility = 1000;
 }
 
 message SetAttrOptsProto {

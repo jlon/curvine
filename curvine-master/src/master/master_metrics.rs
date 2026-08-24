@@ -35,6 +35,8 @@ pub struct MasterMetrics {
     pub(crate) fs_used: Gauge,
     pub(crate) block_num: Gauge,
     pub(crate) blocks_size_avg: Gauge,
+    pub(crate) allocatable_capacity: Gauge,
+    pub(crate) allocatable_available: Gauge,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -81,6 +83,15 @@ pub struct MasterMetrics {
     pub(crate) fs_dir_stalled: Gauge,
     pub(crate) fs_dir_stall_total: Counter,
     pub(crate) fs_dir_probe_acquire_us: Gauge,
+
+    // Compatibility metrics.
+    // Per-verdict gauge: 1 for the current verdict of each worker/client
+    // (compatible, missing_info, blocked, protocol_mismatch, version_too_old,
+    // version_unknown). Only one label per peer is active at a time.
+    pub(crate) compat_worker_verdict: GaugeVec,
+    pub(crate) compat_client_verdict: GaugeVec,
+    // Total number of enforce-mode rejections, labelled by component and verdict.
+    pub(crate) compat_enforce_rejected_total: CounterVec,
 }
 
 impl MasterMetrics {
@@ -107,6 +118,14 @@ impl MasterMetrics {
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
             block_num: m::new_gauge("num_blocks", "Total block number")?,
             blocks_size_avg: m::new_gauge("blocks_size_avg", "Average block size")?,
+            allocatable_capacity: m::new_gauge(
+                "allocatable_capacity",
+                "Storage capacity eligible for new writes (Live workers only)",
+            )?,
+            allocatable_available: m::new_gauge(
+                "allocatable_available",
+                "Available space eligible for new writes (Live workers only)",
+            )?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -201,21 +220,41 @@ impl MasterMetrics {
                 "fs_dir_probe_acquire_us",
                 "Latency in microseconds of the last fs_dir watchdog read-lock probe",
             )?,
+
+            compat_worker_verdict: m::new_gauge_vec(
+                "compat_worker_verdict",
+                "Current compatibility verdict per worker, labelled by worker_id and verdict",
+                &["worker_id", "verdict"],
+            )?,
+            compat_client_verdict: m::new_gauge_vec(
+                "compat_client_verdict",
+                "Current compatibility verdict per client, labelled by client_addr and verdict",
+                &["client_addr", "verdict"],
+            )?,
+            compat_enforce_rejected_total: m::new_counter_vec(
+                "compat_enforce_rejected_total",
+                "Total number of enforce-mode compatibility rejections, labelled by component and verdict",
+                &["component", "verdict"],
+            )?,
         };
 
         Ok(wm)
     }
 
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
-        let master_info = fs.master_info()?;
-        self.capacity.set(master_info.capacity);
-        self.available.set(master_info.available);
-        self.fs_used.set(master_info.fs_used);
-        self.block_num.set(master_info.block_num);
+        let filesystem_info = fs.filesystem_info()?;
+        self.capacity.set(filesystem_info.capacity);
+        self.available.set(filesystem_info.available);
+        self.fs_used.set(filesystem_info.fs_used);
+        self.allocatable_capacity
+            .set(filesystem_info.allocatable_capacity);
+        self.allocatable_available
+            .set(filesystem_info.allocatable_available);
+        self.block_num.set(filesystem_info.block_num);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
-        if master_info.block_num > 0 {
-            let avg_size = master_info.fs_used / master_info.block_num;
+        if filesystem_info.block_num > 0 {
+            let avg_size = filesystem_info.fs_used / filesystem_info.block_num;
             self.blocks_size_avg.set(avg_size);
         }
 
@@ -232,16 +271,16 @@ impl MasterMetrics {
 
         self.worker_num
             .with_label_values(&["live"])
-            .set(master_info.live_workers.len() as i64);
+            .set(filesystem_info.live_workers.len() as i64);
         self.worker_num
             .with_label_values(&["blacklist"])
-            .set(master_info.blacklist_workers.len() as i64);
+            .set(filesystem_info.blacklist_workers.len() as i64);
         self.worker_num
             .with_label_values(&["decommission"])
-            .set(master_info.decommission_workers.len() as i64);
+            .set(filesystem_info.decommission_workers.len() as i64);
         self.worker_num
             .with_label_values(&["lost"])
-            .set(master_info.lost_workers.len() as i64);
+            .set(filesystem_info.lost_workers.len() as i64);
 
         Metrics::text_output()
     }

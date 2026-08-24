@@ -16,12 +16,15 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_model::{
     StaleTaskAttempt, TaskAttemptStart, TransferJobRecord, TransferLease, TransferListFilter,
-    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTenantSummary,
+    TransferStateUpdate, TransferTaskRecord, TransferTaskReport, TransferTaskState,
+    TransferTenantSummary,
 };
 use std::time::Instant;
 
 #[cfg(feature = "transfer-store-mysql")]
 use crate::transfer::MysqlTransferStore;
+#[cfg(feature = "transfer-store-postgres")]
+use crate::transfer::PostgresTransferStore;
 #[cfg(feature = "transfer-store-sqlite")]
 use crate::transfer::SqliteTransferStore;
 use crate::transfer::{
@@ -35,6 +38,8 @@ pub enum TransferStoreBackend {
     Sqlite(SqliteTransferStore),
     #[cfg(feature = "transfer-store-mysql")]
     Mysql(MysqlTransferStore),
+    #[cfg(feature = "transfer-store-postgres")]
+    Postgres(PostgresTransferStore),
 }
 
 impl TransferStore for TransferStoreBackend {
@@ -45,6 +50,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.check_available(),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.check_available(),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.check_available(),
         })
     }
 
@@ -55,6 +62,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.create_or_get_by_request_id(job),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.create_or_get_by_request_id(job),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.create_or_get_by_request_id(job),
         })
     }
 
@@ -68,6 +77,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.create_or_get_by_request_id_checked(job),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.create_or_get_by_request_id_checked(job),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.create_or_get_by_request_id_checked(job),
         })
     }
 
@@ -78,6 +89,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.get_transfer(job_id),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.get_transfer(job_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.get_transfer(job_id),
         })
     }
 
@@ -92,6 +105,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.get_transfer_by_request(submitter, client_request_id),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.get_transfer_by_request(submitter, client_request_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.get_transfer_by_request(submitter, client_request_id),
         })
     }
 
@@ -102,6 +117,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.list_active_transfers(),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_active_transfers(),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_active_transfers(),
         })
     }
 
@@ -123,6 +140,10 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => {
                 store.find_conflicting_active_transfer(target_path, submitter, client_request_id)
             }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.find_conflicting_active_transfer(target_path, submitter, client_request_id)
+            }
         })
     }
 
@@ -133,6 +154,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.count_active_transfers(),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.count_active_transfers(),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.count_active_transfers(),
         })
     }
 
@@ -143,6 +166,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.count_executing_transfers(),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.count_executing_transfers(),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.count_executing_transfers(),
         })
     }
 
@@ -153,6 +178,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.list_transfers(filter),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_transfers(filter),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_transfers(filter),
         })
     }
 
@@ -167,6 +194,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.list_tenant_summaries(limit, offset),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_tenant_summaries(limit, offset),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_tenant_summaries(limit, offset),
         })
     }
 
@@ -177,6 +206,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.purge_terminal_transfers(older_than_ms, limit),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.purge_terminal_transfers(older_than_ms, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.purge_terminal_transfers(older_than_ms, limit),
         })
     }
 
@@ -187,6 +218,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.list_transfer_tasks(job_id, run_id),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.list_transfer_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_transfer_tasks(job_id, run_id),
         })
     }
 
@@ -197,6 +230,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.request_cancel(job_id, run_id, now_ms),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.request_cancel(job_id, run_id, now_ms),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.request_cancel(job_id, run_id, now_ms),
         })
     }
 
@@ -217,6 +252,10 @@ impl TransferStore for TransferStoreBackend {
             }
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => {
+                store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
+            }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
                 store.acquire_runnable_transfer(owner, lease_ms, now_ms, max_executing_transfers)
             }
         })
@@ -243,6 +282,10 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => {
                 store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
             }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.renew_lease(job_id, run_id, owner, lease_epoch, lease_ms, now_ms)
+            }
         })
     }
 
@@ -253,6 +296,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.update_transfer_state(update),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_transfer_state(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.update_transfer_state(update),
         })
     }
 
@@ -263,6 +308,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.requeue_transfer(update),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.requeue_transfer(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.requeue_transfer(update),
         })
     }
 
@@ -302,6 +349,15 @@ impl TransferStore for TransferStoreBackend {
                 cv_metadata_epoch,
                 now_ms,
             ),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.set_transfer_cv_metadata_epoch(
+                job_id,
+                run_id,
+                owner,
+                lease_epoch,
+                cv_metadata_epoch,
+                now_ms,
+            ),
         })
     }
 
@@ -312,6 +368,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.insert_tasks(tasks),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.insert_tasks(tasks),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.insert_tasks(tasks),
         })
     }
 
@@ -322,6 +380,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.persist_planned_tasks(update),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.persist_planned_tasks(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.persist_planned_tasks(update),
         })
     }
 
@@ -332,6 +392,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.update_task_state(update),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_task_state(update),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.update_task_state(update),
         })
     }
 
@@ -347,6 +409,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.claim_pending_tasks(job_id, run_id, limit),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.claim_pending_tasks(job_id, run_id, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.claim_pending_tasks(job_id, run_id, limit),
         })
     }
 
@@ -371,6 +435,10 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => {
                 store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
             }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.mark_stale_attempts(job_id, run_id, owner, lease_epoch, now_ms, limit)
+            }
         })
     }
 
@@ -393,6 +461,28 @@ impl TransferStore for TransferStoreBackend {
             Self::Mysql(store) => {
                 store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
             }
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => {
+                store.list_stale_running_tasks(job_id, run_id, stale_before_ms, limit)
+            }
+        })
+    }
+
+    fn list_tasks_by_state(
+        &self,
+        job_id: &str,
+        run_id: u64,
+        state: TransferTaskState,
+        limit: usize,
+    ) -> FsResult<Vec<TransferTaskRecord>> {
+        self.record_store_operation("list_tasks_by_state", || match self {
+            Self::Memory(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
+            #[cfg(feature = "transfer-store-sqlite")]
+            Self::Sqlite(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
+            #[cfg(feature = "transfer-store-mysql")]
+            Self::Mysql(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.list_tasks_by_state(job_id, run_id, state, limit),
         })
     }
 
@@ -403,6 +493,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.has_failed_tasks(job_id, run_id),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.has_failed_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.has_failed_tasks(job_id, run_id),
         })
     }
 
@@ -413,6 +505,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.has_recoverable_tasks(job_id, run_id),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.has_recoverable_tasks(job_id, run_id),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.has_recoverable_tasks(job_id, run_id),
         })
     }
 
@@ -423,6 +517,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.start_task_attempt(start),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.start_task_attempt(start),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.start_task_attempt(start),
         })
     }
 
@@ -433,6 +529,8 @@ impl TransferStore for TransferStoreBackend {
             Self::Sqlite(store) => store.update_task_report(report),
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(store) => store.update_task_report(report),
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(store) => store.update_task_report(report),
         })
     }
 }
@@ -445,6 +543,8 @@ impl TransferStoreBackend {
             Self::Sqlite(_) => "sqlite",
             #[cfg(feature = "transfer-store-mysql")]
             Self::Mysql(_) => "mysql",
+            #[cfg(feature = "transfer-store-postgres")]
+            Self::Postgres(_) => "postgres",
         }
     }
 
@@ -491,6 +591,7 @@ pub(crate) fn is_store_unavailable_error(err: &FsError) -> bool {
     let message = err.to_string();
     message.contains("sqlite transfer store error:")
         || message.contains("mysql transfer store error:")
+        || message.contains("postgresql transfer store error:")
         || message.contains("Unknown database")
         || message.contains("No database selected")
         || message.contains("doesn't exist")

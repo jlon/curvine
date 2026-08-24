@@ -25,6 +25,9 @@ pub use self::raft_peer::RaftPeer;
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
 
+mod compatibility_conf;
+pub use self::compatibility_conf::CompatibilityConf;
+
 mod master_conf;
 pub use self::master_conf::MasterConf;
 

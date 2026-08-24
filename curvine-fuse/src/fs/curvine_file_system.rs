@@ -49,6 +49,8 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 
 const FUSE_TIME_GRANULARITY_NS: u32 = 1_000_000;
+/// Fragment size used by FUSE statfs block counters.
+const STATFS_FRAGMENT_SIZE: u32 = 4 * ByteUnit::KB as u32;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
@@ -58,9 +60,48 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    async fn normalize_file_creation_mode(
+        &self,
+        header: &fuse_in_header,
+        requested_mode: u32,
+        umask: u32,
+    ) -> FuseResult<u32> {
+        let requested_setgid_exec = requested_mode & (libc::S_ISGID as u32 | libc::S_IXGRP as u32)
+            == (libc::S_ISGID as u32 | libc::S_IXGRP as u32);
+        if !requested_setgid_exec {
+            return Ok(requested_mode & 0o7777 & !umask);
+        }
+
+        let parent = self.state.fs_stat(header.nodeid, None).await?;
+        let created_gid = if parent.mode & libc::S_ISGID as u32 != 0 {
+            FuseUtils::resolve_group_gid(&parent.group)
+        } else {
+            Some(header.gid)
+        };
+        let caller_status = FuseUtils::caller_process_status(header.pid).await;
+        let caller_in_created_group =
+            created_gid.is_some_and(|gid| caller_status.in_group(header.gid, gid));
+
+        Ok(FuseUtils::normalize_create_mode(
+            requested_mode,
+            umask,
+            caller_in_created_group,
+            FuseUtils::caller_has_cap_fsetid(&caller_status),
+        ))
+    }
+
     fn is_ofd_lock_pid(pid: u32) -> bool {
         // FUSE kernels have used both 0 and -1 for the pid of an OFD lock.
         pid == 0 || pid == u32::MAX
+    }
+
+    fn statfs_block_counts(capacity: i64, available: i64) -> (u64, u64) {
+        let capacity = u64::try_from(capacity).unwrap_or(0);
+        let available = u64::try_from(available).unwrap_or(0).min(capacity);
+        let fragment_size = u64::from(STATFS_FRAGMENT_SIZE);
+
+        // Report only complete fragments, preserving the existing rounding behavior.
+        (capacity / fragment_size, available / fragment_size)
     }
 
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
@@ -367,6 +408,18 @@ impl CurvineFileSystem {
         }
 
         Ok(())
+    }
+
+    /// Serialize one Master lock-state operation with close-time lock cleanup.
+    /// Blocking SETLKW retries acquire this guard per attempt, never while waiting.
+    async fn get_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.get_lock(path, lock).await?)
+    }
+
+    async fn set_lock_ordered(&self, path: &Path, lock: FileLock) -> FuseResult<Option<FileLock>> {
+        let _guard = self.state.lock_path(path).await;
+        Ok(self.fs.set_lock(path, lock).await?)
     }
 
     fn record_negative_entry(&self) {
@@ -787,7 +840,9 @@ impl CurvineFileSystem {
         Self::permission_mask_allows(permission_bits, mask)
     }
 
-    /// True when normalized chown targets differ from the file's current uid/gid.
+    /// True when a normalized chown target actually changes uid and/or gid.
+    /// Kept for unit tests documenting value-inequality vs FATTR presence (#1547 leftover).
+    #[cfg(test)]
     fn chown_effectively_changes(
         target_uid: Option<u32>,
         target_gid: Option<u32>,
@@ -797,15 +852,27 @@ impl CurvineFileSystem {
         target_uid.is_some_and(|u| u != file_uid) || target_gid.is_some_and(|g| g != file_gid)
     }
 
+    /// Whether chown/fchown/lchown should clear setuid/setgid on a regular file.
+    ///
+    /// Per Linux `chown(2)`, any chown clears SUID (and SGID when group-executable),
+    /// including same-id (LTP chown02) and `-1` sentinels. Gate on raw FUSE `valid` bits.
+    ///
+    /// `valid == 0` covers `chown(-1,-1)` under `FUSE_HANDLE_KILLPRIV`: kernel strips
+    /// ATTR_KILL_* without setting FATTR_UID/GID, so userspace sees empty valid.
+    ///
+    /// SGID without group-exec (mandatory lock) is preserved by the caller.
+    fn chown_should_clear_setid_bits(valid: u32) -> bool {
+        (valid & (FATTR_UID | FATTR_GID)) != 0 || valid == 0
+    }
+
     /// POSIX permission model for SETATTR issued by a non-root caller.
     ///
     /// `target_uid`/`target_gid` are the *normalized* chown targets: the caller is expected
     /// to have already dropped the `(uid_t)-1` / `(gid_t)-1` "keep current" sentinels to
     /// `None` (see `CurvineFileSystem::set_attr`). Therefore a `Some(_)` here means the FATTR
     /// bit is set and the value is not the (uid_t/gid_t)-1 sentinel; it may still equal the
-    /// current id and be a no-op for the suid/sgid side effect (see
-    /// `chown_effectively_changes`). We no longer need to inspect the raw
-    /// FATTR_UID/FATTR_GID bits or special-case `u32::MAX`.
+    /// current id and be a no-op ownership change (see `chown_effectively_changes`).
+    /// Setuid/setgid clearing uses `chown_should_clear_setid_bits` on raw `valid`.
     fn check_setattr_permission(
         check_permission: bool,
         header: &fuse_in_header,
@@ -1339,7 +1406,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_traverse_permissions(op.header.nodeid, op.header)
             .await?;
 
-        let status = self.state.fs_stat(op.header.nodeid, None).await?;
+        let status = self.state.fs_stat_guarded(op.header.nodeid).await?;
 
         let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
@@ -1429,9 +1496,8 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        // Clear setuid/setgid only when uid/gid actually change (not same-id no-ops).
-        let chown_effective =
-            Self::chown_effectively_changes(target_uid, target_gid, file_uid, file_gid);
+        // Clear setuid/setgid on chown (FATTR_UID/GID, or valid==0 for chown(-1,-1)).
+        let chown_effective = Self::chown_should_clear_setid_bits(op.arg.valid);
         if chown_effective && cur_status.file_type == FileType::File {
             let mut new_mode = if let Some(mode) = opts.mode {
                 mode
@@ -1516,11 +1582,23 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Get file system profile information.
     async fn stat_fs(&self, _: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
-        let info = self.fs.get_master_info().await?;
+        let info = self.fs.get_filesystem_info().await?;
 
-        let block_size = 4 * ByteUnit::KB as u32;
-        let total_blocks = (info.capacity / block_size as i64) as u64;
-        let free_blocks = (info.available / block_size as i64) as u64;
+        // Use the allocatable view (Live workers only) so df matches what new
+        // writes can actually use; capacity/available would also count
+        // Blacklist/Decommission workers and over-report free space.
+        if info.allocatable_capacity < 0
+            || info.allocatable_available < 0
+            || info.allocatable_available > info.allocatable_capacity
+        {
+            debug!(
+                "Normalizing invalid filesystem info for statfs: allocatable_capacity={}, allocatable_available={}",
+                info.allocatable_capacity, info.allocatable_available
+            );
+        }
+
+        let (total_blocks, free_blocks) =
+            Self::statfs_block_counts(info.allocatable_capacity, info.allocatable_available);
 
         let res = fuse_kstatfs {
             blocks: total_blocks,
@@ -1528,9 +1606,9 @@ impl fs::FileSystem for CurvineFileSystem {
             bavail: free_blocks,
             files: FUSE_UNKNOWN_INODES,
             ffree: FUSE_UNKNOWN_INODES,
-            bsize: block_size,
+            bsize: STATFS_FRAGMENT_SIZE,
             namelen: FUSE_MAX_NAME_LENGTH as u32,
-            frsize: block_size,
+            frsize: STATFS_FRAGMENT_SIZE,
             padding: 0,
             spare: [0; 6],
         };
@@ -1674,7 +1752,10 @@ impl fs::FileSystem for CurvineFileSystem {
         self.ensure_writable_path(&path, RpcCode::CreateFile)
             .await?;
 
-        let opts = FuseUtils::create_opts(&op, &self.fs);
+        let mode = self
+            .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+            .await?;
+        let opts = FuseUtils::create_opts(&op, &self.fs, mode);
         let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
         let attr = FuseUtils::status_to_attr(&self.conf, &handle.status())?;
 
@@ -1731,6 +1812,14 @@ impl fs::FileSystem for CurvineFileSystem {
         // lock_owner on almost every FUSE_FLUSH/close; unconditional unlock
         // caused a Master SetLock+journal storm for Spark local-dirs (#1227).
         if op.arg.lock_owner != 0 && handle.take_plock_if_owner(op.arg.lock_owner).is_some() {
+            let path = match Path::from_str(&handle.status().path) {
+                Ok(path) => path,
+                Err(e) => {
+                    handle.add_lock(LockFlags::Plock, op.arg.lock_owner);
+                    return Err(e.into());
+                }
+            };
+            let _guard = self.state.lock_path(&path).await;
             if let Err(e) = self
                 .fs_unlock_owner(&handle, LockFlags::Plock, op.arg.lock_owner)
                 .await
@@ -1909,6 +1998,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.ensure_writable_path(&path, RpcCode::Delete).await?;
 
+        let _guard = self.state.lock_path(&path).await;
         self.fs.delete(&path, false).await?;
         self.state.unlink(op.header.nodeid, name, false)?;
         self.state
@@ -2100,7 +2190,10 @@ impl fs::FileSystem for CurvineFileSystem {
             let path = self.state.get_path_name(op.header.nodeid, name)?;
             self.ensure_writable_path(&path, RpcCode::CreateFile)
                 .await?;
-            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type);
+            let mode = self
+                .normalize_file_creation_mode(op.header, op.arg.mode, op.arg.umask)
+                .await?;
+            let opts = FuseUtils::mknod_opts(&op, &self.fs, file_type, mode);
             self.fs.create_special_node(&path, opts).await?;
             let attr = self.state.lookup_common(op.header.nodeid, name).await?;
             Ok(FuseUtils::create_entry_out(&self.conf, attr))
@@ -2115,7 +2208,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.state.fs_fsync(op.header.nodeid, None).await?;
 
-        let conflict = self.fs.get_lock(&path, lock).await?;
+        let conflict = self.get_lock_ordered(&path, lock).await?;
         let lk = match conflict {
             Some(lk) => fuse_file_lock {
                 start: lk.start,
@@ -2149,7 +2242,7 @@ impl fs::FileSystem for CurvineFileSystem {
             lock.end = u64::MAX;
         }
 
-        let conflict = self.fs.set_lock(&path, lock).await?;
+        let conflict = self.set_lock_ordered(&path, lock).await?;
         if conflict.is_none() {
             if is_unlock {
                 // Full-range unlock drops this owner from handle bookkeeping so a
@@ -2204,7 +2297,7 @@ impl fs::FileSystem for CurvineFileSystem {
             ),
         );
         loop {
-            let conflict = self.fs.set_lock(&path, lock.clone()).await?;
+            let conflict = self.set_lock_ordered(&path, lock.clone()).await?;
             if conflict.is_none() {
                 wait_guard.clear_blocked_by();
                 if is_unlock {
@@ -2254,7 +2347,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 // deadlock (LTP fcntl17) still observes the cycle. If the lock
                 // is free now (OFD unlock/re-lock race, LTP fcntl34), acquire
                 // instead of returning a false EDEADLK.
-                let conflict2 = self.fs.set_lock(&path, lock.clone()).await?;
+                let conflict2 = self.set_lock_ordered(&path, lock.clone()).await?;
                 if conflict2.is_none() {
                     wait_guard.clear_blocked_by();
                     if is_unlock {
@@ -2355,6 +2448,60 @@ mod tests {
             pid,
             padding: 0,
         }
+    }
+
+    #[test]
+    fn statfs_block_counts_normalize_invalid_values() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (-4096, 0, (0, 0)),
+            (8192, -4096, (2, 0)),
+            (-4096, 8192, (0, 0)),
+            (4096, 8192, (1, 1)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            let actual = CurvineFileSystem::statfs_block_counts(capacity, available);
+            assert_eq!(
+                actual, expected,
+                "capacity={capacity}, available={available}"
+            );
+            assert!(actual.1 <= actual.0);
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_round_down_to_complete_fragments() {
+        use super::CurvineFileSystem;
+
+        let cases = [
+            (0, 0, (0, 0)),
+            (1, 1, (0, 0)),
+            (4095, 4095, (0, 0)),
+            (4096, 4096, (1, 1)),
+            (4097, 4097, (1, 1)),
+            (16384, 8192, (4, 2)),
+        ];
+
+        for (capacity, available, expected) in cases {
+            assert_eq!(
+                CurvineFileSystem::statfs_block_counts(capacity, available),
+                expected,
+                "capacity={capacity}, available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn statfs_block_counts_handle_i64_max_without_overflow() {
+        use super::{CurvineFileSystem, STATFS_FRAGMENT_SIZE};
+
+        let expected = u64::try_from(i64::MAX).unwrap() / u64::from(STATFS_FRAGMENT_SIZE);
+        let actual = CurvineFileSystem::statfs_block_counts(i64::MAX, i64::MAX);
+
+        assert_eq!(actual, (expected, expected));
+        assert!(actual.1 <= actual.0);
     }
 
     #[test]
@@ -2761,6 +2908,27 @@ mod tests {
         ));
     }
 
+    /// LTP chown02 / #1567: dual-target same-owner still presents both FATTR bits.
+    #[test]
+    fn chown_should_clear_setid_bits_for_explicit_same_owner_chown02() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+    }
+
+    /// Linux matrix under HANDLE_KILLPRIV: UID/GID FATTR clear; empty valid is chown(-1,-1).
+    #[test]
+    fn chown_should_clear_setid_bits_on_any_fattr_uid_or_gid() {
+        use super::CurvineFileSystem as CFS;
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_GID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID));
+        assert!(CFS::chown_should_clear_setid_bits(FATTR_UID | FATTR_GID));
+        // chown(-1,-1) under killpriv → valid==0
+        assert!(CFS::chown_should_clear_setid_bits(0));
+        // mode-only / time-only setattr is not a chown
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MODE));
+        assert!(!CFS::chown_should_clear_setid_bits(FATTR_MTIME));
+    }
+
     /// pjdfstest chown/00.t regression: owner may keep uid unchanged and move gid to a
     /// supplementary group in the same setattr call. Historically curvine returned EPERM
     /// because FATTR_UID was rejected unconditionally.
@@ -3002,9 +3170,10 @@ mod tests {
     use super::CurvineFileSystem;
     use crate::{
         fuse_init_flag_names, FUSE_ATOMIC_O_TRUNC, FUSE_BIG_WRITES, FUSE_DO_READDIRPLUS,
-        FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR, FUSE_KERNEL_MINOR_VERSION,
-        FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL, FUSE_POSIX_LOCKS, FUSE_SPLICE_MOVE,
-        FUSE_SPLICE_READ, FUSE_SPLICE_WRITE, FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
+        FUSE_EXPLICIT_INVAL_DATA, FUSE_EXPORT_SUPPORT, FUSE_FLOCK_LOCKS, FUSE_HAS_IOCTL_DIR,
+        FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FUSE_MAX_PAGES, FUSE_POSIX_ACL,
+        FUSE_POSIX_LOCKS, FUSE_SETXATTR_EXT, FUSE_SPLICE_MOVE, FUSE_SPLICE_READ, FUSE_SPLICE_WRITE,
+        FUSE_WRITEBACK_CACHE, SUPPORTED_INIT_FLAGS,
     };
 
     #[test]
@@ -3060,13 +3229,41 @@ mod tests {
 
     #[test]
     fn negotiate_out_flags_drops_unsupported_kernel_caps() {
-        let unsupported = FUSE_ATOMIC_O_TRUNC | FUSE_POSIX_ACL | FUSE_HAS_IOCTL_DIR | FUSE_INIT_EXT;
+        let unsupported = FUSE_ATOMIC_O_TRUNC
+            | FUSE_POSIX_ACL
+            | FUSE_HAS_IOCTL_DIR
+            | FUSE_INIT_EXT
+            | FUSE_SETXATTR_EXT;
         let conf = init_conf(false, false);
         let out = CurvineFileSystem::negotiate_out_flags(unsupported, &conf);
         assert_eq!(
             out & unsupported,
             0,
             "no unsupported kernel-offered bit may be advertised"
+        );
+    }
+
+    #[test]
+    fn setxattr_ext_is_not_advertised() {
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(FUSE_SETXATTR_EXT, &conf);
+
+        assert_eq!(
+            out & FUSE_SETXATTR_EXT,
+            0,
+            "the decoder only supports the 8-byte SETXATTR compatibility layout"
+        );
+    }
+
+    #[test]
+    fn explicit_data_invalidation_is_not_advertised() {
+        let conf = init_conf(false, false);
+        let out = CurvineFileSystem::negotiate_out_flags(FUSE_EXPLICIT_INVAL_DATA, &conf);
+
+        assert_eq!(
+            out & FUSE_EXPLICIT_INVAL_DATA,
+            0,
+            "page-cache invalidation is currently delegated to the kernel"
         );
     }
 

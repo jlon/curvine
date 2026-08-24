@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ClusterConf, DBConf};
+use crate::{ClusterConf, CompatibilityConf, DBConf};
 use curvine_core_error::{err_box, CommonResult};
 use curvine_runtime::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use curvine_runtime::runtime::GroupExecutor;
@@ -57,6 +57,9 @@ pub struct MasterConf {
 
     // Immutable regular-file inode cache payload budget used by metadata reads.
     pub metadata_read_cache_size: ByteUnit,
+    /// Version compatibility policy (diagnose by default; enforce only when
+    /// explicitly configured).
+    pub compatibility: CompatibilityConf,
 
     pub block_report_limit: usize,
 
@@ -269,6 +272,7 @@ impl Default for MasterConf {
         let rocksdb = Self::rocksdb_default().set_dir(&dir);
 
         let mut conf = Self {
+            compatibility: Default::default(),
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_MASTER_PORT,
             web_port: ClusterConf::DEFAULT_MASTER_WEB_PORT,

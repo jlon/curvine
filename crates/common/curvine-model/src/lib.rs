@@ -69,7 +69,9 @@ mod file_status;
 pub use self::file_status::{FileStatus, INTERNAL_CTIME_XATTR};
 
 mod master_info;
+mod filesystem_info;
 pub use self::master_info::MasterInfo;
+pub use self::filesystem_info::FilesystemInfo;
 
 mod worker_command;
 pub use self::worker_command::*;
@@ -106,6 +108,10 @@ pub use self::rename_flags::*;
 
 mod directory_attributes;
 pub use self::directory_attributes::{DirectoryAttributeDelta, DirectoryAttributes};
+mod compatibility;
+pub use self::compatibility::{
+    feature_enabled, CompatibilityMode, CompatibilityPolicy, CompatibilityVerdict,
+};
 
 mod file_alloc;
 pub use self::file_alloc::*;

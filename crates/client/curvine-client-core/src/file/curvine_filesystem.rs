@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::BatchBlockWriter;
-use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase, MasterHandshake};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
@@ -23,10 +23,10 @@ use curvine_error::FsError;
 use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_model::ProtoUtils;
-use curvine_model::{CommitBlock, FreeResult, ListOptions};
+use curvine_model::{CommitBlock, DeleteResult, FreeResult, ListOptions};
 use curvine_model::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
+    FilesystemInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, RenameFlags,
     SetAttrOpts,
 };
 use curvine_proto::{GetCvMetadataDeltaPageResponse, GetCvMetadataSnapshotPageResponse};
@@ -183,7 +183,7 @@ impl CurvineFileSystem {
         self.fs_client.rename(src, dst, flags).await
     }
 
-    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         self.fs_client.delete(path, recursive).await
     }
 
@@ -286,12 +286,25 @@ impl CurvineFileSystem {
         self.fs_client.get_block_locations(path).await
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        self.fs_client.get_master_info().await
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        self.fs_client.get_filesystem_info().await
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
-        self.fs_client.get_master_info_bytes().await
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        self.fs_client.handshake().await
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.fs_client.master_handshake()
+    }
+
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        self.fs_client.get_filesystem_info_bytes().await
     }
 
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
@@ -563,7 +576,7 @@ impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
         self.rename(src, dst).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         self.delete(path, recursive).await
     }
 

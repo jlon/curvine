@@ -16,7 +16,9 @@ use crate::{
     FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter, WriteCacheWriter,
 };
 use bytes::BytesMut;
-use curvine_client_core::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
+use curvine_client_core::file::{
+    CurvineFileSystem, FsClient, FsContext, FsReader, MasterHandshake,
+};
 use curvine_client_core::ClientMetrics;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, err_ext};
@@ -25,19 +27,21 @@ use curvine_error::FsResult;
 use curvine_fs_api::{FileSystem, FsKind, ListStream, Path, Reader, RpcCode, Writer};
 use curvine_job_client::{JobMasterClient, TransferClient};
 use curvine_model::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
+    CreateFileOpts, DeleteResult, FileAllocOpts, FileLock, FileStatus, FilesystemInfo, FreeResult,
+    JobStatus, ListOptions, LoadJobCommand, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, RenameFlags, SetAttrOpts, TransferCommand, TransferKind, TransferState,
 };
 use curvine_runtime::common::TimeSpent;
 use curvine_runtime::common::Utils;
 use curvine_runtime::runtime::{RpcRuntime, Runtime};
-use dashmap::DashSet;
+use curvine_runtime::sync::FastMutex;
 use log::{debug, error, info, warn};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time;
 
 const TRANSFER_SUBMIT_MAX_ATTEMPTS: usize = 3;
@@ -50,13 +54,63 @@ enum CacheValidity {
 }
 
 #[derive(Clone)]
+struct AsyncCachePending {
+    paths: Arc<FastMutex<HashSet<String>>>,
+    capacity: usize,
+    submit_slots: Arc<Semaphore>,
+}
+
+enum AsyncCacheAdmission {
+    Accepted(AsyncCachePermit),
+    AlreadyPending,
+    Overloaded,
+}
+
+struct AsyncCachePermit {
+    path: String,
+    paths: Arc<FastMutex<HashSet<String>>>,
+}
+
+impl AsyncCachePending {
+    fn new(capacity: usize, submit_concurrency: usize) -> Self {
+        Self {
+            paths: Arc::new(FastMutex::new(HashSet::new())),
+            capacity,
+            submit_slots: Arc::new(Semaphore::new(submit_concurrency)),
+        }
+    }
+
+    fn try_admit(&self, path: String) -> AsyncCacheAdmission {
+        let mut paths = self.paths.lock();
+        if paths.contains(&path) {
+            return AsyncCacheAdmission::AlreadyPending;
+        }
+        if paths.len() >= self.capacity {
+            return AsyncCacheAdmission::Overloaded;
+        }
+        paths.insert(path.clone());
+
+        AsyncCacheAdmission::Accepted(AsyncCachePermit {
+            path,
+            paths: self.paths.clone(),
+        })
+    }
+}
+
+impl Drop for AsyncCachePermit {
+    fn drop(&mut self) {
+        self.paths.lock().remove(&self.path);
+    }
+}
+
+#[derive(Clone)]
 pub struct UnifiedFileSystem {
     cv: CurvineFileSystem,
     mount_cache: Arc<MountCache>,
     enable_unified: bool,
     enable_read_ufs: bool,
     audit_logging_enabled: bool,
-    async_cache_pending: Arc<DashSet<String>>,
+    async_cache_pending: AsyncCachePending,
     metrics: &'static ClientMetrics,
 }
 
@@ -67,6 +121,8 @@ impl UnifiedFileSystem {
         let enable_unified = conf.client.enable_unified_fs;
         let enable_read_ufs = conf.client.enable_rust_read_ufs;
         let audit_logging_enabled = conf.client.audit_logging_enabled;
+        let async_cache_pending_capacity = conf.transfer.client_pending_queue_size();
+        let async_cache_submit_concurrency = conf.transfer.client_submit_concurrency();
 
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
         let fs = UnifiedFileSystem {
@@ -75,7 +131,10 @@ impl UnifiedFileSystem {
             enable_unified,
             enable_read_ufs,
             audit_logging_enabled,
-            async_cache_pending: Arc::new(DashSet::new()),
+            async_cache_pending: AsyncCachePending::new(
+                async_cache_pending_capacity,
+                async_cache_submit_concurrency,
+            ),
             metrics: FsContext::get_metrics(),
         };
 
@@ -202,14 +261,28 @@ impl UnifiedFileSystem {
         }
     }
 
-    pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
-        let fut = async { self.cv.get_master_info().await };
-        self.track("GetMasterInfo", "", "", fut).await
+    pub async fn get_filesystem_info(&self) -> FsResult<FilesystemInfo> {
+        let fut = async { self.cv.get_filesystem_info().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
-    pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
-        let fut = async { self.cv.get_master_info_bytes().await };
-        self.track("GetMasterInfo", "", "", fut).await
+    /// Client-master version handshake: report this client's `component_info`
+    /// and cache the master's advertised version / protocol / capabilities.
+    pub async fn handshake(&self) -> FsResult<MasterHandshake> {
+        let fut = async { self.cv.handshake().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
+    }
+
+    /// Cached master handshake (version / protocol / capabilities). Before the
+    /// first handshake and against legacy masters this reports a legacy peer,
+    /// which is never rejected.
+    pub fn master_handshake(&self) -> MasterHandshake {
+        self.cv.master_handshake()
+    }
+
+    pub async fn get_filesystem_info_bytes(&self) -> FsResult<BytesMut> {
+        let fut = async { self.cv.get_filesystem_info_bytes().await };
+        self.track("GetFilesystemInfo", "", "", fut).await
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
@@ -286,10 +359,9 @@ impl UnifiedFileSystem {
                 None => err_box!(
                     "the current path is not mounted to ufs, so the `free` command cannot be executed."
                 ),
-                // Cache mode: drop Curvine metadata (and its blocks) via delete.
-                // Master delete already releases worker blocks; calling free first
-                // would only clear locs then delete the inode — redundant.
-                // Use cv.delete (not UnifiedFileSystem::delete) so UFS is untouched.
+                // Cache mode: drop Curvine metadata and blocks via cv.delete.
+                // UFS is untouched; the returned DeleteResult is converted to
+                // FreeResult so the CLI can report inode/byte stats.
                 Some(mount) if mount.is_cache_mode() => {
                     self.free_cache_mode(path, &mount, recursive).await
                 }
@@ -305,20 +377,28 @@ impl UnifiedFileSystem {
         mount: &MountInfo,
         recursive: bool,
     ) -> FsResult<FreeResult> {
+        let mut total = FreeResult::default();
+
         if path.path() == mount.cv_path && recursive {
             for status in self.cv.list_status(path).await? {
                 let child = Path::from_str(status.path)?;
-                if let Err(e) = self.cv.delete(&child, true).await {
-                    if !matches!(e, FsError::FileNotFound(_)) {
+                match self.cv.delete(&child, true).await {
+                    Ok(res) => {
+                        let res: FreeResult = res.into();
+                        total.inodes += res.inodes;
+                        total.bytes += res.bytes;
+                    }
+                    Err(FsError::FileNotFound(_)) => {}
+                    Err(e) => {
                         return Err(e);
                     }
                 }
             }
         } else {
-            self.cv.delete(path, recursive).await?;
+            total = self.cv.delete(path, recursive).await?.into();
         }
 
-        Ok(FreeResult::default())
+        Ok(total)
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
@@ -460,23 +540,47 @@ impl UnifiedFileSystem {
 
     pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
         let source_path = source_path.clone_uri();
-        if self.async_cache_pending.contains(&source_path) {
-            debug!("async cache request already pending for {}", source_path);
-            return Ok(());
-        }
-        let pending_capacity = self.cv.conf().transfer.client_pending_queue_size();
-        if self.async_cache_pending.len() >= pending_capacity {
-            return Err(FsError::transfer_overloaded(format!(
-                "client async cache pending queue is full, capacity={}",
-                pending_capacity
-            )));
-        }
-        self.async_cache_pending.insert(source_path.clone());
+        let pending_permit = match self.async_cache_pending.try_admit(source_path.clone()) {
+            AsyncCacheAdmission::Accepted(pending) => pending,
+            AsyncCacheAdmission::AlreadyPending => {
+                self.metrics
+                    .async_cache_admission_skipped
+                    .with_label_values(&["already_pending"])
+                    .inc();
+                debug!("async cache request already pending for {}", source_path);
+                return Ok(());
+            }
+            AsyncCacheAdmission::Overloaded => {
+                self.metrics
+                    .async_cache_admission_skipped
+                    .with_label_values(&["overloaded"])
+                    .inc();
+                debug!(
+                    "skip async cache request for {} because the client pending queue is full, capacity={}",
+                    source_path, self.async_cache_pending.capacity
+                );
+                return Ok(());
+            }
+        };
         let fs = self.clone();
         let log = self.audit_logging_enabled;
         let metrics = self.metrics;
 
         self.fs_context().rt().spawn(async move {
+            let _pending_permit = pending_permit;
+            let _submit_permit = match fs
+                .async_cache_pending
+                .submit_slots
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(permit) => permit,
+                Err(err) => {
+                    warn!("async cache submit limiter closed unexpectedly: {}", err);
+                    return;
+                }
+            };
             let time = TimeSpent::new();
             let res = fs.submit_async_cache(&source_path).await;
 
@@ -507,7 +611,6 @@ impl UnifiedFileSystem {
                     debug!("submitted async cache job {} for {}", job_id, source_path);
                 }
             }
-            fs.async_cache_pending.remove(&source_path);
         });
 
         Ok(())
@@ -1032,7 +1135,11 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     .inc();
 
                 if mount.info.auto_cache() {
-                    self.async_cache(&ufs_path)?;
+                    // Auto-cache is advisory: scheduling failures must not block the
+                    // foreground read from falling back to UFS.
+                    if let Err(err) = self.async_cache(&ufs_path) {
+                        warn!("skip async cache request for {}: {}", ufs_path, err);
+                    }
                 }
 
                 read_path = ufs_path.full_path().to_owned();
@@ -1058,7 +1165,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         self.rename_with_flags(src, dst, RenameFlags::empty()).await
     }
 
-    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<DeleteResult> {
         let fut = async {
             match self.get_mount_checked(path, RpcCode::Delete).await? {
                 None => self.cv.delete(path, recursive).await,
@@ -1071,16 +1178,21 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                         );
                     }
 
-                    mount.ufs()?.delete(&ufs_path, recursive).await?;
+                    let mut delete_res = mount.ufs()?.delete(&ufs_path, recursive).await?;
 
                     // delete cache
-                    if let Err(e) = self.cv.delete(path, recursive).await {
-                        if !matches!(e, FsError::FileNotFound(_)) {
+                    match self.cv.delete(path, recursive).await {
+                        Ok(res) => {
+                            delete_res.inodes += res.inodes;
+                            delete_res.bytes += res.bytes;
+                        }
+                        Err(FsError::FileNotFound(_)) => {}
+                        Err(e) => {
                             warn!("failed to delete cache for {}: {}", path, e);
                         }
-                    };
+                    }
 
-                    Ok(())
+                    Ok(delete_res)
                 }
             }
         };
@@ -1181,5 +1293,100 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Ok(())
         };
         self.track("SetAttr", path.path(), "", fut).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AsyncCacheAdmission, AsyncCachePending};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn async_cache_pending_enforces_capacity_and_releases_slots() {
+        let pending = AsyncCachePending::new(1, 1);
+        let first = match pending.try_admit("ufs://bucket/a".to_string()) {
+            AsyncCacheAdmission::Accepted(permit) => permit,
+            _ => panic!("first request should be accepted"),
+        };
+
+        assert!(matches!(
+            pending.try_admit("ufs://bucket/a".to_string()),
+            AsyncCacheAdmission::AlreadyPending
+        ));
+        assert!(matches!(
+            pending.try_admit("ufs://bucket/b".to_string()),
+            AsyncCacheAdmission::Overloaded
+        ));
+
+        drop(first);
+        assert!(matches!(
+            pending.try_admit("ufs://bucket/b".to_string()),
+            AsyncCacheAdmission::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn async_cache_pending_deduplicates_concurrent_requests() {
+        let pending = Arc::new(AsyncCachePending::new(32, 4));
+        let accepted = Arc::new(Mutex::new(Vec::new()));
+        let already_pending = Arc::new(AtomicUsize::new(0));
+        let overloaded = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..32 {
+            let pending = pending.clone();
+            let accepted = accepted.clone();
+            let already_pending = already_pending.clone();
+            let overloaded = overloaded.clone();
+            threads.push(std::thread::spawn(move || {
+                match pending.try_admit("ufs://bucket/same".to_string()) {
+                    AsyncCacheAdmission::Accepted(permit) => {
+                        accepted.lock().unwrap().push(permit);
+                    }
+                    AsyncCacheAdmission::AlreadyPending => {
+                        already_pending.fetch_add(1, Ordering::Relaxed);
+                    }
+                    AsyncCacheAdmission::Overloaded => {
+                        overloaded.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(accepted.lock().unwrap().len(), 1);
+        assert_eq!(already_pending.load(Ordering::Relaxed), 31);
+        assert_eq!(overloaded.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn async_cache_pending_waiters_hold_admission_until_submission_finishes() {
+        let pending = AsyncCachePending::new(2, 1);
+        let first_pending = match pending.try_admit("ufs://bucket/a".to_string()) {
+            AsyncCacheAdmission::Accepted(permit) => permit,
+            _ => panic!("first path should be admitted"),
+        };
+        let second_pending = match pending.try_admit("ufs://bucket/b".to_string()) {
+            AsyncCacheAdmission::Accepted(permit) => permit,
+            _ => panic!("second path should wait within pending capacity"),
+        };
+
+        let first_submit = pending.submit_slots.clone().try_acquire_owned().unwrap();
+        assert!(pending.submit_slots.clone().try_acquire_owned().is_err());
+        assert_eq!(pending.paths.lock().len(), 2);
+
+        drop(first_submit);
+        let second_submit = pending.submit_slots.clone().try_acquire_owned().unwrap();
+        drop(second_submit);
+        assert_eq!(pending.paths.lock().len(), 2);
+
+        drop(first_pending);
+        assert!(!pending.paths.lock().contains("ufs://bucket/a"));
+        assert!(pending.paths.lock().contains("ufs://bucket/b"));
+        drop(second_pending);
+        assert!(pending.paths.lock().is_empty());
     }
 }

@@ -261,5 +261,6 @@ fn transfer_task_state_code(state: JobTaskState) -> i32 {
         JobTaskState::Completed => 3,
         JobTaskState::Failed => 4,
         JobTaskState::Canceled => 5,
+        JobTaskState::PartialSuccess => 6,
     }
 }

@@ -220,6 +220,13 @@ dashmap = "5.5.3"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
 parking_lot = { version = "0.12.5", features = ["arc_lock"] }
+native-tls = "0.2.18"
+postgres = "0.19.13"
+postgres-native-tls = "0.5.3"
+r2d2 = "0.8.10"
+r2d2_postgres = "0.18.2"
+percent-encoding = "2.3.1"
+
 linkme = "0.3.35"
 anyhow = "1.0.97"
 url = "2.2.2"

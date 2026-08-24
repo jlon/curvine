@@ -122,11 +122,24 @@ pub struct FilesystemConf {
     pub transfer: TransferClientConf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferClientConf {
     pub enabled: bool,
     pub endpoints: Vec<String>,
+    pub client_pending_queue_size: usize,
+    pub client_submit_concurrency: usize,
+}
+
+impl Default for TransferClientConf {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoints: vec![],
+            client_pending_queue_size: TransferConf::DEFAULT_CLIENT_PENDING_QUEUE_SIZE,
+            client_submit_concurrency: TransferConf::DEFAULT_CLIENT_SUBMIT_CONCURRENCY,
+        }
+    }
 }
 
 impl FilesystemConf {
@@ -178,24 +191,24 @@ impl FilesystemConf {
     }
 
     pub fn into_cluster_conf(self) -> FsResult<ClusterConf> {
-        let mut master_addrs = vec![];
-        if self.master_addrs.is_empty() {
+        if self.master_addrs.trim().is_empty() {
             return err_box!("fs.cv.master_addrs can not be empty");
         }
 
-        for node in self.master_addrs.split(",") {
-            let vec: Vec<&str> = node.split(":").collect();
-            if vec.len() != 2 {
-                return err_box!("wrong format fs.cv.master_addrs {}", self.master_addrs);
+        let master_addrs = match InetAddr::parse_list(&self.master_addrs) {
+            Ok(addrs) => addrs,
+            Err(e) => {
+                return err_box!(
+                    "wrong format fs.cv.master_addrs {}: {}",
+                    self.master_addrs,
+                    e
+                );
             }
-            let hostname = vec[0].to_string();
-            let port: u16 = vec[1].parse()?;
-            master_addrs.push(InetAddr::new(hostname, port));
-        }
+        };
 
         let client = ClientConf {
             master_addrs,
-            hostname: self.client_hostname,
+            hostname: self.client_hostname.trim().to_string(),
             io_threads: self.io_threads,
             worker_threads: self.worker_threads,
             replicas: self.replicas,
@@ -286,6 +299,8 @@ impl FilesystemConf {
             transfer: TransferConf {
                 enabled: self.transfer.enabled,
                 endpoints: self.transfer.endpoints,
+                client_pending_queue_size: self.transfer.client_pending_queue_size,
+                client_submit_concurrency: self.transfer.client_submit_concurrency,
                 ..Default::default()
             },
             ..Default::default()
@@ -301,11 +316,58 @@ mod tests {
     use super::{FilesystemConf, TransferClientConf};
 
     #[test]
+    fn trims_whitespace_in_comma_separated_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        // Production Hadoop/XML often inserts a space after only some commas.
+        // Without trim, only the padded hostname fails DNS, so a leader on that
+        // node looks like "all masters unavailable".
+        conf.master_addrs = "curvine-master-01.oppo.local:8995, curvine-master-02.oppo.local:8995,curvine-master-03.oppo.local:8995"
+            .to_string();
+
+        let cluster = conf.into_cluster_conf().unwrap();
+        let hostnames: Vec<&str> = cluster
+            .client
+            .master_addrs
+            .iter()
+            .map(|addr| addr.hostname.as_str())
+            .collect();
+        assert_eq!(
+            hostnames,
+            [
+                "curvine-master-01.oppo.local",
+                "curvine-master-02.oppo.local",
+                "curvine-master-03.oppo.local"
+            ]
+        );
+    }
+
+    #[test]
+    fn into_cluster_conf_includes_parse_error_for_invalid_master_addrs() {
+        let mut conf = FilesystemConf::with_master_addrs(["placeholder:8995"]).unwrap();
+        conf.master_addrs = "host-a:8995, host-b:not-a-port".to_string();
+
+        let err = conf
+            .into_cluster_conf()
+            .expect_err("invalid master_addrs must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wrong format fs.cv.master_addrs host-a:8995, host-b:not-a-port"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("invalid digit found in string"),
+            "parse error should be included: {msg}"
+        );
+    }
+
+    #[test]
     fn keeps_transfer_routing_in_cluster_conf() {
         let mut conf = FilesystemConf::with_master_addrs(["master-0:8995"]).unwrap();
         conf.transfer = TransferClientConf {
             enabled: true,
             endpoints: vec!["transfer-0:9010".to_string(), "transfer-1:9010".to_string()],
+            client_pending_queue_size: 2048,
+            client_submit_concurrency: 128,
         };
 
         let cluster = conf.into_cluster_conf().unwrap();
@@ -315,6 +377,8 @@ mod tests {
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 2048);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 128);
     }
 
     #[test]
@@ -344,6 +408,8 @@ mod tests {
                 [transfer]
                 enabled = true
                 endpoints = ["transfer-0:9010", "transfer-1:9010"]
+                client_pending_queue_size = 4096
+                client_submit_concurrency = 256
             "#,
         )
         .unwrap();
@@ -355,5 +421,7 @@ mod tests {
             cluster.transfer.endpoints,
             vec!["transfer-0:9010", "transfer-1:9010"]
         );
+        assert_eq!(cluster.transfer.client_pending_queue_size(), 4096);
+        assert_eq!(cluster.transfer.client_submit_concurrency(), 256);
     }
 }

@@ -20,7 +20,7 @@ use curvine_fs_api::proto::{
     GetJobStatusResponse, GetMountTableResponse, MountOptionsProto, SetAttrOptsProto,
     SubmitJobResponse,
 };
-use curvine_fs_api::state::{LoadJobCommand, SetAttrOpts};
+use curvine_fs_api::state::{DeleteResult, LoadJobCommand, SetAttrOpts};
 use curvine_fs_api::utils::ProtoUtils;
 use curvine_sdk_core::blocking_job as job;
 use jni::objects::{JByteArray, JString};
@@ -128,13 +128,18 @@ impl JavaFilesystem {
         self.inner.rename(src, dst)
     }
 
-    pub fn delete(&self, env: &mut JNIEnv, path: JString, recursive: jboolean) -> FsResult<()> {
+    pub fn delete(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        recursive: jboolean,
+    ) -> FsResult<DeleteResult> {
         let path = JavaUtils::jstring_to_string(env, &path)?;
         self.inner.delete(path, JavaUtils::jbool_to_bool(recursive))
     }
 
-    pub fn get_master_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
-        let status = self.inner.get_master_info()?;
+    pub fn get_filesystem_info(&self, env: &mut JNIEnv) -> FsResult<jarray> {
+        let status = self.inner.get_filesystem_info()?;
         let byte_arr = JavaUtils::new_jarray(env, &status)?;
         Ok(byte_arr)
     }

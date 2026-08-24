@@ -3411,10 +3411,10 @@ impl MasterFilesystem {
         Ok(self.rocks_store()?.get_locations(block_id)?)
     }
 
-    pub fn master_info(&self) -> FsResult<MasterInfo> {
+    pub fn filesystem_info(&self) -> FsResult<FilesystemInfo> {
         self.ensure_metadata_current()?;
         let metrics = Master::get_metrics()?;
-        let mut info = MasterInfo {
+        let mut info = FilesystemInfo {
             inode_dir_num: metrics.inode_dir_num.get(),
             inode_file_num: metrics.inode_file_num.get(),
             ..Default::default()
@@ -3437,7 +3437,14 @@ impl MasterFilesystem {
             info.block_num += worker.block_num;
 
             match worker.status {
-                WorkerStatus::Live => info.live_workers.push(worker.clone()),
+                WorkerStatus::Live => {
+                    info.live_workers.push(worker.clone());
+                    // Only Live workers are eligible for new allocations, so the
+                    // allocatable view mirrors the allocation policy. Failed
+                    // storage dirs are already excluded from worker.capacity.
+                    info.allocatable_capacity += worker.capacity;
+                    info.allocatable_available += worker.available;
+                }
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
                 WorkerStatus::Decommission => info.decommission_workers.push(worker.clone()),
                 _ => (),

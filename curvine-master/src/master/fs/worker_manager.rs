@@ -14,7 +14,7 @@
 
 use crate::master::fs::policy::{ChooseContext, WorkerPolicyAdapter};
 use crate::master::fs::state::{BlockMap, WorkerMap};
-use crate::master::fs::DeleteResult;
+use curvine_model::DeleteResult;
 use curvine_config::ClusterConf;
 use curvine_core_error::{err_box, CommonResult};
 use curvine_error::FsResult;

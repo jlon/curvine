@@ -124,6 +124,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
     let block_size = CHUNK_SIZE as i64;
     let block = ExtendedBlock::new(block_id, block_size + 1, StorageType::Disk, FileType::File);
     let request = BlockWriteRequest {
+        component_info: None,
         block: ProtoUtils::extend_block_to_pb(block),
         off: 0,
         block_size,
@@ -155,6 +156,7 @@ fn test_worker_complete_oversized_block_aborts_pending_block() -> CommonResult<(
 
     let read_client = conf.worker_sync_client()?;
     let read = BlockReadRequest {
+        component_info: None,
         id: block_id,
         off: 0,
         len: 1,
@@ -192,6 +194,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
 
     let open_req_id = Utils::req_id();
     let open = BlocksBatchWriteRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -220,6 +223,7 @@ fn test_worker_batch_short_circuit_complete_uses_open_context_without_server_fil
         .all(|response| response.path.is_some()));
 
     let complete = BlocksBatchCommitRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -256,6 +260,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
 
     let req_id = Utils::req_id();
     let open = BlocksBatchWriteRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -279,6 +284,7 @@ fn test_worker_batch_short_circuit_complete_requires_open_connection() -> Common
     let _: BlocksBatchWriteResponse = open_client.rpc_check(open_msg)?.parse_header()?;
 
     let complete = BlocksBatchCommitRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -314,6 +320,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
     ];
 
     let open = BlocksBatchWriteRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -338,6 +345,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
 
     let contents = ["batch-block-a", "batch-block-b"];
     let write = FilesBatchWriteRequest {
+        component_info: None,
         files: contents
             .iter()
             .map(|content| FileWriteData {
@@ -390,6 +398,7 @@ fn test_worker_batch_remote_write_complete_and_read_back() -> CommonResult<()> {
     }
 
     let complete = BlocksBatchCommitRequest {
+        component_info: None,
         blocks: blocks
             .iter()
             .cloned()
@@ -485,6 +494,7 @@ fn test_worker_fault_http_control_plane_e2e() -> CommonResult<()> {
 
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
     let request = BlockWriteRequest {
+        component_info: None,
         block: ProtoUtils::extend_block_to_pb(ExtendedBlock::new(
             Utils::req_id().abs(),
             block_size,
@@ -539,6 +549,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
     let block = ExtendedBlock::new(id, block_size, StorageType::Disk, FileType::File);
     let request = BlockWriteRequest {
+        component_info: None,
         block: ProtoUtils::extend_block_to_pb(block),
         off: 0,
         block_size,
@@ -605,6 +616,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
     block.alloc_opts = Some(FileAllocOpts::with_truncate(target_len));
 
     let request = BlockWriteRequest {
+        component_info: None,
         block: ProtoUtils::extend_block_to_pb(block.clone()),
         off: 0,
         block_size,
@@ -638,6 +650,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
     block.len = target_len;
     let complete_block = ProtoUtils::extend_block_to_pb(block);
     let complete = BlockWriteRequest {
+        component_info: None,
         block: complete_block,
         off: 0,
         block_size,
@@ -660,6 +673,7 @@ fn test_worker_short_circuit_open_resizes_block_file() -> CommonResult<()> {
 
 fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let request = BlockReadRequest {
+        component_info: None,
         id,
         off: 0,
         len: (CHUNK_SIZE * LOOP_NUM) as i64,
@@ -717,6 +731,7 @@ fn block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
 
 fn block_read_bytes(id: i64, len: i64, conf: &ClusterConf) -> CommonResult<Vec<u8>> {
     let request = BlockReadRequest {
+        component_info: None,
         id,
         off: 0,
         len,

@@ -664,7 +664,7 @@ impl MasterFilesystem {
                 match outcome {
                     SameParentRename::Renamed(Some(del_res)) => {
                         let mut worker_manager = self.worker_manager.write();
-                        worker_manager.remove_blocks(&del_res);
+                        worker_manager.remove_blocks(&Self::to_model_delete_result(&del_res));
                         return Ok(true);
                     }
                     SameParentRename::Renamed(None) => return Ok(true),
@@ -846,7 +846,9 @@ impl MasterFilesystem {
             let status = fs_dir.file_status(&inp)?;
             if let Some(clean_result) = clean_result {
                 if !clean_result.blocks.is_empty() {
-                    self.worker_manager.write().remove_blocks(&clean_result);
+                    self.worker_manager
+                        .write()
+                        .remove_blocks(&Self::to_model_delete_result(&clean_result));
                 }
             }
 
@@ -988,7 +990,9 @@ impl MasterFilesystem {
                 if flags.truncate() {
                     let clean_result = self.truncate(&fs_dir, &inp, opts.clone())?;
                     if !clean_result.blocks.is_empty() {
-                        self.worker_manager.write().remove_blocks(&clean_result);
+                        self.worker_manager
+                        .write()
+                        .remove_blocks(&Self::to_model_delete_result(&clean_result));
                     }
                     let status = fs_dir.file_status(&inp)?;
                     (
@@ -4205,7 +4209,9 @@ impl MasterFilesystem {
         if !invalidated.delete_result.blocks.is_empty() {
             self.worker_manager
                 .write()
-                .remove_blocks(&invalidated.delete_result);
+                .remove_blocks(&Self::to_model_delete_result(
+                            &invalidated.delete_result,
+                        ));
         }
 
         Ok(LostWorkerLocationCleanup {
@@ -4359,7 +4365,9 @@ impl MasterFilesystem {
             };
 
             if !del_res.blocks.is_empty() {
-                self.worker_manager.write().remove_blocks(&del_res);
+                self.worker_manager
+                    .write()
+                    .remove_blocks(&Self::to_model_delete_result(&del_res));
             }
 
             Ok(blocks)

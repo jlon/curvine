@@ -381,9 +381,9 @@ async fn verify_mount_and_control_rpcs(
     assert!(fs.get_mount_info(&mount).await?.is_none());
 
     fs.metrics_report().await?;
-    let master_info = fs.get_master_info().await?;
-    assert_eq!(master_info.live_workers.len(), 1);
-    let worker = master_info.live_workers[0].clone();
+    let filesystem_info = fs.get_filesystem_info().await?;
+    assert_eq!(filesystem_info.live_workers.len(), 1);
+    let worker = filesystem_info.live_workers[0].clone();
     let raw_client = cluster.master_client().await?;
 
     let _: MetricsReportResponse = raw_rpc(

@@ -17,7 +17,7 @@ use curvine_core_error::CommonResult;
 use curvine_error::FsError;
 use curvine_fs_api::{Path, RpcCode};
 use curvine_model::{MkdirOpts, ProtoUtils};
-use curvine_proto::{GetFileStatusRequest, GetMasterInfoRequest, MkdirRequest};
+use curvine_proto::{GetFileStatusRequest, GetFilesystemInfoRequest, MkdirRequest};
 use curvine_raft::proto::raft::RaftRequest;
 use curvine_raft::raft::RaftCode;
 use curvine_rpc::client::RpcClient;
@@ -50,8 +50,8 @@ async fn request_master_info(conf: &ClusterConf) -> CommonResult<Result<(), FsEr
     let client = RpcClient::with_raw(&conf.master_addr(), &conf.client_rpc_conf()).await?;
     let response = client
         .rpc(
-            Builder::new_rpc(RpcCode::GetMasterInfo)
-                .proto_header(GetMasterInfoRequest::default())
+            Builder::new_rpc(RpcCode::GetFilesystemInfo)
+                .proto_header(GetFilesystemInfoRequest::default())
                 .build(),
         )
         .await?;

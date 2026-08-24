@@ -28,7 +28,7 @@ use curvine_model::{
 };
 use curvine_proto::{
     CompleteFileRequest, CompleteFileResponse, CreateFileRequest, DeleteRequest,
-    GetMasterInfoRequest, MkdirOptsProto, MkdirRequest, OpenFileRequest, RenameRequest,
+    GetFilesystemInfoRequest, MkdirOptsProto, MkdirRequest, OpenFileRequest, RenameRequest,
 };
 use curvine_raft::conf::JournalConf;
 use curvine_raft::raft::storage::{AppStorage, ApplyMsg};
@@ -326,7 +326,7 @@ fn control_plane_requests_use_the_async_handler() {
         RpcCode::ListOptions,
         RpcCode::GetBlockLocations,
         RpcCode::GetLock,
-        RpcCode::GetMasterInfo,
+        RpcCode::GetFilesystemInfo,
         RpcCode::GetCvMetadataSnapshotPage,
         RpcCode::GetCvMetadataDeltaPage,
     ] {
@@ -355,11 +355,11 @@ fn control_plane_requests_use_the_async_handler() {
         );
     }
 
-    let master_info = Builder::new_rpc(RpcCode::GetMasterInfo).build();
-    assert!(!handler.is_sync(&master_info));
+    let filesystem_info = Builder::new_rpc(RpcCode::GetFilesystemInfo).build();
+    assert!(!handler.is_sync(&filesystem_info));
     assert_eq!(
         handler
-            .request_admission(&master_info)
+            .request_admission(&filesystem_info)
             .unwrap()
             .available_permits(),
         3,
@@ -409,8 +409,8 @@ fn control_plane_requests_use_the_async_handler() {
 fn sync_rpc_to_standby_returns_rpc_error_response() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     let handler = new_handler();
-    let msg = Builder::new_rpc(RpcCode::GetMasterInfo)
-        .proto_header(GetMasterInfoRequest::default())
+    let msg = Builder::new_rpc(RpcCode::GetFilesystemInfo)
+        .proto_header(GetFilesystemInfoRequest::default())
         .build();
 
     let response = handler.handle(&msg)?;

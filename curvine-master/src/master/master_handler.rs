@@ -75,7 +75,13 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
-        control_rpc_executor: Arc<GroupExecutor>,
+        control_rpc_rt: Arc<Runtime>,
+        control_rpc_admission: Arc<Semaphore>,
+        client_request_admission: Arc<Semaphore>,
+        client_blocking_admission: Option<Arc<Semaphore>>,
+        control_request_admission: Arc<Semaphore>,
+        metadata_read_rt: Arc<Runtime>,
+        metadata_read_admission: Arc<Semaphore>,
         replication_manager: Arc<MasterReplicationManager>,
         actor_rt: Arc<Runtime>,
         metrics: &'static MasterMetrics,
@@ -84,9 +90,6 @@ impl MasterHandler {
         // Build the master's compatibility payload once; GetFilesystemInfo can
         // be hot (statfs) and the underlying version metadata is immutable.
         let master_version = curvine_sys::version::component_version("master");
-        // The advertised contract and the enforcement policy both come from
-        // the configured compatibility section; defaults are lenient diagnose
-        // with no bounds, so old components are never rejected by default.
         let compatibility_policy = conf.master.compatibility.to_policy();
         let master_compatibility =
             ProtoUtils::compatibility_to_pb(&master_version, &compatibility_policy);
@@ -98,7 +101,13 @@ impl MasterHandler {
             conn_state,
             mount_manager,
             job_handler,
-            control_rpc_executor,
+            control_rpc_rt,
+            control_rpc_admission,
+            client_request_admission,
+            client_blocking_admission,
+            control_request_admission,
+            metadata_read_rt,
+            metadata_read_admission,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
             actor_rt,
             master_compatibility,

@@ -4245,7 +4245,8 @@ impl MasterFilesystem {
         if !opts.recursive {
             return self.run_metadata_write(|| {
                 let _journal_scope = self.reserve_journal_scope(1)?;
-                let locked = self.lock_resolved_path_for_write(path, InodeLockMode::Write, false)?;
+                let locked =
+                    self.lock_resolved_path_for_write(path, InodeLockMode::Write, false)?;
                 let fs_dir = self.fs_dir.read();
                 fs_dir.set_attr(locked.path, opts)
             });

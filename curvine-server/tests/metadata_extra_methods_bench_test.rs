@@ -119,7 +119,8 @@ fn prepare_worksets(fs: &MasterFilesystem, threads: usize) {
         let directory = format!("/bench/list-{worker:02}");
         fs.mkdir(&directory, true).unwrap();
         for index in 0..LIST_WORKSET {
-            fs.create(format!("{directory}/f-{index:05}"), false).unwrap();
+            fs.create(format!("{directory}/f-{index:05}"), false)
+                .unwrap();
         }
     }
     // Hot file workset for exists/set_attr/lock/write-lifecycle.

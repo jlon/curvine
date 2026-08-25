@@ -1541,6 +1541,61 @@ impl MasterFilesystem {
             .inode_locks)
     }
 
+    /// Light variant of `lock_path_and_inode_for_write`: the lock-request walk
+    /// uses the in-memory metadata replica (one pass) plus an in-tree cover
+    /// check after locking, instead of walking RocksDB twice per call. The
+    /// optional client-supplied `inode_id` still gets a dedicated depth-0
+    /// write lock so a stale handle can never bypass path locking.
+    fn lock_path_and_inode_for_write_light(
+        &self,
+        path: &str,
+        inode_id: Option<i64>,
+    ) -> CommonResult<LockedPath<'_>> {
+        let inode_guard = inode_id.filter(|v| *v > 0);
+        for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
+            let (component_count, resolved, views) =
+                self.metadata_reader.resolve_for_write(path)?;
+            let mut requests = Self::metadata_inode_lock_requests(
+                &resolved,
+                component_count,
+                InodeLockMode::Write,
+                false,
+            );
+            if let Some(id) = inode_guard {
+                requests.push(InodeLockRequest {
+                    depth: 0,
+                    inode_id: id,
+                    mode: InodeLockMode::Write,
+                });
+            }
+            let locks = self.inode_locks.lock_many(&requests);
+            let covered = {
+                let fs_dir = self.fs_dir.read();
+                let current = if self.metadata_reader.validate(&resolved) {
+                    InodePath::from_views(path, views, &fs_dir.store)?
+                } else {
+                    Self::resolve_path(&fs_dir, path)?
+                };
+                Self::inode_locks_cover_path(&locks, &current, InodeLockMode::Write, false)
+                    .then_some(current)
+            };
+            if let Some(current) = covered {
+                return Ok(LockedPath {
+                    inode_locks: locks,
+                    path: current,
+                });
+            }
+            drop(locks);
+            Self::retry_namespace_lock(path, attempt)?;
+        }
+
+        err_box!(
+            "namespace path {} changed while acquiring path+inode locks after {} retries",
+            path,
+            NAMESPACE_LOCK_RETRY_LIMIT
+        )
+    }
+
     fn lock_resolved_path_for_write(
         &self,
         path: &str,
@@ -1582,48 +1637,6 @@ impl MasterFilesystem {
             path,
             NAMESPACE_LOCK_RETRY_LIMIT
         )
-    }
-
-    fn lock_path_and_inode_for_write(
-        &self,
-        path: &str,
-        inode_id: Option<i64>,
-    ) -> CommonResult<InodeLockSet<'_>> {
-        for attempt in 0..NAMESPACE_LOCK_RETRY_LIMIT {
-            let requests = {
-                let store = self.rocks_store()?;
-                let resolved = StorePathResolver::new(&store).resolve(path)?;
-                Self::path_and_inode_lock_requests(&resolved, inode_id)
-            };
-            let locks = self.inode_locks.lock_many(&requests);
-            let current_requests = {
-                let store = self.rocks_store()?;
-                let current = StorePathResolver::new(&store).resolve(path)?;
-                Self::path_and_inode_lock_requests(&current, inode_id)
-            };
-            if locks.covers_requests(&current_requests) {
-                return Ok(locks);
-            }
-            drop(locks);
-            Self::retry_namespace_lock(path, attempt)?;
-        }
-
-        err_box!(
-            "namespace path {} changed while acquiring path+inode locks after {} retries",
-            path,
-            NAMESPACE_LOCK_RETRY_LIMIT
-        )
-    }
-
-    fn path_and_inode_lock_requests(
-        resolved: &StoreResolvedPath,
-        inode_id: Option<i64>,
-    ) -> Vec<InodeLockRequest> {
-        let mut requests = Self::store_inode_lock_requests(resolved, InodeLockMode::Write, false);
-        if let Some(inode_id) = inode_id.filter(|id| *id > 0) {
-            requests.push(InodeLockRequest::write(0, inode_id));
-        }
-        requests
     }
 
     fn lock_delete_path(
@@ -2767,7 +2780,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         self.run_metadata_write(|| {
             let _journal_scope = self.reserve_journal_scope(1)?;
-            let _inode_locks = self.lock_path_and_inode_for_write(path, inode_id)?;
+            let _locked = self.lock_path_and_inode_for_write_light(path, inode_id)?;
             let commit_block_ids = Self::commit_block_ids(&commit_blocks);
             let commit_worker_ids = Self::commit_block_worker_ids(&commit_blocks);
             let commit_location_pairs = Self::commit_block_location_pairs(&commit_blocks);
@@ -2880,7 +2893,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         self.run_metadata_write(|| {
             let _journal_scope = self.reserve_journal_scope(1)?;
-            let _inode_locks = self.lock_path_and_inode_for_write(path, inode_id)?;
+            let _locked = self.lock_path_and_inode_for_write_light(path, inode_id)?;
             let commit_block_ids = Self::commit_block_ids(&commit_blocks);
             let commit_worker_ids = Self::commit_block_worker_ids(&commit_blocks);
             let commit_location_pairs = Self::commit_block_location_pairs(&commit_blocks);
@@ -4226,6 +4239,17 @@ impl MasterFilesystem {
 
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let path = path.as_ref();
+        // Single-node chmod/chown/utimes is the hot case: lock via the
+        // replica-reader walk and reuse the locked InodePath instead of
+        // re-walking RocksDB twice plus a full in-tree resolve per call.
+        if !opts.recursive {
+            return self.run_metadata_write(|| {
+                let _journal_scope = self.reserve_journal_scope(1)?;
+                let locked = self.lock_resolved_path_for_write(path, InodeLockMode::Write, false)?;
+                let fs_dir = self.fs_dir.read();
+                fs_dir.set_attr(locked.path, opts)
+            });
+        }
         self.run_metadata_write(|| {
             let _journal_scope = self.reserve_journal_scope(1)?;
             let _inode_locks = self.lock_set_attr_path(path, opts.recursive)?;
@@ -4430,16 +4454,16 @@ impl MasterFilesystem {
         let path = path.as_ref();
         self.run_metadata_write(|| {
             let _journal_scope = self.reserve_journal_scope(1)?;
-            let _inode_locks = self.lock_path_for_write(path, InodeLockMode::Write, false)?;
+            // Reuse the locked InodePath; the previous implementation resolved
+            // the path a third time from RocksDB after the lock was held.
+            let locked = self.lock_resolved_path_for_write(path, InodeLockMode::Write, false)?;
+            if !locked.path.is_full() {
+                return err_ext!(FsError::file_not_found(path));
+            }
             let writer = self.journal_writer.clone();
             let op_id = self.next_op_id();
             let store = self.rocks_store()?;
-            let resolver = StorePathResolver::new(&store);
-            let resolved = resolver.resolve(path)?;
-            if !resolved.is_full() {
-                return err_ext!(FsError::file_not_found(path));
-            }
-            let inode = match resolved.target() {
+            let inode = match locked.path.get_last_inode() {
                 Some(v) => v,
                 None => return err_ext!(FsError::file_not_found(path)),
             };

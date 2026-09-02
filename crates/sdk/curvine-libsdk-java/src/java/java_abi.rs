@@ -18,7 +18,7 @@ use crate::java::{JavaFilesystem, SUCCESS};
 use crate::{java_err, java_err2, LibFsReader, LibFsWriter};
 use curvine_sys::FFIUtils;
 use jni::objects::{JByteArray, JLongArray, JObject, JString};
-use jni::sys::{jarray, jboolean, jint, jlong};
+use jni::sys::{jarray, jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 
 // It's too troublesome to parse object members by jni. Here the configuration will be passed through the json string.
@@ -270,6 +270,18 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_delete(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_free(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    path: JString,
+    recursive: jboolean,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.free(&mut env, path, recursive))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getFilesystemInfo(
     mut env: JNIEnv,
     _this: JObject,
@@ -355,6 +367,18 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitLoadJob(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_submitExportJob(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    source_path: JString,
+    overwrite: jboolean,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.submit_export_job(&mut env, source_path, overwrite))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getJobStatus(
     mut env: JNIEnv,
     _this: JObject,
@@ -375,4 +399,15 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_cancelJob(
     let fs = &*fs_ptr;
     java_err!(env, fs.cancel_job(&mut env, job_id));
     SUCCESS
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_retryJob(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    job_id: JString,
+) -> jstring {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.retry_job(&mut env, job_id))
 }

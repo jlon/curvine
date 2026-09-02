@@ -22,6 +22,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.IOException;
 import java.time.Duration;
 
 public class LoadJobClientTest {
@@ -58,6 +59,29 @@ public class LoadJobClientTest {
         Assert.assertEquals("s3://bucket/a", request.getSourcePath());
         Assert.assertEquals("/mnt/a", request.getTargetPath());
         Assert.assertTrue(request.isOverwrite());
+    }
+
+    @Test
+    public void terminalStateDetectionMatchesForceRetrySemantics() {
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.PENDING));
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.LOADING));
+        Assert.assertFalse(CurvineTransferClient.isTerminal(JobTaskStateProto.UNKNOWN));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.COMPLETED));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.FAILED));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.PARTIAL_SUCCESS));
+        Assert.assertTrue(CurvineTransferClient.isTerminal(JobTaskStateProto.CANCELED));
+    }
+
+    @Test
+    public void forceRetryRequiresTransferRouting() throws IOException {
+        try {
+            CurvineTransferClient.checkForceAllowed(true, false);
+            Assert.fail("expected force to require transfer routing");
+        } catch (IOException expected) {
+            Assert.assertTrue(expected.getMessage().contains("transfer.enabled=true"));
+        }
+        CurvineTransferClient.checkForceAllowed(false, false);
+        CurvineTransferClient.checkForceAllowed(true, true);
     }
 
     @Test

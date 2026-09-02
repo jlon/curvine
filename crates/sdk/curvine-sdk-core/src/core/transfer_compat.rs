@@ -48,7 +48,7 @@ pub(crate) fn map_transfer_state(state: TransferState) -> JobTaskState {
     }
 }
 
-pub(crate) fn validate_transfer_load_command(command: &LoadJobCommand) -> FsResult<()> {
+pub(crate) fn validate_transfer_command(command: &LoadJobCommand) -> FsResult<()> {
     if command.replicas.is_some()
         || command.block_size.is_some()
         || command.storage_type.is_some()
@@ -56,7 +56,7 @@ pub(crate) fn validate_transfer_load_command(command: &LoadJobCommand) -> FsResu
         || command.ttl_action.is_some()
     {
         return err_box!(
-            "transfer path does not support LoadJob options replicas/block_size/storage_type/ttl; \
+            "transfer path does not support replicas/block_size/storage_type/ttl options; \
              use source_path, target_path, and overwrite only"
         );
     }
@@ -91,9 +91,10 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
     }
 }
 
-async fn resolve_load_paths(
+async fn resolve_transfer_paths(
     fs: &UnifiedFileSystem,
     command: &LoadJobCommand,
+    kind: TransferKind,
 ) -> FsResult<(String, String)> {
     let input = Path::from_str(&command.source_path)?;
     let (source, target) = if let Some(target_path) = &command.target_path {
@@ -109,27 +110,39 @@ async fn resolve_load_paths(
             (input, peer)
         }
     };
-    if source.is_cv() || !target.is_cv() {
-        return err_box!(
-            "load requires a UFS source and Curvine target: {} -> {}",
-            source.full_path(),
-            target.full_path()
-        );
+    match kind {
+        TransferKind::Load if !source.is_cv() && target.is_cv() => {}
+        TransferKind::Export if source.is_cv() && !target.is_cv() => {}
+        TransferKind::Load => {
+            return err_box!(
+                "load requires a UFS source and Curvine target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            )
+        }
+        TransferKind::Export => {
+            return err_box!(
+                "export requires a Curvine source and UFS target: {} -> {}",
+                source.full_path(),
+                target.full_path()
+            )
+        }
     }
     Ok((source.clone_uri(), target.clone_uri()))
 }
 
 fn build_transfer_command(
+    kind: TransferKind,
     source_path: String,
     target_path: String,
     overwrite: bool,
 ) -> TransferCommand {
     let mut command = TransferCommand {
-        kind: TransferKind::Load,
+        kind,
         source_path: source_path.clone(),
         target_path: target_path.clone(),
         client_request_id: TransferCommand::default_client_request_id_with_overwrite(
-            TransferKind::Load,
+            kind,
             &source_path,
             &target_path,
             overwrite,
@@ -156,10 +169,43 @@ pub(crate) async fn submit_load_job(
             .await;
     }
 
-    validate_transfer_load_command(&command)?;
+    validate_transfer_command(&command)?;
     let overwrite = command.overwrite.unwrap_or(true);
-    let (source_path, target_path) = resolve_load_paths(session.unified(), &command).await?;
-    let transfer_command = build_transfer_command(source_path, target_path.clone(), overwrite);
+    let (source_path, target_path) =
+        resolve_transfer_paths(session.unified(), &command, TransferKind::Load).await?;
+    let transfer_command = build_transfer_command(
+        TransferKind::Load,
+        source_path,
+        target_path.clone(),
+        overwrite,
+    );
+    let response = transfer_client(session)?.submit(transfer_command).await?;
+    Ok(load_job_result_from_submit(&response, target_path))
+}
+
+pub(crate) async fn submit_export_job(
+    session: &Session,
+    command: LoadJobCommand,
+) -> FsResult<LoadJobResult> {
+    if !transfer_enabled(session) {
+        return JobMasterClient::new(session.fs_client())
+            .submit_export_job(command)
+            .await;
+    }
+
+    validate_transfer_command(&command)?;
+    if command.target_path.is_some() {
+        return err_box!("export does not support an explicit target path");
+    }
+    let overwrite = command.overwrite.unwrap_or(true);
+    let (source_path, target_path) =
+        resolve_transfer_paths(session.unified(), &command, TransferKind::Export).await?;
+    let transfer_command = build_transfer_command(
+        TransferKind::Export,
+        source_path,
+        target_path.clone(),
+        overwrite,
+    );
     let response = transfer_client(session)?.submit(transfer_command).await?;
     Ok(load_job_result_from_submit(&response, target_path))
 }
@@ -185,6 +231,13 @@ pub(crate) async fn cancel_job(session: &Session, job_id: impl AsRef<str>) -> Fs
     }
     let _ = transfer_client(session)?.cancel(job_id, None).await?;
     Ok(())
+}
+
+pub(crate) async fn retry_job(session: &Session, job_id: impl AsRef<str>) -> FsResult<String> {
+    if !transfer_enabled(session) {
+        return err_box!("retry requires transfer.enabled=true");
+    }
+    Ok(transfer_client(session)?.retry(job_id).await?.job_id)
 }
 
 pub(crate) async fn wait_job_complete(
@@ -313,30 +366,33 @@ mod tests {
     #[test]
     fn rejects_unsupported_transfer_load_options() {
         let command = LoadJobCommand::builder("s3://bucket/a").replicas(2).build();
-        let err = validate_transfer_load_command(&command).unwrap_err();
+        let err = validate_transfer_command(&command).unwrap_err();
         assert!(err.to_string().contains("does not support"));
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .block_size(1024)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .storage_type(StorageType::Disk)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .ttl_ms(1000)
             .ttl_action(TtlAction::Delete)
             .build();
-        assert!(validate_transfer_load_command(&command).is_err());
+        assert!(validate_transfer_command(&command).is_err());
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .target_path("/mnt/a")
             .overwrite(false)
             .build();
-        assert!(validate_transfer_load_command(&command).is_ok());
+        assert!(validate_transfer_command(&command).is_ok());
+
+        let command = LoadJobCommand::builder("/mnt/a").build();
+        assert!(validate_transfer_command(&command).is_ok());
     }
 
     #[test]

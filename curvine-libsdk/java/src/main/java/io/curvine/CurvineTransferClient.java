@@ -150,7 +150,7 @@ public final class CurvineTransferClient implements Closeable {
                     return status;
                 }
                 throw new IOException(
-                        "transfer job " + jobId + " ended with state " + status.getState()
+                        "job " + jobId + " ended with state " + status.getState()
                                 + (status.getProgress() != null
                                 ? ": " + status.getProgress().getMessage()
                                 : ""));
@@ -158,10 +158,10 @@ public final class CurvineTransferClient implements Closeable {
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0L) {
                 throw new TimeoutException(
-                        "transfer job " + jobId + " not complete after " + timeout
+                        "job " + jobId + " not complete after " + timeout
                                 + ", last state=" + status.getState());
             }
-            sleepNanos(Math.min(pollInterval.toNanos(), remainingNanos));
+            sleepNanos(Math.min(saturatingDurationNanos(pollInterval), remainingNanos));
         }
     }
 
@@ -176,10 +176,16 @@ public final class CurvineTransferClient implements Closeable {
     }
 
     static long saturatingDeadlineNanos(Duration timeout) {
-        long now = System.nanoTime();
-        long timeoutNanos = timeout.toNanos();
         try {
-            return Math.addExact(now, timeoutNanos);
+            return Math.addExact(System.nanoTime(), timeout.toNanos());
+        } catch (ArithmeticException overflow) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    static long saturatingDurationNanos(Duration duration) {
+        try {
+            return duration.toNanos();
         } catch (ArithmeticException overflow) {
             return Long.MAX_VALUE;
         }
@@ -200,7 +206,7 @@ public final class CurvineTransferClient implements Closeable {
 
     static void checkForceAllowed(boolean force, boolean transferEnabled) throws IOException {
         if (force && !transferEnabled) {
-            throw new IOException("load --force requires transfer.enabled=true");
+            throw new IOException("load --force requires fs.cv.transfer.enabled=true");
         }
     }
 

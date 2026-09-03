@@ -52,11 +52,11 @@ final class NativeFilesystemHandle {
             if (closed) {
                 return;
             }
+            closed = true;
             long errno = CurvineNative.closeFilesystem(nativeHandle);
             if (errno < 0) {
                 throw CurvineException.create((int) errno, message);
             }
-            closed = true;
         } finally {
             lifecycleLock.writeLock().unlock();
         }

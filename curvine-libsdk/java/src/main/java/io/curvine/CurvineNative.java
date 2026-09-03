@@ -347,7 +347,7 @@ public class CurvineNative {
 
     public static native long delete(long nativeHandle, String path, boolean recursive) throws IOException;
 
-    /** Return the counts and bytes released by deleting a path from Curvine. */
+    /** Release Curvine blocks and metadata for a path and return the released totals. */
     public static native byte[] free(long nativeHandle, String path, boolean recursive) throws IOException;
 
     public static native byte[] getFilesystemInfo(long nativeHandle) throws IOException;

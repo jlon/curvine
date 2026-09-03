@@ -78,7 +78,7 @@ public class LoadJobClientTest {
             CurvineTransferClient.checkForceAllowed(true, false);
             Assert.fail("expected force to require transfer routing");
         } catch (IOException expected) {
-            Assert.assertTrue(expected.getMessage().contains("transfer.enabled=true"));
+            Assert.assertTrue(expected.getMessage().contains("fs.cv.transfer.enabled=true"));
         }
         CurvineTransferClient.checkForceAllowed(false, false);
         CurvineTransferClient.checkForceAllowed(true, true);
@@ -186,6 +186,19 @@ public class LoadJobClientTest {
     public void saturatingDeadlineDoesNotWrap() {
         long deadline = CurvineLoadClient.saturatingDeadlineNanos(Duration.ofNanos(Long.MAX_VALUE));
         Assert.assertEquals(Long.MAX_VALUE, deadline);
+    }
+
+    @Test
+    public void saturatingDeadlineHandlesDurationConversionOverflow() {
+        long deadline = CurvineLoadClient.saturatingDeadlineNanos(Duration.ofSeconds(Long.MAX_VALUE));
+        Assert.assertEquals(Long.MAX_VALUE, deadline);
+    }
+
+    @Test
+    public void saturatingDurationHandlesConversionOverflow() {
+        Assert.assertEquals(
+                Long.MAX_VALUE,
+                CurvineTransferClient.saturatingDurationNanos(Duration.ofSeconds(Long.MAX_VALUE)));
     }
 
     @Test

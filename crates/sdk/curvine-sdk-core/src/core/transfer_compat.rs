@@ -56,8 +56,7 @@ pub(crate) fn validate_transfer_command(command: &LoadJobCommand) -> FsResult<()
         || command.ttl_action.is_some()
     {
         return err_box!(
-            "transfer path does not support replicas/block_size/storage_type/ttl options; \
-             use source_path, target_path, and overwrite only"
+            "transfer path does not support replicas/block_size/storage_type/ttl options"
         );
     }
     Ok(())
@@ -91,6 +90,13 @@ pub(crate) fn job_status_from_transfer(status: GetTransferStatusResponse) -> Job
     }
 }
 
+fn infer_transfer_paths(input: Path, peer: Path, kind: TransferKind) -> (Path, Path) {
+    match kind {
+        TransferKind::Load if input.is_cv() => (peer, input),
+        TransferKind::Load | TransferKind::Export => (input, peer),
+    }
+}
+
 async fn resolve_transfer_paths(
     fs: &UnifiedFileSystem,
     command: &LoadJobCommand,
@@ -104,11 +110,7 @@ async fn resolve_transfer_paths(
             Some(peer) => peer,
             None => return err_box!("{} is not mounted", command.source_path),
         };
-        if input.is_cv() {
-            (peer, input)
-        } else {
-            (input, peer)
-        }
+        infer_transfer_paths(input, peer, kind)
     };
     match kind {
         TransferKind::Load if !source.is_cv() && target.is_cv() => {}
@@ -368,6 +370,7 @@ mod tests {
         let command = LoadJobCommand::builder("s3://bucket/a").replicas(2).build();
         let err = validate_transfer_command(&command).unwrap_err();
         assert!(err.to_string().contains("does not support"));
+        assert!(!err.to_string().contains("target_path"));
 
         let command = LoadJobCommand::builder("s3://bucket/a")
             .block_size(1024)
@@ -393,6 +396,24 @@ mod tests {
 
         let command = LoadJobCommand::builder("/mnt/a").build();
         assert!(validate_transfer_command(&command).is_ok());
+    }
+
+    #[test]
+    fn infers_export_paths_without_reversing_the_cv_source() {
+        let cv_path = Path::from_str("/models/v1").unwrap();
+        let ufs_path = Path::from_str("s3://bucket/models/v1").unwrap();
+
+        let (load_source, load_target) =
+            infer_transfer_paths(cv_path.clone(), ufs_path.clone(), TransferKind::Load);
+        assert_eq!(load_source.clone_uri(), ufs_path.clone_uri());
+        assert_eq!(load_target.clone_uri(), cv_path.clone_uri());
+
+        let (export_source, export_target) =
+            infer_transfer_paths(cv_path.clone(), ufs_path.clone(), TransferKind::Export);
+        assert!(export_source.is_cv());
+        assert!(!export_target.is_cv());
+        assert_eq!(export_source.clone_uri(), cv_path.clone_uri());
+        assert_eq!(export_target.clone_uri(), ufs_path.clone_uri());
     }
 
     #[test]

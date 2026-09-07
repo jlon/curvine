@@ -62,6 +62,7 @@ mod tests {
 
     #[test]
     fn hdfs_provider_selects_native_backend() {
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[])));
         assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
             "hdfs.provider",
             "native"
@@ -73,6 +74,10 @@ mod tests {
         assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
             "hdfs.provider",
             "jvm"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "unknown"
         )])));
     }
 

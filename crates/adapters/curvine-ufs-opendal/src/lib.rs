@@ -48,6 +48,51 @@ fn storage_error(
     }
 }
 
+#[cfg(all(test, any(feature = "opendal-hdfs", feature = "opendal-hdfs-native")))]
+mod tests {
+    use super::OpendalFileSystem;
+    use std::collections::HashMap;
+
+    fn config(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn hdfs_provider_selects_native_backend() {
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "native"
+        )])));
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "HDFS-NATIVE"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.provider",
+            "jvm"
+        )])));
+    }
+
+    #[test]
+    fn legacy_hdfs_native_flag_is_used_only_without_provider() {
+        assert!(OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "true"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[(
+            "hdfs.native",
+            "false"
+        )])));
+        assert!(!OpendalFileSystem::use_hdfs_native(&config(&[
+            ("hdfs.provider", "jvm"),
+            ("hdfs.native", "true"),
+        ])));
+    }
+}
+
 fn opendal_error(operation: impl AsRef<str>, path: impl AsRef<str>, e: opendal::Error) -> FsError {
     let not_found = e.kind() == ErrorKind::NotFound;
     storage_error(operation, path, e, not_found)
@@ -547,15 +592,9 @@ impl OpendalFileSystem {
 
     #[cfg(any(feature = "opendal-hdfs", feature = "opendal-hdfs-native"))]
     fn use_hdfs_native(conf: &HashMap<String, String>) -> bool {
-        let explicit_backend = conf
-            .get("hdfs.provider")
-            .or_else(|| conf.get("hdfs.backend"))
-            .or_else(|| conf.get("opendal.hdfs.driver"));
-
-        if let Some(value) = explicit_backend {
-            if value.eq_ignore_ascii_case("native") || value.eq_ignore_ascii_case("hdfs-native") {
-                return true;
-            }
+        if let Some(value) = conf.get("hdfs.provider") {
+            return value.eq_ignore_ascii_case("native")
+                || value.eq_ignore_ascii_case("hdfs-native");
         }
 
         conf.get("hdfs.native")
@@ -634,6 +673,8 @@ impl OpendalFileSystem {
     ///
     /// Note: HdfsNative uses system-level Kerberos configuration via environment variables.
     /// Supported configurations:
+    /// - hdfs.provider: Set to "native" to select this backend when both JVM
+    ///   and native HDFS providers are compiled in
     /// - hdfs.namenode: NameNode address (required)
     /// - hdfs.root: Root path (default: "/")
     /// - hdfs.kerberos.krb5_conf: Path to krb5.conf file

@@ -138,8 +138,17 @@ public final class CurvineJavaUtils {
 
     public static Configuration getCurvineConf() {
         String confDir = System.getProperty("curvine.conf.dir");
+        if (confDir == null || confDir.trim().isEmpty()) {
+            throw new IllegalArgumentException("System property curvine.conf.dir must be set");
+        }
+
         Configuration conf = new Configuration(false);
         File file = new File(Paths.get(confDir, "curvine-site.xml").toString());
+        if (!file.isFile()) {
+            throw new IllegalArgumentException("curvine-site.xml was not found under curvine.conf.dir: "
+                    + file.getAbsolutePath());
+        }
+
         conf.addResource(new Path(file.getPath()));
 
         if (conf.get("fs.cv.impl") == null) {

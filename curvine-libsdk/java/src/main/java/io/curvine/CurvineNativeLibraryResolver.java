@@ -47,8 +47,10 @@ final class CurvineNativeLibraryResolver {
             }
             libraryNames.add(String.format("libcurvine_libsdk_linux_%s.so", archSuffix));
             libraryNames.add(String.format("libcurvine_libsdk_centos7_%s.so", archSuffix));
+            libraryNames.add(String.format("libcurvine_libsdk_amzn2_%s.so", archSuffix));
+            libraryNames.add(String.format("libcurvine_libsdk_alinux3_%s.so", archSuffix));
+            libraryNames.add(String.format("libcurvine_libsdk_rocky9_%s.so", archSuffix));
             if ("x86".equals(arch)) {
-                libraryNames.add("libcurvine_libsdk_rocky9_x86_64.so");
                 libraryNames.add("libcurvine_libsdk.so");
             }
             return libraryNames.toArray(new String[0]);

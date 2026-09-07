@@ -100,12 +100,18 @@ public class LibFsTest {
         Assert.assertEquals("libcurvine_libsdk_ubuntu20_x86_64.so", x86.get(0));
         Assert.assertTrue(x86.contains("libcurvine_libsdk_linux_x86_64.so"));
         Assert.assertTrue(x86.contains("libcurvine_libsdk_centos7_x86_64.so"));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk_amzn2_x86_64.so"));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk_alinux3_x86_64.so"));
+        Assert.assertTrue(x86.contains("libcurvine_libsdk_rocky9_x86_64.so"));
         Assert.assertTrue(x86.contains("libcurvine_libsdk.so"));
 
         List<String> arm = Arrays.asList(CurvineNativeLibraryResolver.getLibraryNames("linux", "ubuntu20", "aarch"));
         Assert.assertEquals("libcurvine_libsdk_ubuntu20_aarch_64.so", arm.get(0));
         Assert.assertTrue(arm.contains("libcurvine_libsdk_linux_aarch_64.so"));
         Assert.assertTrue(arm.contains("libcurvine_libsdk_centos7_aarch_64.so"));
+        Assert.assertTrue(arm.contains("libcurvine_libsdk_amzn2_aarch_64.so"));
+        Assert.assertTrue(arm.contains("libcurvine_libsdk_alinux3_aarch_64.so"));
+        Assert.assertTrue(arm.contains("libcurvine_libsdk_rocky9_aarch_64.so"));
         Assert.assertFalse(arm.contains("libcurvine_libsdk.so"));
     }
 }

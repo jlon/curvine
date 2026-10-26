@@ -34,7 +34,7 @@ use log::{debug, error, info, warn};
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::{Progress, ProgressState, RawNode, Ready, SoftState};
+use raft::{Progress, ProgressState, RawNode, Ready, SoftState, StateRole};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +63,19 @@ struct PendingPropose {
 }
 
 type PendingPromises = HashMap<i64, PendingPropose>;
+
+fn is_leader_contact_message(message_type: MessageType) -> bool {
+    matches!(
+        message_type,
+        MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot
+    )
+}
+
+fn snapshot_carries_metadata(snapshot: &Snapshot) -> bool {
+    SnapshotData::decode(snapshot.get_data())
+        .map(|data| data.snapshot_id != 0 || data.files_data.is_some() || data.bytes_data.is_some())
+        .unwrap_or(true)
+}
 
 pub struct RaftNode<A, B>
 where
@@ -384,6 +397,8 @@ where
             if !self.is_leader() && !promise.is_empty() {
                 Self::fail_pending_promises(promise, "raft node is not the leader");
             }
+
+            self.refresh_follower_readiness();
         }
 
         Ok(())
@@ -541,6 +556,9 @@ where
         };
 
         let message = &raft.message;
+        let message_type = message.get_msg_type();
+        let message_term = message.term;
+        let message_from = message.from;
         if message.to != self.id() || message.from == self.id() || message.from == DEFAULT_LEADER_ID
         {
             return Self::send_request_error(
@@ -566,6 +584,16 @@ where
         }
         if let Err(e) = self.recovery.step(&mut self.raw, raft, self.session) {
             return Self::send_request_error(env, e);
+        }
+        self.refresh_follower_readiness();
+        if is_leader_contact_message(message_type)
+            && self.raw.raft.state == StateRole::Follower
+            && self.raw.raft.term == message_term
+            && self.raw.raft.leader_id == message_from
+        {
+            self.role_monitor
+                .follower_readiness()
+                .observe_leader_contact(message_term, message_from);
         }
         if self.recovery.active && self.storage.recovery_state()? != Some(self.id()) {
             self.storage.set_recovery_state(Some(self.id()))?;
@@ -639,6 +667,24 @@ where
         }
 
         Ok(())
+    }
+
+    fn refresh_follower_readiness(&self) {
+        let role = if self.recovery.active {
+            RoleState::Init
+        } else {
+            match self.raw.raft.state {
+                StateRole::Leader => RoleState::Leader,
+                StateRole::Follower => RoleState::Follower,
+                _ => RoleState::Init,
+            }
+        };
+        self.role_monitor.follower_readiness().observe_raft_state(
+            role,
+            self.raw.raft.term,
+            self.raw.raft.leader_id,
+            self.raw.raft.raft_log.committed,
+        );
     }
 
     fn handle_ping(&self, env: Envelope) -> RaftResult<()> {
@@ -721,6 +767,11 @@ where
                 !self.recovery.active && self.role_monitor.is_leader() && !self.is_leader();
             if demoted {
                 self.role_monitor.step_down();
+            }
+            if snapshot_carries_metadata(ready.snapshot()) {
+                self.role_monitor
+                    .follower_readiness()
+                    .set_replay_ready(false);
             }
             let snapshot_done = self
                 .storage

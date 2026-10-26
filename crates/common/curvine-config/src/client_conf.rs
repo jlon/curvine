@@ -97,6 +97,17 @@ pub struct ClientConf {
     #[client_cli]
     pub alloc_first_block_on_create: bool,
 
+    /// Opt in to metadata reads on eligible follower masters. This remains
+    /// disabled until the client routing layer is enabled independently.
+    #[serde(alias = "follower_reads")]
+    #[client_cli]
+    pub follower_reads_enabled: bool,
+
+    /// Route same-session reads for a recently mutated path through the
+    /// leader for this many milliseconds before allowing follower reads.
+    #[client_cli]
+    pub follower_write_sticky_ms: u64,
+
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
@@ -361,6 +372,12 @@ impl ClientConf {
             addr.hostname = addr.hostname.trim().to_string();
         }
 
+        if self.follower_reads_enabled && self.follower_write_sticky_ms == 0 {
+            return err_box!(
+                "client.follower_write_sticky_ms must be greater than zero when follower reads are enabled"
+            );
+        }
+
         if self.read_parallel <= 0 {
             self.read_parallel = Self::DEFAULT_READ_PARALLEL;
         }
@@ -479,6 +496,8 @@ impl Default for ClientConf {
 
             short_circuit: true,
             alloc_first_block_on_create: true,
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 5_000,
 
             storage_type: StorageType::Disk,
             storage_type_str: "disk".to_string(),
@@ -608,6 +627,41 @@ mod tests {
     fn test_seek_absorb_window_default_off() {
         let conf = ClientConf::default();
         assert_eq!(conf.seek_absorb_window, 0);
+    }
+
+    #[test]
+    fn follower_reads_are_disabled_by_default() {
+        let conf = ClientConf::default();
+        assert!(!conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 5_000);
+    }
+
+    #[test]
+    fn follower_reads_toml_alias_and_sticky_window_are_supported() {
+        let mut conf: ClientConf =
+            toml::from_str("follower_reads = true\nfollower_write_sticky_ms = 1250").unwrap();
+        conf.init().unwrap();
+
+        assert!(conf.follower_reads_enabled);
+        assert_eq!(conf.follower_write_sticky_ms, 1_250);
+    }
+
+    #[test]
+    fn follower_reads_require_a_positive_sticky_window() {
+        let mut conf = ClientConf {
+            follower_reads_enabled: true,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        let error = conf.init().unwrap_err().to_string();
+        assert!(error.contains("follower_write_sticky_ms must be greater than zero"));
+
+        let mut disabled = ClientConf {
+            follower_reads_enabled: false,
+            follower_write_sticky_ms: 0,
+            ..Default::default()
+        };
+        disabled.init().unwrap();
     }
 
     #[test]

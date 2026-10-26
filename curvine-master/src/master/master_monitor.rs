@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_raft::raft::RoleState;
+use curvine_raft::raft::{FollowerReadinessMonitor, FollowerReadinessSnapshot};
 use curvine_runtime::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,20 +45,46 @@ pub struct MasterMonitor {
     /// epochs are keyed on it: a promotion always carries a higher term than the
     /// previous leadership, while a standby can still observe it (#1883 review).
     term: Arc<AtomicU64>,
+    follower_readiness: FollowerReadinessMonitor,
 }
 
 impl MasterMonitor {
     pub fn new(journal_ctl: StateCtl, fs_ctl: StateCtl) -> Self {
-        Self::with_term(journal_ctl, fs_ctl, Arc::new(AtomicU64::new(0)))
+        Self::with_parts(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            FollowerReadinessMonitor::default(),
+        )
     }
 
-    /// Build a monitor that shares its term handle with the journal loader.
-    pub fn with_term(journal_ctl: StateCtl, fs_ctl: StateCtl, term: Arc<AtomicU64>) -> Self {
+    /// Build a monitor that shares its term handle with the journal loader and
+    /// its readiness handle with the raft driver.
+    pub fn with_parts(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        term: Arc<AtomicU64>,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
         Self {
             journal_ctl,
             fs_ctl,
             term,
+            follower_readiness,
         }
+    }
+
+    pub fn with_follower_readiness(
+        journal_ctl: StateCtl,
+        fs_ctl: StateCtl,
+        follower_readiness: FollowerReadinessMonitor,
+    ) -> Self {
+        Self::with_parts(
+            journal_ctl,
+            fs_ctl,
+            Arc::new(AtomicU64::new(0)),
+            follower_readiness,
+        )
     }
 
     /// Raft term of the last persisted hard state; 0 before the first one.
@@ -69,6 +96,12 @@ impl MasterMonitor {
     #[doc(hidden)]
     pub fn set_term_for_test(&self, term: u64) {
         self.term.store(term, Ordering::Release);
+    }
+
+    /// Returns current Raft contact and actual journal replay observations.
+    /// RPC admission remains controlled separately by master configuration.
+    pub fn follower_readiness_snapshot(&self) -> FollowerReadinessSnapshot {
+        self.follower_readiness.snapshot()
     }
 
     // Determine whether the current node is an active node.

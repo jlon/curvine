@@ -173,9 +173,9 @@ impl MasterClient {
             req.storages.push(ProtoUtils::storage_info_to_pb(item));
         }
 
-        let request = req.clone();
+        let request = self.peer_fanout.as_ref().map(|_| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req);
-        if let (Some(fanout), Ok(_)) = (&self.peer_fanout, &response) {
+        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
             fanout.publish_heartbeat(request);
         }
         if status == HeartbeatStatus::End {
@@ -196,9 +196,9 @@ impl MasterClient {
     ) -> CommonResult<BlockReportListResponse> {
         let req = self.full_report_batch_request(report_id, total_size, blocks);
 
-        let request = req.clone();
+        let request = self.peer_fanout.as_ref().map(|_| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
-        if let (Some(fanout), Ok(_)) = (&self.peer_fanout, &response) {
+        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
             fanout.publish_block_report(request);
         }
         let rep_header: BlockReportListResponse = response?;
@@ -230,9 +230,9 @@ impl MasterClient {
             req.blocks.push(info);
         }
 
-        let request = req.clone();
+        let request = self.peer_fanout.as_ref().map(|_| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
-        if let (Some(fanout), Ok(_)) = (&self.peer_fanout, &response) {
+        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
             fanout.publish_block_report(request);
         }
         let rep_header: BlockReportListResponse = response?;
@@ -257,12 +257,16 @@ impl MasterClient {
         }
     }
 
-    pub(crate) fn resync_follower_reports<F>(&self, build_reports: F) -> CommonResult<()>
+    pub(crate) fn resync_follower_reports<F>(
+        &self,
+        executor: &curvine_runtime::runtime::GroupExecutor,
+        build_reports: F,
+    ) -> CommonResult<()>
     where
-        F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>>,
+        F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>> + Send + 'static,
     {
         if let Some(fanout) = &self.peer_fanout {
-            fanout.resync_with_snapshot(build_reports)?;
+            fanout.schedule_resync(executor, build_reports)?;
         }
         Ok(())
     }

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 // BufferClient uses queue communication, which is thread-safe and can be shared among multiple threads.
@@ -53,6 +54,7 @@ impl BufferClient {
             receiver,
             write_frame,
             call_state.clone(),
+            client_state.close_signal.subscribe(),
         );
         rt.spawn(async move {
             if let Err(e) = request_future.await {
@@ -65,6 +67,7 @@ impl BufferClient {
             timeout,
             read_frame,
             call_state.clone(),
+            client_state.close_signal.subscribe(),
         );
         rt.spawn(async move {
             if let Err(e) = response_future.await {
@@ -88,15 +91,20 @@ impl BufferClient {
         mut receiver: mpsc::Receiver<Envelope>,
         mut write_frame: WriteFrame,
         call_map: Arc<CallMap>,
+        mut close_signal: watch::Receiver<bool>,
     ) -> IOResult<()> {
         let mut msgs: Vec<BoxMessage> = Vec::with_capacity(Self::BATCH_MAX);
 
         loop {
-            if client_state.is_closed() {
+            if client_state.is_closed() || *close_signal.borrow() {
                 break;
             }
 
-            let res = timeout(dur, receiver.recv()).await;
+            let res = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                res = timeout(dur, receiver.recv()) => res,
+            };
             let opt_env = match res {
                 Ok(v) => v,
                 Err(_) => {
@@ -115,7 +123,12 @@ impl BufferClient {
                     } else {
                         // Maintain heartbeat.
                         let msg = BoxMessage::Msg(Message::heartbeat());
-                        if let Err(e) = write_frame.send_timeout(&msg, dur).await {
+                        let send_result = tokio::select! {
+                            biased;
+                            _ = close_signal.changed() => break,
+                            result = write_frame.send_timeout(&msg, dur) => result,
+                        };
+                        if let Err(e) = send_result {
                             let err = IOError::with_msg(e.into_raw(), "heartbeat sending failed");
                             client_state.set_error(err);
                             break;
@@ -179,10 +192,51 @@ impl BufferClient {
                 continue;
             }
 
+<<<<<<< HEAD
             if let Err(e) = write_frame.send_batch_timeout(&msgs, dur).await {
                 // Network exception, setting connection has been closed. All
                 // in-flight callbacks, including this batch's, are failed by
                 // check_calls when the loop exits.
+=======
+            // Set the callback.
+            call_map.insert(req_id, env.cb);
+
+            let send_result = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                result = write_frame.send(&env.msg) => result,
+            };
+            if let Err(e) = send_result {
+                // send failed, send a failed callback notification directly.
+                match call_map.remove(req_id) {
+                    None => {
+                        warn!(
+                            "Request({},{}) not found callback",
+                            req_id,
+                            client_state.conn_info()
+                        );
+                    }
+
+                    Some(cb) => {
+                        let error: IOResult<Message> = err_box!(
+                            "Request({},{}) send failed:  {}",
+                            req_id,
+                            client_state.conn_info(),
+                            e
+                        );
+                        if let Err(e) = cb.send(error) {
+                            debug!(
+                                "Request({},{}) caller cancelled the request, drop send-failure notice: {:?}",
+                                req_id,
+                                client_state.conn_info(),
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Network exception, setting connection has been closed.
+>>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
                 client_state.set_error(e);
                 break;
             }
@@ -202,10 +256,25 @@ impl BufferClient {
         dur: Duration,
         mut read_frame: ReadFrame,
         call_map: Arc<CallMap>,
+        mut close_signal: watch::Receiver<bool>,
     ) -> IOResult<()> {
         loop {
+<<<<<<< HEAD
             let msg = match read_frame.receive_timeout(dur).await {
                 Ok(msg) => msg,
+=======
+            if *close_signal.borrow() {
+                break;
+            }
+
+            let res = tokio::select! {
+                biased;
+                _ = close_signal.changed() => break,
+                res = timeout(dur, read_frame.receive()) => res,
+            };
+            let read_res = match res {
+                Ok(v) => v,
+>>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
 
                 Err(e) if IOUtils::is_timeout(&e) => {
                     // A failed or closed connection takes no new requests, so
@@ -288,6 +357,7 @@ impl BufferClient {
 }
 
 #[cfg(test)]
+<<<<<<< HEAD
 mod tests {
     use super::BufferClient;
     use crate::client::dispatch::{CallMap, Envelope};
@@ -732,5 +802,77 @@ mod tests {
                 "a dead connection must fail its outstanding calls"
             );
         }
+=======
+mod close_signal_tests {
+    use crate::client::{ClientConf, RpcClient};
+    use crate::message::MessageBuilder;
+    use curvine_net::net::InetAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    #[test]
+    fn closing_a_buffer_client_drains_pending_calls_and_closes_its_socket() {
+        let test_runtime = tokio::runtime::Runtime::new().unwrap();
+        let conf = ClientConf {
+            close_idle: false,
+            ..Default::default()
+        };
+        let client_runtime = Arc::new(conf.create_runtime());
+
+        test_runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr: InetAddr = listener.local_addr().unwrap().into();
+            let (request_seen, request_seen_rx) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4_096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0, "client should send the pending RPC");
+                let _ = request_seen.send(());
+
+                // Consume any remaining request bytes and then wait for EOF.
+                // The close signal must release both background frame halves.
+                loop {
+                    let count = timeout(Duration::from_secs(2), socket.read(&mut bytes))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                }
+            });
+
+            let client = RpcClient::with_buffer(client_runtime.clone(), &addr, &conf)
+                .await
+                .unwrap();
+            let pending = tokio::spawn({
+                let client = client.clone();
+                async move { client.rpc(MessageBuilder::new_rpc(1).build()).await }
+            });
+            timeout(Duration::from_secs(2), request_seen_rx)
+                .await
+                .expect("server should receive the pending RPC")
+                .unwrap();
+
+            client.set_closed();
+            assert!(timeout(Duration::from_secs(2), pending)
+                .await
+                .expect("closing should notify the pending callback")
+                .unwrap()
+                .is_err());
+            timeout(Duration::from_secs(2), server)
+                .await
+                .expect("closing should shut down the pooled socket")
+                .unwrap();
+        });
+
+        drop(client_runtime);
+        drop(test_runtime);
+>>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
     }
 }

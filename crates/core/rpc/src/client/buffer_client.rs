@@ -192,51 +192,15 @@ impl BufferClient {
                 continue;
             }
 
-<<<<<<< HEAD
-            if let Err(e) = write_frame.send_batch_timeout(&msgs, dur).await {
-                // Network exception, setting connection has been closed. All
-                // in-flight callbacks, including this batch's, are failed by
-                // check_calls when the loop exits.
-=======
-            // Set the callback.
-            call_map.insert(req_id, env.cb);
-
             let send_result = tokio::select! {
                 biased;
                 _ = close_signal.changed() => break,
-                result = write_frame.send(&env.msg) => result,
+                result = write_frame.send_batch_timeout(&msgs, dur) => result,
             };
             if let Err(e) = send_result {
-                // send failed, send a failed callback notification directly.
-                match call_map.remove(req_id) {
-                    None => {
-                        warn!(
-                            "Request({},{}) not found callback",
-                            req_id,
-                            client_state.conn_info()
-                        );
-                    }
-
-                    Some(cb) => {
-                        let error: IOResult<Message> = err_box!(
-                            "Request({},{}) send failed:  {}",
-                            req_id,
-                            client_state.conn_info(),
-                            e
-                        );
-                        if let Err(e) = cb.send(error) {
-                            debug!(
-                                "Request({},{}) caller cancelled the request, drop send-failure notice: {:?}",
-                                req_id,
-                                client_state.conn_info(),
-                                e
-                            );
-                        }
-                    }
-                }
-
-                // Network exception, setting connection has been closed.
->>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
+                // Network exception, setting connection has been closed. All
+                // in-flight callbacks, including this batch's, are failed by
+                // check_calls when the loop exits.
                 client_state.set_error(e);
                 break;
             }
@@ -259,11 +223,7 @@ impl BufferClient {
         mut close_signal: watch::Receiver<bool>,
     ) -> IOResult<()> {
         loop {
-<<<<<<< HEAD
-            let msg = match read_frame.receive_timeout(dur).await {
-                Ok(msg) => msg,
-=======
-            if *close_signal.borrow() {
+            if *close_signal.borrow() || client_state.is_closed() {
                 break;
             }
 
@@ -272,11 +232,9 @@ impl BufferClient {
                 _ = close_signal.changed() => break,
                 res = timeout(dur, read_frame.receive()) => res,
             };
-            let read_res = match res {
-                Ok(v) => v,
->>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
-
-                Err(e) if IOUtils::is_timeout(&e) => {
+            let msg = match res {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) if IOUtils::is_timeout(&e) => {
                     // A failed or closed connection takes no new requests, so
                     // the read half has nothing left to wait for.
                     if client_state.has_error() || client_state.is_closed() {
@@ -284,8 +242,16 @@ impl BufferClient {
                     }
                     continue;
                 }
+                Err(_) => {
+                    // Idle timeout: same check — the channel itself may still be
+                    // healthy, so only bail when the connection is already dead.
+                    if client_state.has_error() || client_state.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
 
-                Err(e) => {
+                Ok(Err(e)) => {
                     client_state.set_error(e);
                     break;
                 }
@@ -357,8 +323,14 @@ impl BufferClient {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 mod tests {
+
+    /// Tests have no external close trigger; give every future its own signal
+    /// receiver that never fires.
+    fn test_close_signal() -> tokio::sync::watch::Receiver<bool> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        rx
+    }
     use super::BufferClient;
     use crate::client::dispatch::{CallMap, Envelope};
     use crate::client::ClientState;
@@ -400,6 +372,7 @@ mod tests {
                 Duration::from_millis(200),
                 read_frame,
                 call_map,
+                test_close_signal(),
             ),
         )
         .await
@@ -440,6 +413,7 @@ mod tests {
                 Duration::from_millis(200),
                 read_frame,
                 call_map,
+                test_close_signal(),
             ),
         )
         .await
@@ -542,6 +516,7 @@ mod tests {
             Duration::from_millis(100),
             read_frame,
             call_map.clone(),
+            test_close_signal(),
         ));
 
         tokio::time::sleep(Duration::from_millis(350)).await;
@@ -604,6 +579,7 @@ mod tests {
             WINDOW,
             read_frame,
             call_map.clone(),
+            test_close_signal(),
         ));
 
         // Issue the call near the end of the current window: it does not get a
@@ -802,7 +778,8 @@ mod tests {
                 "a dead connection must fail its outstanding calls"
             );
         }
-=======
+
+#[cfg(test)]
 mod close_signal_tests {
     use crate::client::{ClientConf, RpcClient};
     use crate::message::MessageBuilder;
@@ -873,6 +850,7 @@ mod close_signal_tests {
 
         drop(client_runtime);
         drop(test_runtime);
->>>>>>> 3be264cf (Fix follower read fallback and timeout cleanup)
+    }
+}
     }
 }

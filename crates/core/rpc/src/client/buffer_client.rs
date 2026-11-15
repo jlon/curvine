@@ -227,14 +227,19 @@ impl BufferClient {
                 break;
             }
 
-            let res = tokio::select! {
+            // receive_timeout (not a bare receive inside timeout()): a timeout
+            // that fires mid-frame is converted to ConnectionAborted because the
+            // consumed head bytes can never be resumed — that error is fatal
+            // below, while an empty-window timeout just loops.
+            let read_res = tokio::select! {
                 biased;
                 _ = close_signal.changed() => break,
-                res = timeout(dur, read_frame.receive()) => res,
+                res = read_frame.receive_timeout(dur) => res,
             };
-            let msg = match res {
-                Ok(Ok(msg)) => msg,
-                Ok(Err(e)) if IOUtils::is_timeout(&e) => {
+            let msg = match read_res {
+                Ok(msg) => msg,
+
+                Err(e) if IOUtils::is_timeout(&e) => {
                     // A failed or closed connection takes no new requests, so
                     // the read half has nothing left to wait for.
                     if client_state.has_error() || client_state.is_closed() {
@@ -242,16 +247,8 @@ impl BufferClient {
                     }
                     continue;
                 }
-                Err(_) => {
-                    // Idle timeout: same check — the channel itself may still be
-                    // healthy, so only bail when the connection is already dead.
-                    if client_state.has_error() || client_state.is_closed() {
-                        break;
-                    }
-                    continue;
-                }
 
-                Ok(Err(e)) => {
+                Err(e) => {
                     client_state.set_error(e);
                     break;
                 }
@@ -325,10 +322,11 @@ impl BufferClient {
 #[cfg(test)]
 mod tests {
 
-    /// Tests have no external close trigger; give every future its own signal
-    /// receiver that never fires.
+    /// Tests have no external close trigger; give every future a receiver on
+    /// a leaked sender so `changed()` never resolves and `borrow()` stays false.
     fn test_close_signal() -> tokio::sync::watch::Receiver<bool> {
-        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(tx);
         rx
     }
     use super::BufferClient;
@@ -781,6 +779,8 @@ mod tests {
                 "a dead connection must fail its outstanding calls"
             );
         }
+    }
+}
 
 #[cfg(test)]
 mod close_signal_tests {
@@ -853,7 +853,5 @@ mod close_signal_tests {
 
         drop(client_runtime);
         drop(test_runtime);
-    }
-}
     }
 }

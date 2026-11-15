@@ -116,6 +116,10 @@ impl LoopTask for HeartbeatChecker {
                 if let Err(e) = self.fs.retry_passive_block_reports() {
                     warn!("follower block-report replay failed: {}", e);
                 }
+                // A completed follower tick counts as liveness bookkeeping: the
+                // role transition back to leader is detected by compare_and_set
+                // against this flag, not by "never touched since boot".
+                self.last_active.set(true);
             }
             return Ok(());
         }

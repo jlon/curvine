@@ -135,9 +135,7 @@ impl FullReportSnapshot {
                 | crate::worker::block::BlockState::Recovering
                 | crate::worker::block::BlockState::Allocating
                 | crate::worker::block::BlockState::Finalizing
-                | crate::worker::block::BlockState::Quarantined => {
-                    BlockReportStatusProto::Writing
-                }
+                | crate::worker::block::BlockState::Quarantined => BlockReportStatusProto::Writing,
             };
             BlockReportInfoProto {
                 id: block.id,

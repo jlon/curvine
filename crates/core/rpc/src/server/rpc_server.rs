@@ -89,11 +89,15 @@ where
     async fn start0(&self) {
         let ctrl_c = tokio::signal::ctrl_c();
 
-        #[cfg(target_os = "linux")]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            // kill -p pid will send libc::SIGTERM signal (15).
-            let mut unix_sig = signal(SignalKind::terminate()).unwrap();
+            // tokio::signal::unix covers Linux and macOS; on Windows this arm
+            // compiles out and ctrl_c alone decides shutdown.
+            #[cfg(unix)]
+            let mut unix_sig = {
+                use tokio::signal::unix::{signal, SignalKind};
+                // kill -p pid will send libc::SIGTERM signal (15).
+                Some(signal(SignalKind::terminate()).unwrap())
+            };
 
             tokio::select! {
                 res = self.run() => {
@@ -106,23 +110,17 @@ where
                     info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
                 }
 
-                _ = unix_sig.recv()  => {
-                      info!("Received SIGTERM, shutting down {} gracefully...", self.conf.name);
-                }
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            tokio::select! {
-                res = self.run() => {
-                    if let Err(err) = res {
-                        error!("failed to accept, cause = {:?}", err);
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        unix_sig.as_mut().unwrap().recv().await
                     }
-                }
-
-                _ = ctrl_c => {
-                    info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
+                    #[cfg(not(unix))]
+                    {
+                        std::future::pending::<Option<()>>().await
+                    }
+                } => {
+                    info!("Received SIGTERM, shutting down {} gracefully...", self.conf.name);
                 }
             }
         }

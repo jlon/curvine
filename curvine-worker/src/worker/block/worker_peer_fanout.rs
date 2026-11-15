@@ -1394,6 +1394,7 @@ mod tests {
             ];
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
 
             let started = Instant::now();
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
@@ -1433,6 +1434,7 @@ mod tests {
             // for peer 2.
             limits.queued_bytes_max = request_bytes * 2;
             let fanout = WorkerPeerFanout::new(runtime.clone(), transport.clone(), limits).unwrap();
+            fanout.set_mirror_enabled(true);
 
             fanout.publish_heartbeat(request);
             timeout(Duration::from_secs(1), transport.slow_entered.notified())
@@ -1463,6 +1465,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
 
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             timeout(Duration::from_secs(1), async {
@@ -1519,6 +1522,7 @@ mod tests {
             assert!(report_bytes >= start_bytes);
             limits.queued_bytes_max = start_bytes + report_bytes;
             let fanout = WorkerPeerFanout::new(runtime.clone(), transport.clone(), limits).unwrap();
+            fanout.set_mirror_enabled(true);
 
             fanout.publish_heartbeat(start);
             wait_for_calls(&transport, 1).await;
@@ -1552,6 +1556,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
 
@@ -1625,6 +1630,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
 
@@ -1648,6 +1654,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::End));
@@ -1675,6 +1682,7 @@ mod tests {
             transport.slow_peer.store(2, Ordering::Release);
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             timeout(Duration::from_secs(1), transport.slow_entered.notified())
                 .await
@@ -1716,6 +1724,7 @@ mod tests {
             let mut limits = config();
             limits.queue_max_ops = 1;
             let fanout = WorkerPeerFanout::new(runtime.clone(), transport.clone(), limits).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
             transport.slow_entered.notified().await;
@@ -1766,6 +1775,7 @@ mod tests {
             limits.retry_timeout_ms = 1_000;
             limits.retry_max_ms = 1_000;
             let fanout = WorkerPeerFanout::new(runtime.clone(), transport.clone(), limits).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
             let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();
@@ -1796,6 +1806,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
             let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();
@@ -1833,6 +1844,7 @@ mod tests {
             let transport = transport();
             let fanout =
                 WorkerPeerFanout::new(runtime.clone(), transport.clone(), config()).unwrap();
+            fanout.set_mirror_enabled(true);
             fanout.publish_heartbeat(heartbeat(HeartbeatStatus::Start));
             wait_for_calls(&transport, 1).await;
             let mailbox = lock(&fanout.peers).get(&2).unwrap().mailbox.clone();

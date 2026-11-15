@@ -206,14 +206,14 @@ pub struct MasterConf {
     pub global_limit: usize,
 
     /// Permit explicitly allowlisted metadata reads on followers after the
-    /// Raft and journal freshness checks are wired into RPC admission.
-    /// Disabled by default; this setting alone does not bypass standby checks.
+    /// Raft and journal freshness checks are wired into RPC admission, and
+    /// accept worker registration/block reports on followers so they can
+    /// maintain the local non-journaled worker and block-location view those
+    /// reads need. Disabled by default; this setting alone does not bypass
+    /// standby checks.
     #[serde(alias = "follower_read_enabled")]
+    #[serde(alias = "follower_worker_state_enabled")]
     pub follower_reads_enabled: bool,
-    /// Accept worker registration and block reports on followers to maintain
-    /// their local, non-journaled worker and block-location view.
-    /// This does not enable client metadata reads on followers.
-    pub follower_worker_state_enabled: bool,
     /// Maximum number of entries the applied metadata FSM may trail the greater
     /// of the local Raft commit and the latest proven leader commit.
     pub follower_read_max_commit_lag: u64,
@@ -564,7 +564,6 @@ impl Default for MasterConf {
             global_limit: 4096,
 
             follower_reads_enabled: false,
-            follower_worker_state_enabled: false,
             follower_read_max_commit_lag: 0,
             follower_read_apply_stall_timeout: "30s".to_string(),
             follower_read_apply_stall_timeout_unit: Default::default(),
@@ -748,7 +747,6 @@ mod tests {
         let conf = MasterConf::default();
 
         assert!(!conf.follower_reads_enabled);
-        assert!(!conf.follower_worker_state_enabled);
         assert_eq!(conf.follower_read_max_commit_lag, 0);
         assert_eq!(conf.follower_read_apply_stall_timeout_ms(), 30_000);
     }

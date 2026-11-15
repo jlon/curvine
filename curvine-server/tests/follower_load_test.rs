@@ -71,7 +71,6 @@ fn three_worker_cluster() -> (TestDirectory, Vec<ClusterConf>, Vec<ClusterConf>)
     base.master.log.log_dir = "stderr".to_string();
     base.master.heartbeat_interval = "500ms".to_string();
     base.master.follower_reads_enabled = true;
-    base.master.follower_worker_state_enabled = true;
     base.journal.hostname = "127.0.0.1".to_string();
     base.journal.io_threads = 1;
     base.journal.worker_threads = 2;

@@ -79,7 +79,7 @@ impl LoopTask for HeartbeatChecker {
         if !self.monitor.is_active() {
             self.last_active.set(false);
 
-            if self.fs.conf.follower_worker_state_enabled || self.fs.conf.follower_reads_enabled {
+            if self.fs.conf.follower_reads_enabled {
                 if self.monitor.is_active()
                     || self.monitor.follower_readiness_snapshot().role
                         != curvine_raft::raft::RoleState::Follower
@@ -134,9 +134,7 @@ impl LoopTask for HeartbeatChecker {
                 true
             }
         };
-        if promotion_epoch
-            && (self.fs.conf.follower_worker_state_enabled || self.fs.conf.follower_reads_enabled)
-        {
+        if promotion_epoch && (self.fs.conf.follower_reads_enabled) {
             let now = LocalTime::mills();
             let refreshed = {
                 let mut wm = self.fs.worker_manager.write();
@@ -541,7 +539,7 @@ mod tests {
         let mut conf = ClusterConf::format();
         conf.testing = true;
         conf.journal.enable = false;
-        conf.master.follower_worker_state_enabled = true;
+        conf.master.follower_reads_enabled = true;
         let test_id = Utils::rand_str(8);
         conf.master.meta_dir = Utils::test_sub_dir(format!("heartbeat-promotion/meta-{test_id}"));
         conf.journal.journal_dir =

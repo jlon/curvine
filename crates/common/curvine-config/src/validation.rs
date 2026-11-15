@@ -68,7 +68,7 @@ impl ConfValidate for ClusterConf {
             self.mds.validate()?;
         }
         self.journal.validate()?;
-        if self.master.follower_reads_enabled || self.master.follower_worker_state_enabled {
+        if self.master.follower_reads_enabled {
             let contact_timeout = self.journal.follower_read_contact_timeout_ms()?;
             let election_timeout = self.journal.minimum_election_timeout_ms()?;
             if contact_timeout >= election_timeout {
@@ -407,7 +407,7 @@ mod tests {
         assert!(error.contains("follower readiness contact timeout"));
 
         let mut passive_state = ClusterConf::default();
-        passive_state.master.follower_worker_state_enabled = true;
+        passive_state.master.follower_reads_enabled = true;
         passive_state.journal.raft_heartbeat_tick = 5;
         let error = passive_state.validate().unwrap_err().to_string();
         assert!(error.contains("follower readiness contact timeout"));

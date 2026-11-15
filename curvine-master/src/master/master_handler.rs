@@ -182,13 +182,12 @@ impl MasterHandler {
     }
 
     fn passive_worker_rpc_allowed(
-        worker_state_enabled: bool,
         follower_reads_enabled: bool,
         role: curvine_raft::raft::RoleState,
         marked_worker_mirror: bool,
         code: RpcCode,
     ) -> bool {
-        (worker_state_enabled || follower_reads_enabled)
+        follower_reads_enabled
             && role == curvine_raft::raft::RoleState::Follower
             && marked_worker_mirror
             && matches!(code, RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport)
@@ -1610,7 +1609,6 @@ impl MessageHandler for MasterHandler {
             let readiness_snapshot = self.fs.master_monitor.follower_readiness_snapshot();
             let role = readiness_snapshot.role;
             if Self::passive_worker_rpc_allowed(
-                self.fs.conf.follower_worker_state_enabled,
                 self.fs.conf.follower_reads_enabled,
                 role,
                 Self::is_worker_mirror_rpc(msg, code),
@@ -1827,27 +1825,23 @@ mod tests {
 
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             false,
-            false,
             follower,
             true,
             RpcCode::WorkerHeartbeat
         ));
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             true,
-            false,
             follower,
             false,
             RpcCode::WorkerHeartbeat
         ));
         assert!(MasterHandler::passive_worker_rpc_allowed(
             true,
-            false,
             follower,
             true,
             RpcCode::WorkerHeartbeat
         ));
         assert!(MasterHandler::passive_worker_rpc_allowed(
-            false,
             true,
             follower,
             true,
@@ -1855,13 +1849,11 @@ mod tests {
         ));
         assert!(!MasterHandler::passive_worker_rpc_allowed(
             true,
-            true,
             follower,
             true,
             RpcCode::Mkdir
         ));
         assert!(!MasterHandler::passive_worker_rpc_allowed(
-            true,
             true,
             curvine_raft::raft::RoleState::Leader,
             true,

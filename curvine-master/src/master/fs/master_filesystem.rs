@@ -1959,7 +1959,7 @@ impl MasterFilesystem {
     }
 
     fn follower_worker_state_enabled(&self) -> bool {
-        self.conf.follower_worker_state_enabled || self.conf.follower_reads_enabled
+        self.conf.follower_reads_enabled
     }
 
     /// Evaluate the configured follower-read freshness policy against one
@@ -3867,7 +3867,7 @@ mod tests {
     fn passive_block_report_from_unregistered_worker_is_retryable() {
         let mut fs = test_fs("passive-block-report-unregistered");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -3894,7 +3894,7 @@ mod tests {
     fn passive_full_report_must_match_current_worker_session() {
         let mut fs = test_fs("passive-block-report-session");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -3954,7 +3954,7 @@ mod tests {
     fn passive_start_serializes_readiness_reset_with_session_replacement() {
         let mut fs = test_fs("passive-start-session-serialization");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -4077,7 +4077,7 @@ mod tests {
     fn follower_reconcile_runs_without_report_lock_and_old_session_cannot_finish_it() {
         let mut fs = test_fs("follower-reconcile-restart-fence");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -4142,7 +4142,7 @@ mod tests {
     fn failed_follower_reconcile_requests_a_fresh_full_report() {
         let mut fs = test_fs("follower-reconcile-retry");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -4217,7 +4217,7 @@ mod tests {
     fn follower_stale_chunk_rechecks_role_after_acquiring_namespace_writer() {
         let mut fs = test_fs("follower-reconcile-promotion-fence");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         let readiness = use_current_follower_view(&mut fs);
 
@@ -4288,7 +4288,7 @@ mod tests {
     fn deferred_replay_rechecks_commit_fence_under_namespace_writer() {
         let mut fs = test_fs("deferred-replay-promotion-fence");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         let readiness = use_current_follower_view(&mut fs);
         let report = DeferredBlockReport {
@@ -4347,7 +4347,7 @@ mod tests {
     fn follower_resyncs_surviving_worker_after_term_change() {
         let mut fs = test_fs("follower-term-worker-resync");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         let readiness = use_current_follower_view(&mut fs);
 
@@ -4466,7 +4466,7 @@ mod tests {
     fn passive_block_report_defers_unknown_inode_until_fresh_replay_contact() {
         let mut fs = test_fs("passive-block-report-replay");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         let readiness = use_current_follower_view(&mut fs);
 
@@ -4542,7 +4542,7 @@ mod tests {
     fn follower_location_reads_filter_to_any_safe_replica_per_block() {
         let mut fs = test_fs("follower-location-readiness");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 
@@ -4625,7 +4625,7 @@ mod tests {
     fn follower_read_lock_is_shared_and_fails_fast_during_report_writes() {
         let mut fs = test_fs("follower-read-lock-contention");
         let mut conf = (*fs.conf).clone();
-        conf.follower_worker_state_enabled = true;
+        conf.follower_reads_enabled = true;
         fs.conf = Arc::new(conf);
         use_current_follower_view(&mut fs);
 

@@ -1337,9 +1337,25 @@ impl FsClient {
                                 )
                                 .await
                             {
-                                Ok(response) => return Ok(response),
-                                Err((false, error)) => return Err(error),
+                                Ok(response) => {
+                                    FsContext::get_metrics()
+                                        .follower_read_total
+                                        .with_label_values(&[&format!("{code:?}"), "accepted"])
+                                        .inc();
+                                    return Ok(response);
+                                }
+                                Err((false, error)) => {
+                                    FsContext::get_metrics()
+                                        .follower_read_total
+                                        .with_label_values(&[&format!("{code:?}"), "refused"])
+                                        .inc();
+                                    return Err(error);
+                                }
                                 Err((true, error)) => {
+                                    FsContext::get_metrics()
+                                        .follower_read_total
+                                        .with_label_values(&[&format!("{code:?}"), "error"])
+                                        .inc();
                                     // A leader refusal is a quick membership hint and
                                     // should be reconsidered on the next read. Cool down
                                     // connection/transport failures, especially peers that

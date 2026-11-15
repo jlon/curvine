@@ -55,6 +55,12 @@ the full table. Oversized paths or a full path table pin all reads to the leader
 for the sticky window. Large encoded mutation batches also fall back to pinning
 the full namespace when they exceed 1,024 paths or contain a path over 4 KiB.
 
+Worker report mirroring is driven by the master: each heartbeat response
+carries a `mirror_worker_state` hint and the worker mirrors or stops mirroring
+on the next heartbeat. `worker.follower_mirroring_enabled` only opts a worker
+out entirely (default true = follow the master's hint); use it to isolate a
+misbehaving worker without changing masters.
+
 Worker report mirroring is bounded. Defaults are 256 queued operations per
 follower, 64 MiB across worker queues, 32 peer queues, and 16 concurrent peer
 RPCs. The configured caps are 4,096 operations, 1 GiB, 32 queues, and 32
@@ -75,11 +81,14 @@ maximum retry delay is 60 seconds.
 
 ## Rollout order
 
-1. Enable follower admission and passive worker state on the masters. Keep the
-   commit-lag limit at zero unless the application explicitly accepts staler
-   metadata.
-2. Enable worker report mirroring and restart workers. Keep `worker.follower_report_max_peer_queues`
-   at least as large as the number of follower masters that need worker state.
+1. Enable follower admission on the masters (`master.follower_reads_enabled`).
+   Keep the commit-lag limit at zero unless the application explicitly accepts
+   staler metadata. Worker report mirroring starts automatically: the leader
+   delivers `mirror_worker_state=true` in each worker heartbeat, so no worker
+   restart is needed.
+2. Keep `worker.follower_report_max_peer_queues` at least as large as the
+   number of follower masters that need worker state, and keep
+   `worker.follower_mirroring_enabled` at its default of true.
 3. Wait for workers to send their Start heartbeats and complete full block
    reports to every candidate follower. Do this before enabling clients; older
    workers that do not mirror reports cannot make follower block locations
@@ -97,7 +106,8 @@ The client does not cycle through every follower on a slow or unavailable peer.
 ## Read consistency
 
 The client allowlist is `Exists`, `FileStatus`, `ListStatus`, `ListOptions`,
-`GetMountTable`, `GetMountInfo`, `GetBlockLocations`, and `OpenFile` with a
+`GetMountTable`, `GetMountInfo`, `GetBlockLocations`, `GetFileBlockDetails`,
+`ListTrash`, `GetCvMetadataSnapshotPage`, and `OpenFile` with a
 valid read-only flag set. Writes, trash operations, unknown RPCs, malformed
 requests, and write-capable `OpenFile` flags stay on the leader path.
 Only the direct follower attempt carries the follower-read marker. Sticky
@@ -117,3 +127,30 @@ leader.
 
 Use follower reads for workloads that can tolerate those limits. Keep the
 feature disabled when every read must observe the latest committed write.
+
+## Observability
+
+Master metrics:
+
+- `master_follower_read_accepted_total{rpc_code}` — reads served by this
+  follower.
+- `master_follower_read_refused_total{rpc_code, reason}` — refusals by policy
+  (`disabled`, `missing_opt_in`, `not_allowlisted`, `open_file_not_read_only`,
+  `not_follower`) or by freshness (`commit_lag`, `apply_stalled`,
+  `replication_stalled`, `stale_leader_contact`, `leader_commit_unknown`,
+  `no_current_term_leader_contact`, `no_leader`, `replay_not_ready`,
+  `apply_progress_unknown`, `leadership_changed`).
+- `master_follower_read_commit_lag_entries` — leader commit minus local commit
+  observed on the last admitted follower read snapshot.
+- `master_follower_read_ready` — 1 when this master currently passes the
+  freshness/readiness gate, 0 otherwise (including on the leader).
+
+Client metric:
+
+- `client_follower_read_total{code, outcome}` — outcome of each follower
+  attempt: `accepted` (follower answered), `refused` (terminal follower
+  refusal, no fallback), `error` (retryable failure, fell back to leader).
+
+Worker peer-queue omissions warn at queue-capacity events; a worker whose
+queues cannot hold its inventory keeps its followers unready rather than
+serving incomplete block locations.

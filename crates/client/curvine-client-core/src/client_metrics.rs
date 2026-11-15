@@ -40,6 +40,12 @@ pub struct ClientMetrics {
     pub read_discarded_bytes: Counter,
     pub seek_absorbed_total: Counter,
     pub block_idle_conn: Gauge,
+
+    /// Follower-read attempt outcomes per RPC. `accepted` means the follower
+    /// answered; `refused` and `error` mean the client fell back to the
+    /// leader. Compare against `master_follower_read_accepted_total` to see
+    /// how much read traffic actually offloaded.
+    pub follower_read_total: CounterVec,
 }
 
 impl ClientMetrics {
@@ -84,6 +90,12 @@ impl ClientMetrics {
                 "forward seeks absorbed by prefetch buffer",
             )?,
             block_idle_conn: m::new_gauge("client_block_idle_conn", "block idle conn total")?,
+
+            follower_read_total: m::new_counter_vec(
+                "client_follower_read_total",
+                "follower read attempts by outcome (accepted|refused|error)",
+                &["code", "outcome"],
+            )?,
         };
 
         Ok(cm)

@@ -149,6 +149,14 @@ pub struct MasterMetrics {
     pub(crate) rpc_request_total_time: Counter,
     pub(crate) follower_read_accepted_total: CounterVec,
     pub(crate) follower_read_refused_total: CounterVec,
+    /// Latest commit-lag observation for a follower read that was admitted.
+    /// `leader_commit_index - commit_index` from the readiness snapshot. 0 on
+    /// a leader or when no leader commit proof has arrived yet.
+    pub(crate) follower_read_commit_lag_entries: Gauge,
+    /// 1 when this master's readiness snapshot passes the follower-read
+    /// refusal checks (freshness, apply/replication progress, commit lag).
+    /// 0 otherwise, including on the leader itself.
+    pub(crate) follower_read_ready: Gauge,
     pub(crate) active_connections: Gauge,
 
     pub(crate) capacity: Gauge,
@@ -318,6 +326,14 @@ impl MasterMetrics {
                 "master_follower_read_refused_total",
                 "Follower RPCs refused by the allowlist or freshness/readiness checks",
                 &["rpc_code", "reason"],
+            )?,
+            follower_read_commit_lag_entries: m::new_gauge(
+                "master_follower_read_commit_lag_entries",
+                "leader_commit_index - commit_index on the last admitted follower read snapshot",
+            )?,
+            follower_read_ready: m::new_gauge(
+                "master_follower_read_ready",
+                "1 when this master passes follower-read freshness/readiness checks, 0 otherwise",
             )?,
             active_connections: m::new_gauge(
                 "master_active_connections",

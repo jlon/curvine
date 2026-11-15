@@ -1638,12 +1638,35 @@ impl MessageHandler for MasterHandler {
                     code,
                     open_file_flags,
                 );
+                let readiness_refusal = if denial.is_none() {
+                    self.fs.follower_read_refusal(&readiness_snapshot)
+                } else {
+                    None
+                };
+                // Ready/lag reflect the freshness gate only. Policy denials
+                // (disabled, unmarked, mutation) leave `ready` at its last
+                // observation; the refusal counter carries their reason.
+                self.metrics.follower_read_ready.set(
+                    if readiness_refusal.is_none() && denial.is_none() {
+                        1
+                    } else {
+                        0
+                    },
+                );
+                self.metrics.follower_read_commit_lag_entries.set(
+                    readiness_snapshot
+                        .leader_commit_index
+                        .map(|leader_commit| {
+                            leader_commit.saturating_sub(readiness_snapshot.commit_index) as i64
+                        })
+                        .unwrap_or(0),
+                );
                 if let Some(reason) = denial {
                     if Self::is_follower_read_candidate(code) {
                         Self::record_follower_read_refused(self.metrics, code, reason);
                     }
                     Err(FsError::not_leader_master(ctx.code, self.client_ip()))
-                } else if let Some(reason) = self.fs.follower_read_refusal(&readiness_snapshot) {
+                } else if let Some(reason) = readiness_refusal {
                     if Self::is_follower_read_candidate(code) {
                         Self::record_follower_read_refused(
                             self.metrics,
@@ -1724,6 +1747,17 @@ impl MessageHandler for MasterHandler {
                     .follower_read_refusal(&final_snapshot)
                     .map(Self::follower_read_refusal_label)
             };
+            self.metrics
+                .follower_read_ready
+                .set(if refusal.is_none() { 1 } else { 0 });
+            self.metrics.follower_read_commit_lag_entries.set(
+                final_snapshot
+                    .leader_commit_index
+                    .map(|leader_commit| {
+                        leader_commit.saturating_sub(final_snapshot.commit_index) as i64
+                    })
+                    .unwrap_or(0),
+            );
             if let Some(reason) = refusal {
                 Self::record_follower_read_refused(self.metrics, code, reason);
                 response = Err(FsError::not_leader(format!(

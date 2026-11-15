@@ -16,6 +16,7 @@ use crate::block::{BlockClient, BlockClientPool};
 use crate::file::{FsClient, MasterHandshake, SessionPathTracker, WorkerPrecheck};
 use crate::ClientMetrics;
 use curvine_config::ClusterConf;
+use curvine_core_error::err_box;
 use curvine_error::{FsError, FsResult};
 use curvine_fs_api::RpcCode;
 use curvine_io::CacheManager;

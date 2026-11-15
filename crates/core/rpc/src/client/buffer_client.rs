@@ -456,6 +456,7 @@ mod tests {
             receiver,
             write_frame,
             call_map,
+            test_close_signal(),
         ));
 
         // Let the request side settle into its receive loop while the
@@ -652,6 +653,7 @@ mod tests {
             receiver,
             write_frame,
             call_map,
+            test_close_signal(),
         ));
 
         let mut promises = Vec::with_capacity(N as usize);
@@ -708,6 +710,7 @@ mod tests {
             receiver,
             write_frame,
             call_map,
+            test_close_signal(),
         ));
 
         for req_id in 0..CANCELLED {

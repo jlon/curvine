@@ -529,6 +529,7 @@ mod tests {
         );
         assert_eq!(location_count(&fs), 1);
         forget_checker(checker);
+    }
 
     #[test]
     fn promotion_grants_passive_lost_worker_one_lost_interval_before_cleanup() {

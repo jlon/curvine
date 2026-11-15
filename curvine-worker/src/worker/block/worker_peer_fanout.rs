@@ -134,13 +134,17 @@ impl FullReportSnapshot {
                 crate::worker::block::BlockState::Writing
                 | crate::worker::block::BlockState::Recovering
                 | crate::worker::block::BlockState::Allocating
-                | crate::worker::block::BlockState::Finalizing => BlockReportStatusProto::Writing,
+                | crate::worker::block::BlockState::Finalizing
+                | crate::worker::block::BlockState::Quarantined => {
+                    BlockReportStatusProto::Writing
+                }
             };
             BlockReportInfoProto {
                 id: block.id,
                 status: status.into(),
                 block_size: block.len,
                 storage_type: block.storage_type.into(),
+                corrupted: None,
             }
         }));
         request

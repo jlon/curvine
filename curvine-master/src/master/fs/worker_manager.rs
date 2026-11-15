@@ -1057,6 +1057,7 @@ mod tests {
         };
         manager.settle_committed_blocks(&WorkerManager::settle_snapshot(&[commit]));
         assert_eq!(manager.get_worker(1).unwrap().scheduled_bytes, 4096);
+    }
 
     #[test]
     fn passive_heartbeat_does_not_return_leader_delete_commands() {

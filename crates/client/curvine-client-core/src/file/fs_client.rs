@@ -2193,6 +2193,7 @@ mod tests {
                 path: path("/open/read").encode(),
                 opts: CreateFileOptsProto::default(),
                 flags: OpenFlags::RDONLY.bits(),
+                first_block_client: None,
             };
             client
                 .rpc::<OpenFileRequest, OpenFileResponse>(RpcCode::OpenFile, read_open)
@@ -2205,6 +2206,7 @@ mod tests {
                 path: path("/open/write").encode(),
                 opts: CreateFileOptsProto::default(),
                 flags: OpenFlags::new_write_only().bits(),
+                first_block_client: None,
             };
             client
                 .rpc::<OpenFileRequest, OpenFileResponse>(RpcCode::OpenFile, write_open)

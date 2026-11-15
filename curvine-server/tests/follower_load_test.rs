@@ -91,7 +91,6 @@ fn three_worker_cluster() -> (TestDirectory, Vec<ClusterConf>, Vec<ClusterConf>)
     base.worker.io_threads = 1;
     base.worker.worker_threads = 2;
     base.worker.log.log_dir = "stderr".to_string();
-    base.worker.follower_reports_enabled = true;
 
     let master_confs: Vec<ClusterConf> = (0..3)
         .map(|i| {

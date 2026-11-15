@@ -109,6 +109,10 @@ message WorkerHeartbeatRequest {
 
 message WorkerHeartbeatResponse {
     repeated WorkerCommandProto cmds = 1;
+    // The active master tells the worker whether to mirror lifecycle
+    // heartbeats and block reports to follower masters (follower reads).
+    // Absent means do not mirror.
+    optional bool mirror_worker_state = 2;
 }
 
 enum BlockReportStatusProto {

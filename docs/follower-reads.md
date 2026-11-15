@@ -16,7 +16,7 @@ follower_read_max_commit_lag = 0
 follower_read_apply_stall_timeout = "30s"
 
 [worker]
-follower_reports_enabled = true
+follower_mirroring_enabled = true
 
 [client]
 follower_reads_enabled = true

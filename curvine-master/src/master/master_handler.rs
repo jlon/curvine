@@ -903,6 +903,7 @@ impl MasterHandler {
         let cmds = Self::process_worker_heartbeat(self.fs.clone(), header)?;
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
+            mirror_worker_state: Some(self.fs.conf.follower_reads_enabled),
         };
         ctx.response(rep_header)
     }
@@ -927,7 +928,10 @@ impl MasterHandler {
         }
 
         Self::process_worker_heartbeat_passive(self.fs.clone(), header)?;
-        ctx.response(WorkerHeartbeatResponse { cmds: Vec::new() })
+        ctx.response(WorkerHeartbeatResponse {
+            cmds: Vec::new(),
+            mirror_worker_state: Some(self.fs.conf.follower_reads_enabled),
+        })
     }
 
     fn process_worker_heartbeat_passive(

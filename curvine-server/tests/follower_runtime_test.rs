@@ -88,7 +88,7 @@ fn cluster_config(mirror_reports: bool) -> (TestDirectory, Vec<ClusterConf>) {
     base.worker.io_threads = 1;
     base.worker.worker_threads = 2;
     base.worker.log.log_dir = "stderr".to_string();
-    base.worker.follower_reports_enabled = mirror_reports;
+    base.worker.follower_mirroring_enabled = mirror_reports;
     base.worker.data_dir = vec![format!("[SSD:64MB]{}", root.0.join("data").display())];
     let confs = (0..3)
         .map(|i| {

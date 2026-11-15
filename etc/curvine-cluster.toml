@@ -203,7 +203,7 @@ dir_reserved = "0"
 # queued operations, 1..1073741824 bytes, 1..32 peers and concurrent RPCs.
 # Retry timeout is 1..300000ms; retry delays are positive, max is <=60000ms,
 # min <= max, and min <= timeout.
-# follower_reports_enabled = false
+# follower_mirroring_enabled = true
 # follower_report_queue_max_ops = 256
 # follower_report_queue_max_bytes = 67108864
 # follower_report_max_peer_queues = 32

@@ -237,6 +237,11 @@ pub(crate) struct WorkerPeerFanout {
     resync_retry_after: Mutex<Option<Instant>>,
     initial_full_report_active: AtomicBool,
     shutdown: AtomicBool,
+    /// Whether the cluster's active master asked this worker to mirror worker
+    /// state to follower masters (delivered in WorkerHeartbeatResponse).
+    /// Default on for tests that publish directly; `MasterClient` sets it from
+    /// every heartbeat response.
+    mirror_enabled: AtomicBool,
 }
 
 struct PeerTask {
@@ -384,7 +389,39 @@ impl WorkerPeerFanout {
             resync_retry_after: Mutex::new(None),
             initial_full_report_active: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            mirror_enabled: AtomicBool::new(false),
         }))
+    }
+
+    /// Whether mirrored requests should be queued. Driven by the master's
+    /// `mirror_worker_state` heartbeat hint.
+    pub(crate) fn mirror_enabled(&self) -> bool {
+        self.mirror_enabled.load(Ordering::Acquire)
+    }
+
+    /// Apply the master's mirror hint. Turning mirroring off stops every peer
+    /// queue and drops their pending state so a later re-enable restarts each
+    /// follower from a full resync instead of replaying a stale queue. The
+    /// latest Start heartbeat and has_running are kept so re-enabling can
+    /// resume without losing the session view.
+    pub(crate) fn set_mirror_enabled(&self, enabled: bool) {
+        let was = self.mirror_enabled.swap(enabled, Ordering::AcqRel);
+        if !enabled && was {
+            self.drain_peers();
+        }
+    }
+
+    fn drain_peers(&self) {
+        let tasks = {
+            let mut peers = lock(&self.peers);
+            peers.drain().map(|(_, task)| task).collect::<Vec<_>>()
+        };
+        for mut task in tasks {
+            let _ = task.stop_tx.send(true);
+            // Join handles are detached like reconcile_peers: publish callers
+            // are the heartbeat thread and must not block on a dead peer.
+            drop(task.join.take());
+        }
     }
 
     /// Publish a request only after the primary leader call succeeded. A
@@ -399,10 +436,15 @@ impl WorkerPeerFanout {
         if let Some(generation) = publication.as_mut() {
             **generation = generation.wrapping_add(1);
         }
+        // Track the session even while mirroring is disabled: the latest Start
+        // and has_running are what a later enable uses to resync followers.
         match HeartbeatStatus::from(request.status) {
             HeartbeatStatus::Start => self.remember_latest_start(request.clone()),
             HeartbeatStatus::Running => self.has_running.store(true, Ordering::Release),
             HeartbeatStatus::End => {}
+        }
+        if !self.mirror_enabled() {
+            return;
         }
 
         let Some(leader_id) = self.transport.master_peer_leader_id() else {
@@ -442,7 +484,7 @@ impl WorkerPeerFanout {
     /// Queue a block report only after the authoritative leader accepted it.
     /// Reports stay FIFO with worker Start and lifecycle heartbeats per peer.
     pub(crate) fn publish_block_report(&self, request: BlockReportListRequest) {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.shutdown.load(Ordering::Acquire) || !self.mirror_enabled() {
             return;
         }
         let mut publication = lock(&self.publication_gate);
@@ -461,6 +503,9 @@ impl WorkerPeerFanout {
     }
 
     pub(crate) fn needs_full_resync(&self) -> bool {
+        if !self.mirror_enabled() {
+            return false;
+        }
         lock(&self.peers)
             .values()
             .any(|peer| peer.mailbox.needs_resync())
@@ -521,7 +566,7 @@ impl WorkerPeerFanout {
     where
         F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>>,
     {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.shutdown.load(Ordering::Acquire) || !self.mirror_enabled() {
             return Ok(());
         }
         let publication = lock(&self.publication_gate);

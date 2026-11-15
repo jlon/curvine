@@ -61,7 +61,10 @@ pub struct MasterClient {
     /// and cloned into each request instead of re-allocated on the hot path.
     pub(crate) component_info: ComponentInfoProto,
     runtime: Arc<Runtime>,
-    peer_fanout: Option<Arc<WorkerPeerFanout>>,
+    peer_fanout: Arc<WorkerPeerFanout>,
+    /// Whether this worker honors the leader's mirror hint. A `false` config
+    /// forces leader-only reporting regardless of what the leader advertises.
+    mirroring_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -116,20 +119,17 @@ impl MasterClient {
         let fs_client = FsClient::new(context);
         let component_info =
             ProtoUtils::component_version_to_pb(&version::component_version("worker"));
-        let peer_fanout = if worker_conf.follower_reports_enabled {
-            Some(
-                WorkerPeerFanout::new(
-                    runtime.clone(),
-                    Arc::new(FsClientPeerMirrorTransport {
-                        client: fs_client.clone(),
-                    }),
-                    WorkerPeerFanoutConfig::from(&worker_conf),
-                )
-                .map_err(|error| CommonError::from(error.to_string()))?,
-            )
-        } else {
-            None
-        };
+        // The fanout is always constructed; whether it publishes is decided by
+        // the active master through the mirror_worker_state heartbeat hint,
+        // so no worker-side switch is needed.
+        let peer_fanout = WorkerPeerFanout::new(
+            runtime.clone(),
+            Arc::new(FsClientPeerMirrorTransport {
+                client: fs_client.clone(),
+            }),
+            WorkerPeerFanoutConfig::from(&worker_conf),
+        )
+        .map_err(|error| CommonError::from(error.to_string()))?;
         Ok(Self {
             fs_client,
             cluster_id,
@@ -140,6 +140,7 @@ impl MasterClient {
             software_version: version::VERSION.to_string(),
             startup_time_ms,
             component_info,
+            mirroring_enabled: worker_conf.follower_mirroring_enabled,
             runtime,
             peer_fanout,
         })
@@ -173,19 +174,25 @@ impl MasterClient {
             req.storages.push(ProtoUtils::storage_info_to_pb(item));
         }
 
-        let request = self.peer_fanout.as_ref().map(|_| req.clone());
-        let response = self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req);
-        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
-            fanout.publish_heartbeat(request);
+        // publish_heartbeat tracks the Start/Running session even while
+        // mirroring is off, so the request clone is unconditional.
+        let mirror_request = req.clone();
+        let response: FsResult<WorkerHeartbeatResponse> =
+            self.fs_client.rpc_blocking(RpcCode::WorkerHeartbeat, req);
+        // The active master decides whether follower state feeds should run.
+        // Apply its hint before publishing this heartbeat to peers.
+        if let Ok(header) = &response {
+            self.peer_fanout.set_mirror_enabled(
+                header.mirror_worker_state.unwrap_or(false) && self.mirroring_enabled,
+            );
+        }
+        if response.is_ok() {
+            self.peer_fanout.publish_heartbeat(mirror_request);
         }
         if status == HeartbeatStatus::End {
-            if let Some(fanout) = &self.peer_fanout {
-                self.runtime.block_on(fanout.shutdown());
-            }
+            self.runtime.block_on(self.peer_fanout.shutdown());
         }
-        let rep_header: WorkerHeartbeatResponse = response?;
-
-        Ok(rep_header)
+        Ok(response?)
     }
 
     pub fn full_block_report(
@@ -196,10 +203,10 @@ impl MasterClient {
     ) -> CommonResult<BlockReportListResponse> {
         let req = self.full_report_batch_request(report_id, total_size, blocks);
 
-        let request = self.peer_fanout.as_ref().map(|_| req.clone());
+        let mirror_request = self.peer_fanout.mirror_enabled().then(|| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
-        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
-            fanout.publish_block_report(request);
+        if let (Some(request), Ok(_)) = (mirror_request, &response) {
+            self.peer_fanout.publish_block_report(request);
         }
         let rep_header: BlockReportListResponse = response?;
         Ok(rep_header)
@@ -230,31 +237,25 @@ impl MasterClient {
             req.blocks.push(info);
         }
 
-        let request = self.peer_fanout.as_ref().map(|_| req.clone());
+        let mirror_request = self.peer_fanout.mirror_enabled().then(|| req.clone());
         let response = self.fs_client.rpc_blocking(RpcCode::WorkerBlockReport, req);
-        if let (Some(fanout), Some(request), Ok(_)) = (&self.peer_fanout, request, &response) {
-            fanout.publish_block_report(request);
+        if let (Some(request), Ok(_)) = (mirror_request, &response) {
+            self.peer_fanout.publish_block_report(request);
         }
         let rep_header: BlockReportListResponse = response?;
         Ok(rep_header)
     }
 
     pub(crate) fn needs_follower_resync(&self) -> bool {
-        self.peer_fanout
-            .as_ref()
-            .is_some_and(|fanout| fanout.needs_full_resync())
+        self.peer_fanout.needs_full_resync()
     }
 
     pub(crate) fn begin_initial_full_report(&self) {
-        if let Some(fanout) = &self.peer_fanout {
-            fanout.begin_initial_full_report();
-        }
+        self.peer_fanout.begin_initial_full_report();
     }
 
     pub(crate) fn end_initial_full_report(&self) {
-        if let Some(fanout) = &self.peer_fanout {
-            fanout.end_initial_full_report();
-        }
+        self.peer_fanout.end_initial_full_report();
     }
 
     pub(crate) fn resync_follower_reports<F>(
@@ -265,9 +266,7 @@ impl MasterClient {
     where
         F: FnOnce(usize) -> CommonResult<Option<FullReportSnapshot>> + Send + 'static,
     {
-        if let Some(fanout) = &self.peer_fanout {
-            fanout.schedule_resync(executor, build_reports)?;
-        }
+        self.peer_fanout.schedule_resync(executor, build_reports)?;
         Ok(())
     }
 

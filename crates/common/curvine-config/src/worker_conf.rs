@@ -232,9 +232,12 @@ pub struct WorkerConf {
     /// bound `min_client_version` and `blocked_versions` are what apply.
     pub compatibility: CompatibilityConf,
 
-    /// Mirror worker lifecycle and block reports to follower masters. The
-    /// leader remains authoritative for commands and the default is disabled.
-    pub follower_reports_enabled: bool,
+    /// Whether this worker honors the leader's `mirror_worker_state`
+    /// heartbeat hint to mirror lifecycle heartbeats and block reports to
+    /// follower masters. The leader decides when that traffic is wanted;
+    /// this flag is a worker-side opt-out for operators/tests that need a
+    /// specific worker to keep leader-only reporting. Default true.
+    pub follower_mirroring_enabled: bool,
 
     /// Maximum FIFO block-report operations per follower peer. Lifecycle
     /// heartbeats use fixed coalesced slots, and every slot counts toward the
@@ -296,11 +299,9 @@ impl WorkerConf {
         Ok(ByteUnit::from_str(&self.block_checksum_scan_rate)?.as_byte())
     }
 
-    /// Validate settings used by opt-in passive worker report fanout.
+    /// Validate the follower report fanout limits. The fanout itself is
+    /// driven by the master's heartbeat hint; these bounds always apply.
     pub fn validate_follower_reports(&self) -> CommonResult<()> {
-        if !self.follower_reports_enabled {
-            return Ok(());
-        }
         if self.follower_report_queue_max_ops == 0 {
             return err_box!("worker.follower_report_queue_max_ops must be > 0");
         }
@@ -411,7 +412,7 @@ impl Default for WorkerConf {
             enable_s3_gateway: false,
             spdk_disk: SpdkConf::default(),
             compatibility: CompatibilityConf::default(),
-            follower_reports_enabled: false,
+            follower_mirroring_enabled: true,
             follower_report_queue_max_ops: 256,
             follower_report_queue_max_bytes: 64 * 1024 * 1024,
             follower_report_max_peer_queues: 32,
@@ -528,10 +529,9 @@ data_dir = ["[SSD]/data/data1"]
     }
 
     #[test]
-    fn follower_report_fanout_is_disabled_by_default_with_bounded_limits() {
+    fn follower_report_fanout_defaults_are_bounded() {
         let conf = WorkerConf::default();
 
-        assert!(!conf.follower_reports_enabled);
         assert!(conf.follower_report_queue_max_ops > 0);
         assert!(conf.follower_report_queue_max_bytes > 0);
         assert!(conf.follower_report_max_peer_queues > 0);
@@ -542,7 +542,6 @@ data_dir = ["[SSD]/data/data1"]
     #[test]
     fn follower_report_fanout_validates_enabled_queue_limits() {
         let mut conf = WorkerConf {
-            follower_reports_enabled: true,
             follower_report_queue_max_ops: 0,
             ..WorkerConf::default()
         };
